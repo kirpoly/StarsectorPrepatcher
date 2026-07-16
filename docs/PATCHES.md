@@ -1,6 +1,7 @@
-# Карта патчей 0.3.0-exp3
+# Карта патчей 0.4.0-exp4
 
-Все target-классы относятся к `starfarer_obf.jar` Starsector 0.98a-RC8 и проверяются по exact SHA-256 до изменения.
+Каждый блок независимо сопоставляется с фактически загружаемым bytecode по symbolic/data-flow
+контракту. Несовместимый блок пропускается без отмены уже подтверждённых патчей класса.
 
 | Блок | Target | Vanilla-проблема | Изменение | Совместимость/риск |
 |---|---|---|---|---|
@@ -17,7 +18,7 @@
 | `patch.sampleCacheClearThrottle` | `A.H.<init>` | повторный terrain sample-cache clear | min interval | средний |
 | `patch.gridLineCap` | `A.H.null(F)V` | grid lines растут с физическим размером сектора | dynamic spacing/max lines | средний, визуальный LOD |
 | `patch.campaignListenerThrottle` | `CampaignEngine.advance` | каждый кадр O(N) `readdChangeListeners()` | first/change/audit refresh | низкий; public method не меняется |
-| `patch.routeJumpPointIndex` | `A.O0Oo.getNextStep`, `getLastLegDistance` | 3 scans всех hyperspace jump points + 1 scan systems | ordered identity indexes, original selection loop сохраняется | низкий/средний, TTL 250 мс; miss -> full list |
+| `patch.routeJumpPointIndex` | `A.O0Oo.getNextStep`, `getLastLegDistance` | 3 scans всех hyperspace jump points + 1 scan systems | ordered identity indexes, original selection loop сохраняется | средний; полный snapshot раз в TTL 250 мс, miss -> full list; safe profile: off |
 
 ## Новое: campaign listener refresh
 
@@ -29,7 +30,7 @@ for each starSystem:
     starSystem.getObjects().setListener(engine)
 ```
 
-`ObjectRepository.setListener()` — простая запись поля. При этом `CampaignEngine.advance()` вызывает метод каждый кадр. Exp3 трансформирует только этот один call site. Методы `createStarSystem`, `removeStarSystem` и публичный `readdChangeListeners` не меняются.
+`ObjectRepository.setListener()` — простая запись поля. При этом `CampaignEngine.advance()` вызывает метод каждый кадр. Exp4 трансформирует только этот один call site. Методы `createStarSystem`, `removeStarSystem` и публичный `readdChangeListeners` не меняются.
 
 Refresh выполняется при:
 
@@ -56,32 +57,27 @@ Global.getSector().getHyperspace().getJumpPoints()
 - star destination;
 - расстояние и tie-break.
 
-В одном месте `CampaignEngine.getStarSystems()` подставляется singleton candidate для известного hyperspace anchor. Оригинальный bytecode повторно сравнивает anchor identity, поэтому stale positive безопасно отфильтровывается. Cache miss возвращает полный vanilla list.
+В одном месте `CampaignEngine.getStarSystems()` подставляется ordered candidate list для известного
+hyperspace anchor; несколько systems с одинаковым anchor не теряются. Оригинальный bytecode повторно
+сравнивает anchor identity, поэтому stale positive безопасно отфильтровывается. Cache miss возвращает
+полный vanilla list.
 
-## Точные targets
+На каждом hit проверяются size/first/last. Раз в `route.indexTtlMs` дополнительно сверяется полный
+identity snapshot списка и отношение jump-point -> destination system / system -> anchor. Если
+сторонний мод изменил середину списка или переназначил объект, индекс перестраивается. Между полными
+проверками возможна ограниченная TTL задержка видимости прямой мутации; поэтому safe profile держит
+этот блок выключенным. Неиндексируемый `List` и malformed/custom getter сразу используют vanilla
+fallback; исключение полного аудита переводит индекс в failed state до следующего TTL, без hot-loop
+исключений.
 
-```text
-starfarer_obf.jar
-5dd222b9e266d2ac2d63b3dad4983eb05caaf5a247d7dfb82aaeba47ea774cc8
+## Проверка совместимости
 
-com.fs.starfarer.coreui.A.H
-3bad0296ca21b7c1de04ec091fa35ba868903d00185501d2d60053182c304d14
+Точные structural/data-flow preconditions, postconditions, статусы и ограничения описаны в
+[`STRUCTURAL_COMPATIBILITY.md`](STRUCTURAL_COMPATIBILITY.md). Хеши JAR и классов не участвуют в
+решении о применении патча.
 
-com.fs.starfarer.coreui.A.A
-bd9e3fbe425ff18199f5f0c5ec654996c836326224ff6bc2efdfcaf41162cb2f
-
-com.fs.starfarer.coreui.A.Z
-f584eb5cd28216f8be97cf47a2ba9141ad7f0671e9b16c235e5dc8c6787cce98
-
-com.fs.starfarer.campaign.comms.v2.EventsPanel
-3924d42d8e8ceab19a147ed9db03161773333203752f3430518bf87231ff6aa1
-
-com.fs.starfarer.campaign.CampaignEngine
-9888ba1d2493f8d1d41106b57d9843c266f7073355aa9d2c41e73c14c3527cab
-
-com.fs.starfarer.coreui.A.O0Oo
-31ba933e63240f793eb7e40706d0ed155d0e226f80f90c0f4813f46f2d7ac222
-```
+Уровни доказательств, runtime-сигналы и отдельные A/B-сценарии для каждого блока перечислены в
+[`PATCH_VALIDATION_CHECKLIST.md`](PATCH_VALIDATION_CHECKLIST.md).
 
 ## Намеренно не изменено
 

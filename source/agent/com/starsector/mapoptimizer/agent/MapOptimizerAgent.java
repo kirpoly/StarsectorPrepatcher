@@ -2,25 +2,19 @@ package com.starsector.mapoptimizer.agent;
 
 import com.starsector.mapoptimizer.runtime.MapOptimizerHooks;
 
-import java.io.IOException;
-import java.io.InputStream;
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.security.MessageDigest;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HexFormat;
 import java.util.Map;
 import java.util.Set;
 
 public final class MapOptimizerAgent {
-    public static final String VERSION = "0.3.0-exp3";
-    public static final String EXPECTED_GAME_JAR_SHA256 =
-            "5dd222b9e266d2ac2d63b3dad4983eb05caaf5a247d7dfb82aaeba47ea774cc8";
+    public static final String VERSION = "0.4.0-exp4";
 
     private MapOptimizerAgent() {}
 
@@ -47,28 +41,13 @@ public final class MapOptimizerAgent {
                 return;
             }
 
-            Path gameJar = locateGameJar(modRoot);
-            String gameHash = gameJar == null ? null : sha256(gameJar);
-            OptimizerLog.info("Core JAR: " + gameJar);
-            OptimizerLog.info("Core JAR SHA-256: " + gameHash);
-            boolean knownBuild = EXPECTED_GAME_JAR_SHA256.equalsIgnoreCase(gameHash == null ? "" : gameHash);
-            if (!knownBuild && config.requireKnownGameJar) {
-                OptimizerLog.error("Unsupported starfarer_obf.jar; expected " + EXPECTED_GAME_JAR_SHA256
-                        + " but found " + gameHash + ". Patches were not installed.", null);
-                System.setProperty("starsector.mapoptimizer.status", "unsupported-game-build");
-                return;
-            }
-            if (!knownBuild) {
-                OptimizerLog.warn("Unknown core JAR accepted because compatibility.requireKnownGameJar=false."
-                        + " Structural checks still apply; use at your own risk.");
-            }
-
             MapOptimizerHooks.configure(config, modRoot);
             exportInternalAsm(instrumentation);
-            ClassFileTransformer transformer = new MapOptimizerTransformer(config, knownBuild);
+            ClassFileTransformer transformer = new MapOptimizerTransformer(config);
             instrumentation.addTransformer(transformer, false);
-            System.setProperty("starsector.mapoptimizer.status", "transformer-installed");
-            OptimizerLog.info("Transformer installed. Target classes will be patched as they load.");
+            System.setProperty("starsector.mapoptimizer.status", "structural-transformer-installed");
+            OptimizerLog.info("Structural transformer installed. Each patch will be matched, applied,"
+                    + " and verified independently as its target class loads.");
         } catch (Throwable ex) {
             System.setProperty("starsector.mapoptimizer.status", "agent-error");
             OptimizerLog.error("Fatal agent initialization error; optimizer has failed open and the game will continue unpatched.", ex);
@@ -81,6 +60,7 @@ public final class MapOptimizerAgent {
         Map<String, Set<Module>> exports = new HashMap<>();
         exports.put("jdk.internal.org.objectweb.asm", Collections.singleton(ours));
         exports.put("jdk.internal.org.objectweb.asm.tree", Collections.singleton(ours));
+        exports.put("jdk.internal.org.objectweb.asm.tree.analysis", Collections.singleton(ours));
         instrumentation.redefineModule(
                 javaBase,
                 Collections.emptySet(),
@@ -124,29 +104,4 @@ public final class MapOptimizerAgent {
         return path;
     }
 
-    private static Path locateGameJar(Path modRoot) {
-        Path[] candidates = new Path[] {
-                Paths.get("starfarer_obf.jar"),
-                Paths.get("starsector-core", "starfarer_obf.jar"),
-                modRoot.resolve("..").resolve("..").resolve("starsector-core").resolve("starfarer_obf.jar"),
-                modRoot.resolve("..").resolve("..").resolve("starfarer_obf.jar")
-        };
-        for (Path candidate : candidates) {
-            Path normalized = candidate.toAbsolutePath().normalize();
-            if (Files.isRegularFile(normalized)) return normalized;
-        }
-        return null;
-    }
-
-    private static String sha256(Path file) throws Exception {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        try (InputStream in = Files.newInputStream(file)) {
-            byte[] buffer = new byte[64 * 1024];
-            int read;
-            while ((read = in.read(buffer)) >= 0) {
-                digest.update(buffer, 0, read);
-            }
-        }
-        return HexFormat.of().formatHex(digest.digest());
-    }
 }

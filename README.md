@@ -1,40 +1,46 @@
-# Starsector Map Optimizer 0.3.0-exp3
+# Starsector Map Optimizer 0.4.0-exp4
 
-Точечные runtime-патчи для **Starsector 0.98a-RC8**, рассчитанные на очень большие сектора. Версия exp3 сохраняет исправления sector/hyperspace/Intel map и добавляет два консервативных направления: обычную campaign-сцену при закрытой карте и вычисление следующего шага маршрута.
+Runtime-оптимизации sector/hyperspace/Intel map, campaign bookkeeping и route candidate scans
+для очень больших секторов Starsector. Основное исправление карты на реальном сохранении подняло
+сцену примерно с **10 FPS** до установленного предела **60 FPS**.
 
-Основное исправление карты уже проверено на реальном сохранении: сцена, работавшая примерно в **10 FPS**, после патча упёрлась в установленный предел **60 FPS**.
+Мод состоит из sandbox-safe bootstrap-плагина и startup `javaagent`. Javaagent обязателен: обычный
+script classloader Starsector не может безопасно менять engine bytecode до загрузки классов.
 
-Мод состоит из:
+## Совместимость без SHA allowlist
 
-- sandbox-safe mod-plugin, который сообщает состояние в `starsector.log`;
-- startup `javaagent`, который до загрузки engine-классов проверяет SHA-256 игры и меняет только известные call sites.
+Версия exp4 не содержит проверок SHA игры или target-классов. Вместо решения «подходит ли весь JAR»
+каждый патч отдельно:
 
-Обычный script classloader Starsector запрещает reflection и файловый доступ, поэтому javaagent обязателен.
+1. находит symbolic bytecode site;
+2. проверяет receiver, arguments и local values через ASM data-flow;
+3. требует однозначное ожидаемое число sites;
+4. применяет изменение транзакционно;
+5. ставит private synthetic ownership marker для безопасной идемпотентности;
+6. проверяет точные hook descriptors, postconditions, public API и весь полученный класс через
+   `BasicVerifier`.
 
-## Поддерживаемая сборка
+Переводы строк, изменения несвязанных методов и другие безопасные модификации core JAR не блокируют
+подходящие патчи. Неизвестный или неоднозначный site получает `SKIPPED_STRUCTURAL`, при этом остальные
+патчи того же класса продолжают устанавливаться. Подробные контракты описаны в
+[`docs/STRUCTURAL_COMPATIBILITY.md`](docs/STRUCTURAL_COMPATIBILITY.md).
 
-```text
-Starsector 0.98a-RC8
-starfarer_obf.jar SHA-256:
-5dd222b9e266d2ac2d63b3dad4983eb05caaf5a247d7dfb82aaeba47ea774cc8
-```
-
-На другой сборке агент по умолчанию ничего не меняет. Помимо core JAR проверяется SHA-256 каждого из шести target-классов.
-
-## Обновление с exp1/exp2
+## Установка
 
 1. Полностью закройте игру.
-2. Замените каталог `<Starsector>\mods\StarsectorMapOptimizer` новым.
-3. Строку в `vmparams` менять не требуется: имя и путь agent JAR прежние.
-4. Включите мод в launcher и запустите игру.
+2. Поместите каталог в `<Starsector>\mods\StarsectorMapOptimizer`.
+3. Запустите `install-agent.bat` из каталога мода.
+4. Включите мод в launcher и запустите Starsector.
 
-Для новой установки запустите `install-agent.bat` из каталога мода. Он создаёт резервную копию `vmparams` и добавляет:
+Installer создаёт резервную копию `vmparams` и добавляет:
 
 ```text
 -javaagent:../mods/StarsectorMapOptimizer/agent/StarsectorMapOptimizerAgent.jar
 ```
 
-Telemetry javaagent можно оставить: JVM поддерживает несколько `-javaagent`.
+Telemetry javaagent можно оставить. Installer автоматически добавляет Map Optimizer после всех
+существующих `-javaagent`, чтобы структурный matcher видел уже изменённые ими bytes. Повторный
+запуск installer исправляет порядок старой установки, если Map Optimizer стоит раньше другого агента.
 
 ## Что исправляется
 
@@ -46,98 +52,75 @@ Telemetry javaagent можно оставить: JVM поддерживает н
 icons.keySet().retainAll(entityArrayList);
 ```
 
-заменяется явной identity-reconciliation:
+заменяется линейной reconciliation. Vanilla entities используют reusable identity membership;
+для modded entity с собственными `equals/hashCode` автоматически используется reusable `HashSet`,
+сохраняющий Java collection semantics. Сложность меняется с `O(K × E)` на `O(K + E)`.
 
-1. vanilla entities отмечаются в переиспользуемом `IdentityHashMap`;
-2. `icons.keySet()` обходится один раз;
-3. отсутствующие ключи удаляются iterator-ом.
+Дополнительные блоки уменьшают:
 
-Если modded entity переопределяет `equals/hashCode`, helper автоматически переключает этот кадр на reusable `HashSet`, сохраняя обычную Java collection-семантику. Для vanilla fast path сложность меняется с `O(K × E)` на `O(K + E)` без `AbstractCollection.retainAll` и `ArrayList.contains/indexOfRange`.
-
-Также остаются best-effort патчи hover, label layout, Intel callbacks/indexes, synthetic nebula preparation, временных allocations и LOD сетки большого сектора.
+- временные `ArrayList`, `HashSet` и `Vector2f` allocations;
+- полный scan иконок при label layout и Intel reconciliation;
+- повторные `IntelInfoPlugin.getMapLocation/getArrowData` callbacks;
+- hover hit-tests и all-system hyperspace scans;
+- подготовку synthetic system-nebula entities;
+- повторные sample-cache clears;
+- количество grid lines в огромных секторах.
 
 ### Campaign при закрытой карте
 
-`CampaignEngine.advance()` в vanilla каждый кадр вызывает `readdChangeListeners()`. Этот метод проходит hyperspace и все star systems, хотя внутри лишь повторно записывает тот же listener в `ObjectRepository`.
-
-Exp3 меняет **только внутренний call site в `advance()`**:
+Vanilla `CampaignEngine.advance()` каждый кадр вызывает `readdChangeListeners()` и обходит hyperspace
+и все star systems. Патч меняет только внутренний call site:
 
 - первый вызов выполняется полностью;
-- изменение списка систем/hyperspace вызывает немедленный полный refresh;
-- раз в `campaign.listenerAuditMs` выполняется совместимый контрольный refresh;
-- публичный `CampaignEngine.readdChangeListeners()` не меняется: моды, вызывающие его напрямую, получают точное vanilla-поведение.
-
-Vanilla `createStarSystem()` и `removeStarSystem()` уже устанавливают/снимают listener непосредственно, поэтому штатные изменения сектора не ждут audit.
+- изменение backing systems/hyperspace вызывает немедленный refresh;
+- периодический audit покрывает необычные прямые мутации модами;
+- публичный `readdChangeListeners()` остаётся оригинальным.
 
 ### Route/pathfinding
 
-Виджет курса `coreui.A.O0Oo` при активном маршруте может каждый кадр:
+`coreui.A.O0Oo` заменяет три полных hyperspace jump-point scans и один all-system anchor scan
+короткоживущими identity indexes. Оригинальный bytecode продолжает выполнять wormhole/star filters,
+distance, tolerance и tie-break. Cache miss, malformed/custom data или runtime error возвращают
+полный vanilla candidate list. Полный identity/relationship snapshot перепроверяется раз в TTL;
+консервативный профиль отключает этот патч.
 
-- дважды пройти все hyperspace jump points, чтобы найти входы в одну систему;
-- пройти все star systems, чтобы сопоставить hyperspace anchor;
-- повторить scan jump points в `getLastLegDistance()`.
+## Совместимость и безопасность
 
-Exp3 строит короткоживущие identity-indexes:
-
-- `destination system -> ordered jump-point candidates`;
-- `hyperspace anchor -> star system`.
-
-Исходные vanilla-проверки остаются в `O0Oo`: wormhole/star filtering, расстояние, допуск 300, hashCode tie-break и fallback anchor не переписаны. Helper только сужает исходный ordered candidate list. При miss, malformed/custom data или ошибке возвращается полный vanilla list.
-
-Стандартный TTL индекса — 250 мс. Это ограничивает задержку при нестандартной прямой мутации destination модом, сохраняя большую часть выигрыша в секторе с тысячами систем.
-
-## Совместимость
-
-- Публичные Starsector API и сигнатуры методов не меняются.
-- Формат сохранений не меняется; все кэши transient и живут только в JVM.
-- Модовые callbacks по-прежнему выполняются на campaign thread.
-- Route-result выбирается оригинальным vanilla-кодом; index не принимает решение за него.
-- Public `readdChangeListeners()` остаётся оригинальным.
-- Exact class hashes предотвращают применение к уже изменённому неизвестным agent-ом bytecode.
-- Любой block отключается отдельно в `optimizer.properties`.
-
-Не патчится проход, который распределяет advance неактивных систем по 60 кадрам: его удаление затрагивает `activeThisFrame` и может изменить ожидания модов. Не патчится `NavigationModule.advance()`: статический анализ показал локальные avoid-lists, а не sector-wide scan.
+- Публичные Starsector API и формат сохранений не меняются.
+- Wrapper-патчи сохраняют оригинальные методы как private synthetic fallback.
+- Каждый блок отключается независимо в `optimizer.properties`.
+- Повторная трансформация распознаётся как `ALREADY_APPLIED` и ничего не дублирует.
+- Любая структурная неоднозначность пропускает только затронутый блок.
+- Кэши transient и живут только в текущей JVM.
 
 ## Проверка запуска
 
-Лог:
+Основной лог:
 
 ```text
 mods\StarsectorMapOptimizer\logs\map-optimizer.log
 ```
 
-После загрузки campaign и открытия map/Intel UI ожидаются до шести строк:
+Для каждого загруженного target ожидаются строки `APPLIED`, `ALREADY_APPLIED`,
+`SKIPPED_STRUCTURAL` или `SKIPPED_ERROR`, затем сводная строка класса. UI-классы загружаются лениво,
+поэтому их строки появляются после первого открытия соответствующего экрана.
 
-```text
-Patched com/fs/starfarer/campaign/CampaignEngine: ...
-Patched com/fs/starfarer/coreui/A/O0Oo: ...
-Patched com/fs/starfarer/coreui/A/H: ...
-Patched com/fs/starfarer/coreui/A/A: ...
-Patched com/fs/starfarer/coreui/A/Z: ...
-Patched com/fs/starfarer/campaign/comms/v2/EventsPanel: ...
+Постоянный in-memory regression harness:
+
+```powershell
+.\verify-structural.ps1 -CoreJars `
+  'C:\Games\Starsector\starsector-core\starfarer_obf.jar', `
+  'C:\Games\Starsector_test\starsector-core\starfarer_obf.jar'
 ```
 
-UI-классы загружаются лениво, поэтому не все строки обязаны появиться до первого открытия соответствующего экрана.
+Harness не записывает изменённые game classes: он читает JAR, трансформирует bytes в памяти,
+проверяет наличие каждого hook descriptor в runtime JAR, все concrete methods, scratch exception
+frames, идемпотентность, ownership/metadata wrapper и отрицательные missing/ambiguous cases.
 
-Каждые 30 секунд лог дополнительно показывает:
-
-- map reconciliation/hover/Intel/label/nebula counters;
-- `campaignListenerRuns` и `campaignListenerSkips`;
-- build/hit/fallback route jump/system indexes.
-
-## Настройка
-
-Корневой `optimizer.properties` — рекомендуемый best-effort профиль. Основные новые параметры:
-
-```properties
-patch.campaignListenerThrottle=true
-campaign.listenerAuditMs=1000
-
-patch.routeJumpPointIndex=true
-route.indexTtlMs=250
-```
-
-`profiles/safe.properties` оставляет только близкие к точной семантике изменения, включая оба новых патча. `profiles/telemetry-confirmed.properties` изолирует только доказанный map `retainAll` fix.
+Критерии доказательности и воспроизводимые сценарии для каждого блока собраны в
+[`docs/PATCH_VALIDATION_CHECKLIST.md`](docs/PATCH_VALIDATION_CHECKLIST.md). Успешный `APPLIED`
+подтверждает структурную совместимость, но утверждение о корректности или ускорении дополнительно
+требует behavior-проверки и одинаковой A/B-телеметрии.
 
 ## Откат
 

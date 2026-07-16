@@ -33,6 +33,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.RandomAccess;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.LongAdder;
@@ -107,6 +108,29 @@ public final class MapOptimizerHooks {
     // Map reconciliation and scratch collection reuse
     // ---------------------------------------------------------------------
 
+    /** Opens a re-entrancy-safe lease for pooled values used by one transformed method. */
+    public static void beginScratchScope() {
+        Scratch scratch = SCRATCH.get();
+        int next = scratch.scopeDepth;
+        scratch.frameAt(next);
+        scratch.scopeDepth = next + 1;
+    }
+
+    /**
+     * Closes the current lease. This hook is deliberately noexcept and idempotent:
+     * it is also called by a generated catch-all handler.
+     */
+    public static void endScratchScope() {
+        try {
+            Scratch scratch = SCRATCH.get();
+            if (scratch.scopeDepth <= 0) return;
+            int index = --scratch.scopeDepth;
+            scratch.frameAt(index).clear();
+        } catch (Throwable ignored) {
+            // Never mask an original return value or exception.
+        }
+    }
+
     /**
      * Replaces the exact H.renderStuff() reconciliation call.
      *
@@ -127,7 +151,7 @@ public final class MapOptimizerHooks {
             return target.retainAll(keep);
         }
 
-        Scratch scratch = SCRATCH.get();
+        ScratchFrame scratch = SCRATCH.get().scopeFrame();
         IdentityHashMap<Object, Boolean> membership = scratch.identityMembership;
         membership.clear();
         boolean customEquality = false;
@@ -212,7 +236,7 @@ public final class MapOptimizerHooks {
     public static ArrayList borrowEntityList(Collection source) {
         OptimizerConfig c = config;
         if (c == null || !c.scratchCollections) return new ArrayList(source);
-        ArrayList list = SCRATCH.get().entityList;
+        ArrayList list = SCRATCH.get().scopeFrame().entityList;
         list.clear();
         list.addAll(source);
         return list;
@@ -222,7 +246,7 @@ public final class MapOptimizerHooks {
     public static HashSet borrowClassSet() {
         OptimizerConfig c = config;
         if (c == null || !c.scratchCollections) return new HashSet();
-        HashSet set = SCRATCH.get().classSet;
+        HashSet set = SCRATCH.get().scopeFrame().classSet;
         set.clear();
         return set;
     }
@@ -231,7 +255,7 @@ public final class MapOptimizerHooks {
     public static ArrayList borrowHitList(Collection source) {
         OptimizerConfig c = config;
         if (c == null || !c.scratchCollections) return new ArrayList(source);
-        ArrayList list = SCRATCH.get().hitList;
+        ArrayList list = SCRATCH.get().scopeFrame().hitList;
         list.clear();
         list.addAll(source);
         return list;
@@ -240,7 +264,7 @@ public final class MapOptimizerHooks {
     public static Vector2f borrowHitPoint(float x, float y) {
         OptimizerConfig c = config;
         if (c == null || !c.scratchCollections) return new Vector2f(x, y);
-        Vector2f vector = SCRATCH.get().hitPoint;
+        Vector2f vector = SCRATCH.get().scopeFrame().hitPoint;
         vector.set(x, y);
         return vector;
     }
@@ -248,7 +272,7 @@ public final class MapOptimizerHooks {
     public static Vector2f borrowArrowVector(float x, float y) {
         OptimizerConfig c = config;
         if (c == null || !c.arrowVectorPool) return new Vector2f(x, y);
-        Scratch scratch = SCRATCH.get();
+        ScratchFrame scratch = SCRATCH.get().scopeFrame();
         Vector2f vector = scratch.arrowVectors[scratch.arrowVectorIndex++ & (scratch.arrowVectors.length - 1)];
         vector.set(x, y);
         return vector;
@@ -289,7 +313,7 @@ public final class MapOptimizerHooks {
             Vector2f location = token.getLocation();
             int cx = floorCell(location.x, LabelIndex.CELL_X);
             int cy = floorCell(location.y, LabelIndex.CELL_Y);
-            ArrayList<Object> result = SCRATCH.get().labelCandidates;
+            ArrayList<Object> result = SCRATCH.get().scopeFrame().labelCandidates;
             result.clear();
             result.addAll(index.fallback);
             for (int dx = -1; dx <= 1; dx++) {
@@ -437,7 +461,7 @@ public final class MapOptimizerHooks {
         if (c == null || !c.intelFastContains || collection.size() < 16) {
             return collection.contains(value);
         }
-        Scratch scratch = SCRATCH.get();
+        ScratchFrame scratch = SCRATCH.get().scopeFrame();
         if (scratch.containsSource != collection || scratch.containsSourceSize != collection.size()) {
             scratch.containsSet.clear();
             scratch.containsSet.addAll(collection);
@@ -484,12 +508,15 @@ public final class MapOptimizerHooks {
                     INTEL_INDEX_BUILDS.increment();
                 }
             }
-            if (index.failed) return invokeOriginalIntelIconLookup(owner, plugin);
-            INTEL_INDEX_HITS.increment();
-            return index.byPlugin.get(plugin);
-        } catch (Throwable ex) {
-            return invokeOriginalIntelIconLookup(owner, plugin);
+            if (!index.failed) {
+                INTEL_INDEX_HITS.increment();
+                return index.byPlugin.get(plugin);
+            }
+        } catch (Throwable ignored) {
+            // Fall through to the original method. Keep that invocation outside
+            // this catch so an exception from game/mod code is never retried.
         }
+        return invokeOriginalIntelIconLookup(owner, plugin);
     }
 
     private static Object invokeOriginalIntelIconLookup(Object owner, IntelInfoPlugin plugin) {
@@ -511,7 +538,8 @@ public final class MapOptimizerHooks {
             @Override
             protected Method computeValue(Class<?> type) {
                 try {
-                    Method method = type.getDeclaredMethod("smo$originalGetIntelIconEntity", IntelInfoPlugin.class);
+                    Method method = findDeclaredMethod(type,
+                            "smo$originalGetIntelIconEntity", IntelInfoPlugin.class);
                     method.setAccessible(true);
                     return method;
                 } catch (ReflectiveOperationException ex) {
@@ -523,17 +551,25 @@ public final class MapOptimizerHooks {
         static final ClassValue<Field> PLUGIN_FIELD = new ClassValue<>() {
             @Override
             protected Field computeValue(Class<?> type) {
+                Field result = null;
                 Class<?> current = type;
                 while (current != null) {
                     for (Field field : current.getDeclaredFields()) {
                         if (IntelInfoPlugin.class.isAssignableFrom(field.getType())) {
-                            field.setAccessible(true);
-                            return field;
+                            if (result != null) {
+                                throw new IllegalStateException("Ambiguous IntelInfoPlugin fields in "
+                                        + type.getName());
+                            }
+                            result = field;
                         }
                     }
                     current = current.getSuperclass();
                 }
-                throw new IllegalStateException("No IntelInfoPlugin field in " + type.getName());
+                if (result == null) {
+                    throw new IllegalStateException("No IntelInfoPlugin field in " + type.getName());
+                }
+                result.setAccessible(true);
+                return result;
             }
         };
     }
@@ -598,6 +634,11 @@ public final class MapOptimizerHooks {
     public static SectorEntityToken hitTestCached(Object handler, float x, float y, float radius) {
         OptimizerConfig c = config;
         if (c == null || !c.hoverHitTestCache) return invokeOriginalHitTest(handler, x, y, radius);
+
+        HitCache cache = null;
+        long now = 0L;
+        long cellKey = 0L;
+        boolean cacheCell = false;
         try {
             HitAccess access = HitAccess.ACCESS.get(handler.getClass());
             Object map = access.mapField.get(handler);
@@ -605,8 +646,7 @@ public final class MapOptimizerHooks {
             Object icons = access.getIcons.invoke(map);
             int iconCount = icons instanceof Map ? ((Map<?, ?>) icons).size() : -1;
             Object location = access.getLocation.invoke(map);
-            long now = System.nanoTime();
-            HitCache cache;
+            now = System.nanoTime();
             synchronized (HIT_CACHES) {
                 cache = HIT_CACHES.computeIfAbsent(handler, ignored -> new HitCache(c.hoverMaxCells));
                 if (HIT_CACHES.size() > 64) {
@@ -630,32 +670,40 @@ public final class MapOptimizerHooks {
                     && Float.isFinite(factor) && factor > 0f) {
                 int cellX = safeFloorToInt((x * factor) / c.hoverCellPixels);
                 int cellY = safeFloorToInt((y * factor) / c.hoverCellPixels);
-                long key = cellKey(cellX, cellY) ^ ((long) Float.floatToIntBits(radius) * 0x9E3779B97F4A7C15L);
-                CellHit hit = cache.cells.get(key);
+                cellKey = cellKey(cellX, cellY)
+                        ^ ((long) Float.floatToIntBits(radius) * 0x9E3779B97F4A7C15L);
+                CellHit hit = cache.cells.get(cellKey);
                 if (hit != null && now - hit.atNanos <= c.hoverCellTtlMs * 1_000_000L) {
                     cache.setLast(hit.value, now);
                     HOVER_HITS.increment();
                     return hit.value;
                 }
-                SectorEntityToken value = invokeOriginalHitTest(handler, x, y, radius);
-                cache.cells.put(key, new CellHit(value, now));
+                cacheCell = true;
+            }
+        } catch (Throwable ignored) {
+            // Cache setup is optional. Invoke the original once, below, outside
+            // the catch boundary so its exception/side effects stay exact.
+            cache = null;
+            cacheCell = false;
+        }
+
+        SectorEntityToken value = invokeOriginalHitTest(handler, x, y, radius);
+        if (cache != null) {
+            try {
+                if (cacheCell) cache.cells.put(cellKey, new CellHit(value, now));
                 cache.setLast(value, now);
                 HOVER_MISSES.increment();
-                return value;
+            } catch (Throwable ignored) {
+                // Returning the already-computed original result is always safe.
             }
-            SectorEntityToken value = invokeOriginalHitTest(handler, x, y, radius);
-            cache.setLast(value, now);
-            HOVER_MISSES.increment();
-            return value;
-        } catch (Throwable ex) {
-            return invokeOriginalHitTest(handler, x, y, radius);
         }
+        return value;
     }
 
     private static SectorEntityToken invokeOriginalHitTest(Object handler, float x, float y, float radius) {
         try {
-            HitAccess access = HitAccess.ACCESS.get(handler.getClass());
-            return (SectorEntityToken) access.original.invoke(handler, x, y, radius);
+            Method original = HitOriginalAccess.ORIGINAL.get(handler.getClass());
+            return (SectorEntityToken) original.invoke(handler, x, y, radius);
         } catch (InvocationTargetException ex) {
             Throwable cause = ex.getCause();
             if (cause instanceof RuntimeException) throw (RuntimeException) cause;
@@ -666,27 +714,35 @@ public final class MapOptimizerHooks {
         }
     }
 
+    private static final class HitOriginalAccess {
+        static final ClassValue<Method> ORIGINAL = new ClassValue<>() {
+            @Override
+            protected Method computeValue(Class<?> type) {
+                try {
+                    Method original = findDeclaredMethod(type,
+                            "smo$originalHitTest", float.class, float.class, float.class);
+                    original.setAccessible(true);
+                    return original;
+                } catch (ReflectiveOperationException ex) {
+                    throw new IllegalStateException(ex);
+                }
+            }
+        };
+    }
+
     private static final class HitAccess {
         static final ClassValue<HitAccess> ACCESS = new ClassValue<>() {
             @Override
             protected HitAccess computeValue(Class<?> type) {
                 try {
-                    Field mapField = null;
-                    for (Field field : type.getDeclaredFields()) {
-                        if (field.getType().getName().equals("com.fs.starfarer.coreui.A.H")) {
-                            mapField = field;
-                            break;
-                        }
-                    }
-                    if (mapField == null) throw new NoSuchFieldException("H map field");
+                    Field mapField = findUniqueFieldByTypeName(type,
+                            "com.fs.starfarer.coreui.A.H", "H map field");
                     mapField.setAccessible(true);
                     Class<?> mapType = mapField.getType();
                     Method getFactor = mapType.getMethod("getFactor");
                     Method getIcons = mapType.getMethod("getIcons");
                     Method getLocation = mapType.getMethod("getLocation");
-                    Method original = type.getDeclaredMethod("smo$originalHitTest", float.class, float.class, float.class);
-                    original.setAccessible(true);
-                    return new HitAccess(mapField, getFactor, getIcons, getLocation, original);
+                    return new HitAccess(mapField, getFactor, getIcons, getLocation);
                 } catch (ReflectiveOperationException ex) {
                     throw new IllegalStateException(ex);
                 }
@@ -697,14 +753,12 @@ public final class MapOptimizerHooks {
         final Method getFactor;
         final Method getIcons;
         final Method getLocation;
-        final Method original;
 
-        HitAccess(Field mapField, Method getFactor, Method getIcons, Method getLocation, Method original) {
+        HitAccess(Field mapField, Method getFactor, Method getIcons, Method getLocation) {
             this.mapField = mapField;
             this.getFactor = getFactor;
             this.getIcons = getIcons;
             this.getLocation = getLocation;
-            this.original = original;
         }
     }
 
@@ -768,43 +822,49 @@ public final class MapOptimizerHooks {
         systemNebulas.clear();
         constellationLabels.clear();
         nebulaStars.clear();
+        Throwable cacheFailure = null;
         try {
             SectorAPI sector = Global.getSector();
-            if (sector == null) {
-                invokeOriginalSystemNebulaBuilder(owner);
+            if (sector != null) {
+                NebulaCache cache = getOrBuildNebulaCache(sector, c);
+                SystemNebulaAccess access = SystemNebulaAccess.ACCESS.get(owner.getClass());
+                for (int i = 0; i < cache.systemNebulaSystems.size(); i++) {
+                    StarSystemAPI system = cache.systemNebulaSystems.get(i);
+                    Object terrain = access.createNebula.invoke(null, system);
+                    if (!(terrain instanceof SectorEntityToken token)) {
+                        throw new IllegalStateException("createNebula returned " + terrain);
+                    }
+                    token.getCustomData().put("system", system);
+                    token.getCustomData().put("seed", Long.valueOf(cache.systemNebulaSeeds[i]));
+                    systemNebulas.add(terrain);
+                }
+                for (Constellation constellation : cache.constellations) {
+                    Object label = access.createConstellationLabel.invoke(null, constellation);
+                    if (!(label instanceof SectorEntityToken token)) {
+                        throw new IllegalStateException("createConstellationLabel returned " + label);
+                    }
+                    token.getCustomData().put("constellationLabel", Boolean.TRUE);
+                    token.getCustomData().put("constellation", constellation);
+                    constellationLabels.add(label);
+                }
+                nebulaStars.addAll(cache.nebulaStars);
+                NEBULA_HITS.increment();
                 return;
             }
-            NebulaCache cache = getOrBuildNebulaCache(sector, c);
-            SystemNebulaAccess access = SystemNebulaAccess.ACCESS.get(owner.getClass());
-            for (int i = 0; i < cache.systemNebulaSystems.size(); i++) {
-                StarSystemAPI system = cache.systemNebulaSystems.get(i);
-                Object terrain = access.createNebula.invoke(null, system);
-                if (!(terrain instanceof SectorEntityToken token)) {
-                    throw new IllegalStateException("createNebula returned " + terrain);
-                }
-                token.getCustomData().put("system", system);
-                token.getCustomData().put("seed", Long.valueOf(cache.systemNebulaSeeds[i]));
-                systemNebulas.add(terrain);
-            }
-            for (Constellation constellation : cache.constellations) {
-                Object label = access.createConstellationLabel.invoke(null, constellation);
-                if (!(label instanceof SectorEntityToken token)) {
-                    throw new IllegalStateException("createConstellationLabel returned " + label);
-                }
-                token.getCustomData().put("constellationLabel", Boolean.TRUE);
-                token.getCustomData().put("constellation", constellation);
-                constellationLabels.add(label);
-            }
-            nebulaStars.addAll(cache.nebulaStars);
-            NEBULA_HITS.increment();
         } catch (Throwable ex) {
-            systemNebulas.clear();
-            constellationLabels.clear();
-            nebulaStars.clear();
-            OptimizerLog.warn("System-nebula metadata cache failed; using vanilla builder: "
-                    + ex.getClass().getSimpleName() + ": " + ex.getMessage());
-            invokeOriginalSystemNebulaBuilder(owner);
+            cacheFailure = ex;
         }
+
+        systemNebulas.clear();
+        constellationLabels.clear();
+        nebulaStars.clear();
+        if (cacheFailure != null) {
+            OptimizerLog.warn("System-nebula metadata cache failed; using vanilla builder: "
+                    + cacheFailure.getClass().getSimpleName() + ": " + cacheFailure.getMessage());
+        }
+        // Never place the original call inside the compatibility catch: if game
+        // or mod code throws, it must be observed after exactly one invocation.
+        invokeOriginalSystemNebulaBuilder(owner);
     }
 
     private static NebulaCache getOrBuildNebulaCache(SectorAPI sector, OptimizerConfig c) {
@@ -864,7 +924,7 @@ public final class MapOptimizerHooks {
 
     private static void invokeOriginalSystemNebulaBuilder(Object owner) {
         try {
-            SystemNebulaAccess.ACCESS.get(owner.getClass()).original.invoke(owner);
+            SystemNebulaOriginalAccess.ORIGINAL.get(owner.getClass()).invoke(owner);
         } catch (InvocationTargetException ex) {
             Throwable cause = ex.getCause();
             if (cause instanceof RuntimeException) throw (RuntimeException) cause;
@@ -875,28 +935,39 @@ public final class MapOptimizerHooks {
         }
     }
 
+    private static final class SystemNebulaOriginalAccess {
+        static final ClassValue<Method> ORIGINAL = new ClassValue<>() {
+            @Override
+            protected Method computeValue(Class<?> type) {
+                try {
+                    Method original = findDeclaredMethod(type, "smo$originalUpdateSystemNebulas");
+                    original.setAccessible(true);
+                    return original;
+                } catch (ReflectiveOperationException ex) {
+                    throw new IllegalStateException(ex);
+                }
+            }
+        };
+    }
+
     private static final class SystemNebulaAccess {
         static final ClassValue<SystemNebulaAccess> ACCESS = new ClassValue<>() {
             @Override
             protected SystemNebulaAccess computeValue(Class<?> type) {
                 try {
-                    Method original = type.getDeclaredMethod("smo$originalUpdateSystemNebulas");
-                    original.setAccessible(true);
                     Method createNebula = type.getMethod("createNebula", StarSystemAPI.class);
                     Method createConstellationLabel = type.getMethod("createConstellationLabel", Constellation.class);
-                    return new SystemNebulaAccess(original, createNebula, createConstellationLabel);
+                    return new SystemNebulaAccess(createNebula, createConstellationLabel);
                 } catch (ReflectiveOperationException ex) {
                     throw new IllegalStateException(ex);
                 }
             }
         };
 
-        final Method original;
         final Method createNebula;
         final Method createConstellationLabel;
 
-        SystemNebulaAccess(Method original, Method createNebula, Method createConstellationLabel) {
-            this.original = original;
+        SystemNebulaAccess(Method createNebula, Method createConstellationLabel) {
             this.createNebula = createNebula;
             this.createConstellationLabel = createConstellationLabel;
         }
@@ -987,7 +1058,7 @@ public final class MapOptimizerHooks {
     // by mods.
     // ---------------------------------------------------------------------
 
-    public static void readdChangeListenersIfNeeded(Object engine) {
+    public static void readdChangeListenersIfNeeded(Object engine, List<?> systems, Object hyperspace) {
         if (engine == null) return;
         OptimizerConfig c = config;
         if (c == null || !c.campaignListenerThrottle) {
@@ -995,19 +1066,13 @@ public final class MapOptimizerHooks {
             return;
         }
 
-        List<Object> systems;
-        Object hyperspace;
-        int size;
-        Object first;
-        Object last;
-        long now;
-        boolean refresh;
+        int size = -1;
+        Object first = null;
+        Object last = null;
+        long now = 0L;
+        boolean refresh = true;
+        boolean compatibilityFallback = false;
         try {
-            CampaignListenerAccess access = CampaignListenerAccess.ACCESS.get(engine.getClass());
-            @SuppressWarnings("unchecked")
-            List<Object> currentSystems = (List<Object>) access.starSystems.get(engine);
-            systems = currentSystems;
-            hyperspace = access.hyperspace.get(engine);
             size = systems == null ? -1 : systems.size();
             first = size > 0 ? systems.get(0) : null;
             last = size > 0 ? systems.get(size - 1) : null;
@@ -1025,8 +1090,12 @@ public final class MapOptimizerHooks {
                         || (auditNs > 0L && now - state.refreshedAtNanos >= auditNs);
             }
         } catch (Throwable ex) {
-            // Compatibility is more important than this optimization. If any mod
-            // changes the expected engine shape, execute the exact vanilla method.
+            compatibilityFallback = true;
+        }
+
+        if (compatibilityFallback) {
+            // Keep the original call outside the catch boundary so an exception
+            // from game/mod code cannot cause a retry.
             invokeReaddChangeListeners(engine);
             return;
         }
@@ -1071,26 +1140,18 @@ public final class MapOptimizerHooks {
             @Override
             protected CampaignListenerAccess computeValue(Class<?> type) {
                 try {
-                    Field systems = findField(type, "starSystems");
-                    Field hyperspace = findField(type, "hyperspace");
                     Method refresh = type.getMethod("readdChangeListeners");
-                    systems.setAccessible(true);
-                    hyperspace.setAccessible(true);
                     refresh.setAccessible(true);
-                    return new CampaignListenerAccess(systems, hyperspace, refresh);
+                    return new CampaignListenerAccess(refresh);
                 } catch (ReflectiveOperationException ex) {
                     throw new IllegalStateException("Unexpected CampaignEngine layout: " + type.getName(), ex);
                 }
             }
         };
 
-        final Field starSystems;
-        final Field hyperspace;
         final Method readdChangeListeners;
 
-        CampaignListenerAccess(Field starSystems, Field hyperspace, Method readdChangeListeners) {
-            this.starSystems = starSystems;
-            this.hyperspace = hyperspace;
+        CampaignListenerAccess(Method readdChangeListeners) {
             this.readdChangeListeners = readdChangeListeners;
         }
     }
@@ -1119,7 +1180,9 @@ public final class MapOptimizerHooks {
         if (hyperspace == null) return null;
         List live = hyperspace.getJumpPoints();
         OptimizerConfig c = config;
-        if (c == null || !c.routeJumpPointIndex || system == null || live == null || live.size() < 32) {
+        if (c == null || !c.routeJumpPointIndex || c.routeIndexTtlMs <= 0
+                || system == null || live == null || !(live instanceof RandomAccess)
+                || live.size() < 32) {
             ROUTE_JUMP_INDEX_FALLBACKS.increment();
             return live;
         }
@@ -1158,42 +1221,45 @@ public final class MapOptimizerHooks {
     public static List routeSystemsForAnchor(Object engine, Object anchor) {
         if (engine == null || anchor == null) return vanillaStarSystems(engine);
         OptimizerConfig c = config;
-        if (c == null || !c.routeJumpPointIndex) return vanillaStarSystems(engine);
+        if (c == null || !c.routeJumpPointIndex || c.routeIndexTtlMs <= 0) {
+            return vanillaStarSystems(engine);
+        }
 
         try {
             CampaignRouteAccess access = CampaignRouteAccess.ACCESS.get(engine.getClass());
-            List systems = (List) access.starSystems.get(engine);
-            if (systems == null || systems.size() < 32) return vanillaStarSystems(engine);
-
-            long now = System.nanoTime();
-            RouteSystemIndex index;
-            synchronized (ROUTE_SYSTEM_INDEXES) {
-                index = ROUTE_SYSTEM_INDEXES.get(engine);
-                if (index == null || !index.matches(systems, now, c.routeIndexTtlMs)) {
-                    index = RouteSystemIndex.build(systems, now);
-                    ROUTE_SYSTEM_INDEXES.put(engine, index);
-                    ROUTE_SYSTEM_INDEX_BUILDS.increment();
+            List systems = access.backingSystems(engine);
+            if (systems instanceof RandomAccess && systems.size() >= 32) {
+                long now = System.nanoTime();
+                RouteSystemIndex index;
+                synchronized (ROUTE_SYSTEM_INDEXES) {
+                    index = ROUTE_SYSTEM_INDEXES.get(engine);
+                    if (index == null || !index.matches(systems, now, c.routeIndexTtlMs)) {
+                        index = RouteSystemIndex.build(systems, now);
+                        ROUTE_SYSTEM_INDEXES.put(engine, index);
+                        ROUTE_SYSTEM_INDEX_BUILDS.increment();
+                    }
+                }
+                if (!index.failed) {
+                    List candidates = index.byAnchor.get(anchor);
+                    if (candidates != null) {
+                        ROUTE_SYSTEM_INDEX_HITS.increment();
+                        return candidates;
+                    }
                 }
             }
-            Object system = index.byAnchor.get(anchor);
-            if (system == null) {
-                // Preserve immediate visibility of unusual direct mutations.
-                ROUTE_SYSTEM_INDEX_FALLBACKS.increment();
-                return vanillaStarSystems(engine);
-            }
-            ROUTE_SYSTEM_INDEX_HITS.increment();
-            return Collections.singletonList(system);
-        } catch (Throwable ex) {
-            ROUTE_SYSTEM_INDEX_FALLBACKS.increment();
-            return vanillaStarSystems(engine);
+        } catch (Throwable ignored) {
+            // Fall through. The public getter below is deliberately independent
+            // from backing-field discovery, so compatibility fallback stays live.
         }
+        ROUTE_SYSTEM_INDEX_FALLBACKS.increment();
+        return vanillaStarSystems(engine);
     }
 
     @SuppressWarnings("rawtypes")
     private static List vanillaStarSystems(Object engine) {
         if (engine == null) return Collections.emptyList();
         try {
-            return (List) CampaignRouteAccess.ACCESS.get(engine.getClass()).getStarSystems.invoke(engine);
+            return (List) CampaignRouteGetter.GETTER.get(engine.getClass()).invoke(engine);
         } catch (InvocationTargetException ex) {
             throwUnchecked(ex.getCause());
             return Collections.emptyList(); // unreachable
@@ -1202,28 +1268,83 @@ public final class MapOptimizerHooks {
         }
     }
 
+    private static final class CampaignRouteGetter {
+        static final ClassValue<Method> GETTER = new ClassValue<>() {
+            @Override
+            protected Method computeValue(Class<?> type) {
+                try {
+                    Method getter = type.getMethod("getStarSystems");
+                    getter.setAccessible(true);
+                    return getter;
+                } catch (ReflectiveOperationException ex) {
+                    throw new IllegalStateException("Unexpected CampaignEngine route layout: "
+                            + type.getName(), ex);
+                }
+            }
+        };
+    }
+
     private static final class CampaignRouteAccess {
         static final ClassValue<CampaignRouteAccess> ACCESS = new ClassValue<>() {
             @Override
             protected CampaignRouteAccess computeValue(Class<?> type) {
-                try {
-                    Field systems = findField(type, "starSystems");
-                    Method getter = type.getMethod("getStarSystems");
-                    systems.setAccessible(true);
-                    getter.setAccessible(true);
-                    return new CampaignRouteAccess(systems, getter);
-                } catch (ReflectiveOperationException ex) {
-                    throw new IllegalStateException("Unexpected CampaignEngine route layout: " + type.getName(), ex);
+                Method getter = CampaignRouteGetter.GETTER.get(type);
+                ArrayList<Field> candidates = new ArrayList<>();
+                Class<?> current = type;
+                while (current != null) {
+                    for (Field field : current.getDeclaredFields()) {
+                        if (List.class.isAssignableFrom(field.getType())) {
+                            field.setAccessible(true);
+                            candidates.add(field);
+                        }
+                    }
+                    current = current.getSuperclass();
                 }
+                return new CampaignRouteAccess(candidates, getter);
             }
         };
 
-        final Field starSystems;
+        final List<Field> listFields;
         final Method getStarSystems;
+        volatile Field resolvedStarSystems;
 
-        CampaignRouteAccess(Field starSystems, Method getStarSystems) {
-            this.starSystems = starSystems;
+        CampaignRouteAccess(List<Field> listFields, Method getStarSystems) {
+            this.listFields = listFields;
             this.getStarSystems = getStarSystems;
+        }
+
+        @SuppressWarnings("rawtypes")
+        List backingSystems(Object engine) throws ReflectiveOperationException {
+            Field resolved = resolvedStarSystems;
+            if (resolved != null) return (List) resolved.get(engine);
+            synchronized (this) {
+                resolved = resolvedStarSystems;
+                if (resolved != null) return (List) resolved.get(engine);
+                List visible = (List) getStarSystems.invoke(engine);
+                Field match = null;
+                for (Field candidate : listFields) {
+                    Object value = candidate.get(engine);
+                    if (!(value instanceof List list) || !sameIdentityContents(list, visible)) continue;
+                    if (match != null) {
+                        throw new IllegalStateException("Ambiguous CampaignEngine star-system List fields");
+                    }
+                    match = candidate;
+                }
+                if (match == null) {
+                    throw new IllegalStateException("CampaignEngine backing star-system List was not found");
+                }
+                resolvedStarSystems = match;
+                return (List) match.get(engine);
+            }
+        }
+
+        @SuppressWarnings("rawtypes")
+        private static boolean sameIdentityContents(List candidate, List visible) {
+            if (candidate == null || visible == null || candidate.size() != visible.size()) return false;
+            for (int i = 0; i < candidate.size(); i++) {
+                if (candidate.get(i) != visible.get(i)) return false;
+            }
+            return true;
         }
     }
 
@@ -1231,17 +1352,22 @@ public final class MapOptimizerHooks {
         final int size;
         final Object first;
         final Object last;
-        final long builtAtNanos;
+        long validatedAtNanos;
         final IdentityHashMap<Object, List<SectorEntityToken>> bySystem;
+        final Object[] entries;
+        final Object[] destinationSystems;
         final boolean failed;
 
         RouteJumpIndex(int size, Object first, Object last, long builtAtNanos,
-                       IdentityHashMap<Object, List<SectorEntityToken>> bySystem, boolean failed) {
+                       IdentityHashMap<Object, List<SectorEntityToken>> bySystem,
+                       Object[] entries, Object[] destinationSystems, boolean failed) {
             this.size = size;
             this.first = first;
             this.last = last;
-            this.builtAtNanos = builtAtNanos;
+            this.validatedAtNanos = builtAtNanos;
             this.bySystem = bySystem;
+            this.entries = entries;
+            this.destinationSystems = destinationSystems;
             this.failed = failed;
         }
 
@@ -1250,8 +1376,25 @@ public final class MapOptimizerHooks {
             Object currentFirst = currentSize > 0 ? live.get(0) : null;
             Object currentLast = currentSize > 0 ? live.get(currentSize - 1) : null;
             long ttlNs = ttlMs * 1_000_000L;
-            return size == currentSize && first == currentFirst && last == currentLast
-                    && (ttlNs <= 0L || now - builtAtNanos < ttlNs);
+            if (size != currentSize || first != currentFirst || last != currentLast) return false;
+            if (ttlNs <= 0L) return false;
+            if (now - validatedAtNanos < ttlNs) return true;
+            if (failed) return false;
+
+            // Size/edge checks do not catch middle replacement or a mod retargeting
+            // an existing jump point. Periodically validate the full relation while
+            // keeping ordinary cache hits O(1); a mismatch rebuilds the index.
+            try {
+                for (int i = 0; i < currentSize; i++) {
+                    Object raw = live.get(i);
+                    if (raw != entries[i]
+                            || destinationSystem(raw) != destinationSystems[i]) return false;
+                }
+            } catch (Throwable ignored) {
+                return false;
+            }
+            validatedAtNanos = now;
+            return true;
         }
 
         @SuppressWarnings("rawtypes")
@@ -1260,28 +1403,37 @@ public final class MapOptimizerHooks {
             Object first = size > 0 ? live.get(0) : null;
             Object last = size > 0 ? live.get(size - 1) : null;
             IdentityHashMap<Object, List<SectorEntityToken>> bySystem = new IdentityHashMap<>();
+            Object[] entries = new Object[size];
+            Object[] destinationSystems = new Object[size];
             try {
                 for (int i = 0; i < size; i++) {
                     Object raw = live.get(i);
-                    if (!(raw instanceof JumpPointAPI jumpPoint)) {
-                        return new RouteJumpIndex(size, first, last, now, bySystem, true);
-                    }
-                    List<JumpPointAPI.JumpDestination> destinations = jumpPoint.getDestinations();
-                    if (destinations == null || destinations.isEmpty()) continue;
-                    JumpPointAPI.JumpDestination firstDestination = destinations.get(0);
-                    if (firstDestination == null || firstDestination.getDestination() == null) {
-                        return new RouteJumpIndex(size, first, last, now, bySystem, true);
-                    }
-                    SectorEntityToken destination = firstDestination.getDestination();
-                    LocationAPI location = destination.getContainingLocation();
+                    entries[i] = raw;
+                    Object location = destinationSystem(raw);
+                    destinationSystems[i] = location;
                     if (location == null) continue;
                     bySystem.computeIfAbsent(location, ignored -> new ArrayList<>(2))
                             .add((SectorEntityToken) raw);
                 }
-                return new RouteJumpIndex(size, first, last, now, bySystem, false);
+                return new RouteJumpIndex(size, first, last, now, bySystem,
+                        entries, destinationSystems, false);
             } catch (Throwable ex) {
-                return new RouteJumpIndex(size, first, last, now, bySystem, true);
+                return new RouteJumpIndex(size, first, last, now, bySystem,
+                        entries, destinationSystems, true);
             }
+        }
+
+        private static Object destinationSystem(Object raw) {
+            if (!(raw instanceof JumpPointAPI jumpPoint)) {
+                throw new IllegalStateException("Non-jump-point entry in hyperspace jump list");
+            }
+            List<JumpPointAPI.JumpDestination> destinations = jumpPoint.getDestinations();
+            if (destinations == null || destinations.isEmpty()) return null;
+            JumpPointAPI.JumpDestination firstDestination = destinations.get(0);
+            if (firstDestination == null || firstDestination.getDestination() == null) {
+                throw new IllegalStateException("Malformed jump-point destination");
+            }
+            return firstDestination.getDestination().getContainingLocation();
         }
     }
 
@@ -1289,16 +1441,23 @@ public final class MapOptimizerHooks {
         final int size;
         final Object first;
         final Object last;
-        final long builtAtNanos;
-        final IdentityHashMap<Object, Object> byAnchor;
+        long validatedAtNanos;
+        final IdentityHashMap<Object, List<Object>> byAnchor;
+        final Object[] entries;
+        final Object[] anchors;
+        final boolean failed;
 
         RouteSystemIndex(int size, Object first, Object last, long builtAtNanos,
-                         IdentityHashMap<Object, Object> byAnchor) {
+                         IdentityHashMap<Object, List<Object>> byAnchor,
+                         Object[] entries, Object[] anchors, boolean failed) {
             this.size = size;
             this.first = first;
             this.last = last;
-            this.builtAtNanos = builtAtNanos;
+            this.validatedAtNanos = builtAtNanos;
             this.byAnchor = byAnchor;
+            this.entries = entries;
+            this.anchors = anchors;
+            this.failed = failed;
         }
 
         boolean matches(List<?> live, long now, int ttlMs) {
@@ -1306,8 +1465,22 @@ public final class MapOptimizerHooks {
             Object currentFirst = currentSize > 0 ? live.get(0) : null;
             Object currentLast = currentSize > 0 ? live.get(currentSize - 1) : null;
             long ttlNs = ttlMs * 1_000_000L;
-            return size == currentSize && first == currentFirst && last == currentLast
-                    && (ttlNs <= 0L || now - builtAtNanos < ttlNs);
+            if (size != currentSize || first != currentFirst || last != currentLast) return false;
+            if (ttlNs <= 0L) return false;
+            if (now - validatedAtNanos < ttlNs) return true;
+            if (failed) return false;
+
+            try {
+                for (int i = 0; i < currentSize; i++) {
+                    Object raw = live.get(i);
+                    if (raw != entries[i] || !(raw instanceof StarSystemAPI system)
+                            || system.getHyperspaceAnchor() != anchors[i]) return false;
+                }
+            } catch (Throwable ignored) {
+                return false;
+            }
+            validatedAtNanos = now;
+            return true;
         }
 
         @SuppressWarnings("rawtypes")
@@ -1315,16 +1488,58 @@ public final class MapOptimizerHooks {
             int size = systems.size();
             Object first = size > 0 ? systems.get(0) : null;
             Object last = size > 0 ? systems.get(size - 1) : null;
-            IdentityHashMap<Object, Object> byAnchor = new IdentityHashMap<>(Math.max(32, size * 2));
-            for (int i = 0; i < size; i++) {
-                Object raw = systems.get(i);
-                if (raw instanceof StarSystemAPI system) {
+            IdentityHashMap<Object, List<Object>> byAnchor = new IdentityHashMap<>(Math.max(32, size * 2));
+            Object[] entries = new Object[size];
+            Object[] anchors = new Object[size];
+            try {
+                for (int i = 0; i < size; i++) {
+                    Object raw = systems.get(i);
+                    entries[i] = raw;
+                    if (!(raw instanceof StarSystemAPI system)) {
+                        throw new IllegalStateException("Non-system entry in CampaignEngine star-system list");
+                    }
                     SectorEntityToken anchor = system.getHyperspaceAnchor();
-                    if (anchor != null) byAnchor.put(anchor, raw);
+                    anchors[i] = anchor;
+                    if (anchor != null) {
+                        byAnchor.computeIfAbsent(anchor, ignored -> new ArrayList<>(1)).add(raw);
+                    }
                 }
+                return new RouteSystemIndex(size, first, last, now, byAnchor, entries, anchors, false);
+            } catch (Throwable ex) {
+                return new RouteSystemIndex(size, first, last, now, byAnchor, entries, anchors, true);
             }
-            return new RouteSystemIndex(size, first, last, now, byAnchor);
         }
+    }
+
+    private static Method findDeclaredMethod(Class<?> type, String name, Class<?>... parameterTypes)
+            throws NoSuchMethodException {
+        Class<?> current = type;
+        while (current != null) {
+            try {
+                return current.getDeclaredMethod(name, parameterTypes);
+            } catch (NoSuchMethodException ignored) {
+                current = current.getSuperclass();
+            }
+        }
+        throw new NoSuchMethodException(type.getName() + "." + name);
+    }
+
+    private static Field findUniqueFieldByTypeName(Class<?> type, String fieldTypeName, String label)
+            throws NoSuchFieldException {
+        Field result = null;
+        Class<?> current = type;
+        while (current != null) {
+            for (Field field : current.getDeclaredFields()) {
+                if (!field.getType().getName().equals(fieldTypeName)) continue;
+                if (result != null) {
+                    throw new NoSuchFieldException("Ambiguous " + label + " in " + type.getName());
+                }
+                result = field;
+            }
+            current = current.getSuperclass();
+        }
+        if (result == null) throw new NoSuchFieldException(label + " in " + type.getName());
+        return result;
     }
 
     private static Field findField(Class<?> type, String name) throws NoSuchFieldException {
@@ -1406,6 +1621,20 @@ public final class MapOptimizerHooks {
     }
 
     private static final class Scratch {
+        final ArrayList<ScratchFrame> frames = new ArrayList<>(2);
+        int scopeDepth;
+
+        ScratchFrame frameAt(int index) {
+            while (frames.size() <= index) frames.add(new ScratchFrame());
+            return frames.get(index);
+        }
+
+        ScratchFrame scopeFrame() {
+            return frameAt(Math.max(0, scopeDepth - 1));
+        }
+    }
+
+    private static final class ScratchFrame {
         final ArrayList<Object> entityList = new ArrayList<>(1024);
         final ArrayList<Object> hitList = new ArrayList<>(1024);
         final HashSet<Object> classSet = new HashSet<>(16);
@@ -1421,5 +1650,18 @@ public final class MapOptimizerHooks {
                 new Vector2f(), new Vector2f(), new Vector2f(), new Vector2f()
         };
         int arrowVectorIndex;
+
+        void clear() {
+            entityList.clear();
+            hitList.clear();
+            classSet.clear();
+            identityMembership.clear();
+            equalityMembership.clear();
+            containsSet.clear();
+            containsSource = null;
+            containsSourceSize = -1;
+            labelCandidates.clear();
+            arrowVectorIndex = 0;
+        }
     }
 }

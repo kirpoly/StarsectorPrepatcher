@@ -13,6 +13,8 @@ public final class MapOptimizerBootstrapPlugin extends BaseModPlugin {
         String version = System.getProperty("starsector.mapoptimizer.version", "unknown");
         String status = System.getProperty("starsector.mapoptimizer.status", "javaagent-not-installed");
         String patched = System.getProperty("starsector.mapoptimizer.patchedClasses", "0");
+        String applied = System.getProperty("starsector.mapoptimizer.appliedPatches", "0");
+        String skipped = System.getProperty("starsector.mapoptimizer.skippedPatches", "0");
         if ("javaagent-not-installed".equals(status)) {
             Global.getLogger(MapOptimizerBootstrapPlugin.class).warn(
                     "Starsector Map Optimizer mod is enabled, but its javaagent is not installed. "
@@ -20,7 +22,9 @@ public final class MapOptimizerBootstrapPlugin extends BaseModPlugin {
         } else {
             Global.getLogger(MapOptimizerBootstrapPlugin.class).info(
                     "Starsector Map Optimizer " + version + ": status=" + status
-                    + ", patchedClassesSoFar=" + patched);
+                    + ", patchedClassesSoFar=" + patched
+                    + ", appliedPatchesSoFar=" + applied
+                    + ", skippedPatchesSoFar=" + skipped);
         }
     }
 }

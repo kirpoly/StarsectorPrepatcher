@@ -11,7 +11,6 @@ public final class OptimizerConfig {
     private final Properties properties = new Properties();
 
     public final boolean enabled;
-    public final boolean requireKnownGameJar;
     public final boolean retainAll;
     public final boolean scratchCollections;
     public final boolean labelSpatialCandidates;
@@ -46,7 +45,6 @@ public final class OptimizerConfig {
     private OptimizerConfig(Properties p) {
         properties.putAll(p);
         enabled = bool("enabled", true);
-        requireKnownGameJar = bool("compatibility.requireKnownGameJar", true);
         retainAll = bool("patch.retainAll", true);
         scratchCollections = bool("patch.scratchCollections", true);
         labelSpatialCandidates = bool("patch.labelSpatialCandidates", true);
