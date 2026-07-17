@@ -4,7 +4,9 @@
 
 Current version: **0.8.0**. Supported game build: **Starsector 0.98a-RC8**.
 
-[Watch the unplayable-vs-Prepatcher smoothness comparison (WebM)](media/smoothness_comparison_60fps.webm).
+[![Unplayable without Prepatcher versus smooth with Prepatcher](media/smoothness_comparison.gif)](https://github.com/kirpoly/StarsectorPrepatcher/releases/download/v0.8.0/StarsectorPrepatcher-0.8.0-comparison.webm)
+
+Click the preview for the full 60 FPS WebM comparison.
 
 StarsectorPrepatcher is a compatibility-first pre-load patching layer for Starsector. Its startup
 javaagent runs before the game and mod classloaders begin normal loading, so guarded structural

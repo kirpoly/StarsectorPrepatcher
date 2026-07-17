@@ -4,7 +4,9 @@
 
 Текущая версия: **0.8.0**. Поддерживаемая версия игры: **Starsector 0.98a-RC8**.
 
-[Сравнение плавности без препатчера и с ним (WebM)](media/smoothness_comparison_60fps.webm).
+[![Без препатчера и с ним](media/smoothness_comparison.gif)](https://github.com/kirpoly/StarsectorPrepatcher/releases/download/v0.8.0/StarsectorPrepatcher-0.8.0-comparison.webm)
+
+Нажмите на превью, чтобы открыть полное сравнение в WebM при 60 FPS.
 
 StarsectorPrepatcher — compatibility-first слой ранних патчей Starsector. Startup-javaagent'ы
 запускаются до обычной загрузки игровых и модовых classloader'ов, поэтому защищённые структурные
