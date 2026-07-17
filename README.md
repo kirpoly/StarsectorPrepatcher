@@ -37,6 +37,13 @@ not use whole-class hashes. It checks whichever game files are installed, origin
 and accepts them when the local bytecode contract still matches. Unknown, ambiguous, or partially
 changed sites remain vanilla and the reason is written to the diagnostic log.
 
+The agent control code and the typed runtime are deliberately separated. At startup the agent reads
+the `com.fs.starfarer.api.StarsectorPrepatcher*` runtime classfiles from its own JAR and defines them
+in the classloader that owns Starsector's API. This keeps hook arguments loader-identical under both
+the vanilla launcher and Faster Rendering's custom system classloader. The transformer is registered
+only after that runtime is installed successfully, and it skips a target whose loader differs from
+the runtime loader.
+
 The bootstrap plugin does not perform bytecode work. It exposes agent status through the normal game
 log and warns when the mod is enabled without the startup agent.
 
@@ -44,11 +51,25 @@ log and warns when the mod is enabled without the startup agent.
 
 1. Fully close Starsector.
 2. Extract the directory as `<Starsector>\mods\StarsectorPrepatcher`.
-3. Run `<Starsector>\mods\StarsectorPrepatcher\install-agent.bat`.
+3. Install the agent for the launcher you use (commands below).
 4. Enable **StarsectorPrepatcher** in the launcher and start the game.
 
-The installer creates a timestamped `vmparams` backup, replaces any existing entries for this
-installation, and places it after any other `-javaagent` options:
+For the vanilla launcher, run:
+
+```bat
+install-agent.bat
+```
+
+For Faster Rendering (`starsector-core\fr.bat`), run:
+
+```bat
+install-agent.bat -Target FasterRendering
+```
+
+To configure both launch paths, use `install-agent.bat -Target Both`. The installer understands
+both vanilla's `vmparams` command line and Faster Rendering's `starsector-core\fr.vmparams` Java
+argument file. For every changed file it creates a timestamped backup, replaces any existing entry
+for this installation, and places Prepatcher after every other `-javaagent` option:
 
 ```text
 -javaagent:../mods/StarsectorPrepatcher/agent/StarsectorPrepatcherAgent.jar
@@ -57,6 +78,9 @@ installation, and places it after any other `-javaagent` options:
 The folder name must not contain whitespace and should remain `StarsectorPrepatcher` after
 installation. No additional `--add-exports` options are required; the agent exports the required JDK
 ASM packages through `Instrumentation.redefineModule()`.
+
+Install telemetry and other agents first, or rerun this installer afterward. Prepatcher must remain
+the final `-javaagent` so its transformer sees the bytes returned by earlier agents.
 
 The prepatcher does not modify save data, and its runtime caches are never serialized.
 
@@ -87,7 +111,8 @@ enabled=false
 because they participated in confirmed mission-startup failures. They will not be re-enabled until
 their fixes pass an isolated startup and mission suite.
 
-Run `uninstall-agent.bat` to remove the managed entry from `vmparams`.
+Run `uninstall-agent.bat` for vanilla, `uninstall-agent.bat -Target FasterRendering` for FR, or
+`uninstall-agent.bat -Target Both` to remove both managed entries. Each changed file is backed up.
 
 ## Diagnostics and verification
 
@@ -97,12 +122,15 @@ Runtime logs:
 mods\StarsectorPrepatcher\logs\prepatcher.log
 ```
 
-The agent records `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, or `SKIPPED_ERROR` for every
-patch. Hyperspace targets use the same structural, per-patch status model as all other targets.
+The agent records `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, `SKIPPED_LOADER`, or
+`SKIPPED_ERROR` for every patch. Hyperspace targets use the same structural, per-patch status model
+as all other targets. `SKIPPED_LOADER` is a fail-open classloader guard and must be investigated
+before calling that launch path compatible.
 
 Run `verify-structural.bat` on Windows or `./verify-structural.sh` on Linux/macOS for the complete
 documentation, structural, negative/idempotency, lifecycle/GC, runtime, hyperspace, and agent
-startup suite. Build details are in [`BUILDING.md`](BUILDING.md).
+startup suite. When `fr.jar` is present it also runs the real Faster Rendering classloader smoke.
+Build details are in [`BUILDING.md`](BUILDING.md).
 
 ## Documentation
 

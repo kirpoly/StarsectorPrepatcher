@@ -50,6 +50,8 @@ Javaagent-классы и их `static`/`ThreadLocal` живут до завер
 | TTL correctness | до истечения TTL не проверяется дешёвый mutable input: position, order, identity, tag | мутация сразу после build сравнивается с vanilla; явно доказано допустимое окно stale-данных либо есть live validation |
 | Failed-cache storm | failed build не memoize-ится и повторяет allocation/full scan каждый вызов | malformed/custom объект многократно вызывает path; build выполняется ограниченно, fallback остаётся полным |
 | Encoding/platform drift | `javac` использует системную code page; PowerShell содержит bash syntax; проверка шла на другой JDK | explicit UTF-8, parser/syntax check для каждого script, полный прогон на целевом JDK 17 и ОС |
+| Loader constraint violation | typed hook и target определены sibling/child classloader'ами и имеют разные копии `com.fs.*` | payload определяется через game-loader lookup; hooks, API и targets имеют identity-equal loader; wrong-loader target получает `SKIPPED_LOADER` без изменения bytes |
+| FR resolver drift | payload больше не может разрешить `PrepatcherConfig`/`PrepatcherLog` через fallback FR `AppClassLoader` → `JavaAgentLoader` | FR smoke выполняет bridge configuration и runtime logging; install failure происходит до регистрации transformer; остаточная связь явно учитывается до перехода на полностью JDK-only boundary |
 
 ## Обязательные review gates
 
@@ -71,6 +73,12 @@ Review не считается завершённым без следующих 
    same-frame invalidators. Производительность не оправдывает незаявленное изменение семантики.
 8. **Toolchain contract:** команды воспроизводимы из clean checkout, используют Java 17 и explicit
    UTF-8; Windows и POSIX entrypoints передают одинаковые arguments и exit codes.
+9. **Loader contract:** перечислены loader control plane, payload, API и каждого target. До
+   регистрации transformer весь payload определён loader'ом target; несовпадение identity даёт
+   локальный `SKIPPED_LOADER`, а не потенциальный поздний `LinkageError`.
+10. **Parent-loader exceptions:** target, который не видит game-loader runtime, не получает typed
+    helper call. Для `sound.Sound` разрешена только structurally-verified inline-трансформация без
+    runtime descriptor; новые исключения должны быть перечислены отдельно.
 
 ## Обязательные test gates
 
@@ -90,6 +98,13 @@ Review не считается завершённым без следующих 
 - documentation consistency: строгий `X.Y.Z` совпадает в `mod_info.json`, agent sources и
   manifests; changelog упорядочен, все актуальные документы достижимы от README, ссылки целы,
   а `SHA256SUMS.txt` полностью покрывает поставляемое дерево и совпадает с его содержимым;
+- agent JAR содержит все top-level/nested entries `com/fs/starfarer/api/StarsectorPrepatcher*`, а
+  control plane не имеет typed-ссылок, которые заставят agent loader определить payload;
+- loader harness подтверждает vanilla и FR-like topology: payload/API/targets принадлежат одному
+  system/game loader, premain control code — отдельному agent loader; wrong-loader negative case
+  оставляет bytes без изменений и публикует `SKIPPED_LOADER`;
+- structural test `sound.Sound` подтверждает exact inline suppression, отсутствие helper
+  `INVOKESTATIC` и полную postcondition/idempotency marker;
 - полный `verify-structural` на целевой Java 17; PowerShell parser check и POSIX shell syntax check;
 - реальный startup/activity smoke на той же Starsector-установке, для которой публикуется guard.
 
@@ -97,6 +112,34 @@ Review не считается завершённым без следующих 
 какой-либо gate временно неприменим, патч остаётся experimental/disabled by default. Исключение
 допустимо только по явному решению владельца релиза, при наличии отдельного kill switch и записи
 причины/остаточного риска в отчёте соответствующего выпуска из [`releases/`](releases/0.8.0.md).
+
+## Матрица запуска vanilla и Faster Rendering
+
+Loader harness необходим, но не заменяет запуск настоящего `fr.jar`. Перед merge/release нужно
+проверить одну и ту же mod-сборку и порядок agents как минимум в двух режимах:
+
+1. Vanilla: root `vmparams`, запуск обычного launcher.
+2. Faster Rendering: `starsector-core/fr.vmparams`, запуск `starsector-core/fr.bat`.
+
+В обоих режимах выполняются cold startup, создание новой кампании до первого campaign frame,
+загрузка существующего save, открытие sector/system/Intel map, переход через hyperspace и один бой.
+При включённой telemetry порядок должен быть `Telemetry` → `Prepatcher`; его можно восстановить
+идемпотентным вызовом `install-agent.bat -Target Vanilla` или
+`install-agent.bat -Target FasterRendering`.
+
+Обязательные loader assertions для FR:
+
+```text
+StarsectorPrepatcherHooks.class.getClassLoader()
+    == CampaignEngine.class.getClassLoader()
+    == ClassLoader.getSystemClassLoader()
+```
+
+В `prepatcher.log` должны быть успешная установка target-loader runtime и ожидаемые patch statuses.
+Любой `LinkageError`, `NoClassDefFoundError` payload/agent types, `SKIPPED_LOADER`, определение
+payload через agent loader или расхождение результатов vanilla/FR блокирует merge. Отдельно
+сохраняются startup/mission logs: успешный главный экран не покрывает deferred hook linkage,
+которое впервые происходит при генерации кампании или первом frame.
 
 ## Временно отключённые startup-патчи
 

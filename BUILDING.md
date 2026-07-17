@@ -30,6 +30,19 @@ agent/StarsectorPrepatcherAgent.jar
 jars/StarsectorPrepatcherBootstrap.jar
 ```
 
+Typed runtime находится в исходниках exact-пакета `source/agent/com/fs/starfarer/api` и попадает в
+agent JAR как обычные entries `com/fs/starfarer/api/StarsectorPrepatcher*.class`. Control-код agent
+не должен иметь на них статических ссылок: `RuntimeInstaller` читает эти entries как bytes и через
+`MethodHandles.Lookup.defineClass()` определяет их в system/game loader. Build завершается ошибкой,
+если в JAR нет обязательных top-level entries или exact inventory текущего payload отличается от
+48 top-level/nested class entries:
+
+```text
+com/fs/starfarer/api/StarsectorPrepatcherHooks.class
+com/fs/starfarer/api/StarsectorPrepatcherHyperspaceHooks.class
+com/fs/starfarer/api/StarsectorPrepatcherRuntimeBridge.class
+```
+
 В конце сборка атомарно регенерирует `SHA256SUMS.txt` для поставляемых файлов. Сам manifest,
 runtime-логи и содержимое `.build/` в него не входят.
 
@@ -70,7 +83,10 @@ Linux/macOS:
 7. запускает lifecycle, exp6, exp8 и loading/save runtime suites;
 8. проверяет локальные structural contracts hyperspace targets из `starfarer.api.jar` и
    `starfarer_obf.jar` той установки, где находится мод — оригинальной либо переводной;
-9. запускает собранный javaagent и сохраняет startup smoke.
+9. проверяет target-loader runtime: состав payload, порядок определения nest members, vanilla
+   system-loader path, FR-like split agent/game loaders, fail-open при неверном loader и отсутствие
+   cross-loader вызова из `sound.Sound`;
+10. запускает собранный javaagent и сохраняет startup smoke.
 
 Structural harness создаёт внутренний `.build/structural-all-enabled.properties` из aggressive
 profile и только там включает known-disabled loading/startup patches, чтобы продолжать проверять
@@ -78,8 +94,10 @@ profile и только там включает known-disabled loading/startup p
 поставляемых профилях оба проблемных переключателя остаются `false`.
 
 Сырые отчёты `documentation-consistency.txt`, `structural-verification.txt`,
-`runtime-regression.txt`, `hyperspace-verification.txt` и `startup-smoke.txt` создаются в
-`.build/reports/` и намеренно не входят в документацию или дистрибутив.
+`runtime-regression.txt`, `hyperspace-verification.txt`, `startup-smoke.txt` и
+`faster-rendering-loader-smoke.txt` создаются в `.build/reports/` и намеренно не входят в
+документацию или дистрибутив. Если `fr.jar` отсутствует, FR smoke явно получает `SKIPPED`; такой
+результат допустим для обычной разработки, но не для выпуска с заявленной FR-совместимостью.
 Краткие пользовательские изменения фиксируются в [`CHANGELOG.md`](CHANGELOG.md), а причины,
 измерения и остаточные риски — в [`docs/releases/`](docs/releases/0.8.0.md). Обязательные regression
 gates для новых pre-load патчей описаны в [`docs/VALIDATION.md`](docs/VALIDATION.md).
@@ -89,3 +107,26 @@ gates для новых pre-load патчей описаны в [`docs/VALIDATIO
 Scripts используют `-encoding UTF-8 -source 17 -target 17`. Из-за доступа к JDK-internal ASM вместо `--release 17`
 применяются compile-time `--add-exports`. Runtime vmparams flags не нужны: startup-agent вызывает
 `Instrumentation.redefineModule()` до регистрации transformer.
+
+## Проверка с Faster Rendering
+
+Автоматический FR-like harness обязан подтвердить главное identity-условие:
+
+```text
+StarsectorPrepatcherHooks.class.getClassLoader()
+    == CampaignEngine.class.getClassLoader()
+    == ClassLoader.getSystemClassLoader()
+```
+
+Перед выпуском дополнительно нужен реальный Windows-прогон той версии Faster Rendering, с которой
+заявляется совместимость. Сначала установите telemetry, затем выполните из каталога мода:
+
+```bat
+install-agent.bat -Target FasterRendering
+```
+
+Запустите `starsector-core\fr.bat`, создайте новую кампанию и пройдите сценарии из
+[`docs/VALIDATION.md`](docs/VALIDATION.md). В `logs/prepatcher.log` должны присутствовать сообщение
+об установленном target-loader runtime и ожидаемые `APPLIED`/`ALREADY_APPLIED`; `LinkageError`,
+`SKIPPED_LOADER` и загрузка payload-класса agent loader'ом являются блокирующими результатами.
+Сам build/verify workflow не изменяет `fr.vmparams`; это делает только явный вызов installer.

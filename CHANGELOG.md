@@ -16,10 +16,34 @@
 
 ## [Unreleased]
 
+### Добавлено
+
+- Installer получил явный `-Target Vanilla|FasterRendering|Both`: он поддерживает как root
+  `vmparams`, так и `starsector-core/fr.vmparams`, сохраняет отдельные timestamped backups и
+  идемпотентно размещает Prepatcher последним `-javaagent`.
+- Добавлены loader regression gates для vanilla и FR-like topology, wrong-loader fail-open и
+  parent-loaded `sound.Sound`.
+
+### Изменено
+
+- Typed hooks перенесены в payload exact-пакета `com.fs.starfarer.api`. Startup control plane читает
+  их classfile'ы из agent JAR и определяет через lookup loader'а Starsector до регистрации
+  transformer.
+- `sound.Sound`, который Faster Rendering оставляет в parent loader, подавляет сопоставленный
+  pure-INFO блок inline без cross-loader helper call.
+
+### Исправлено
+
+- Устранён `loader constraint violation` при вызове typed hooks с Faster Rendering: transformer
+  теперь требует identity-equal target/runtime loader и fail-open публикует `SKIPPED_LOADER` при
+  несовпадении.
+
 ### Документация
 
 - Добавлен технический roadmap: обязательный name-independent structural discovery до загрузки
   классов, декомпозиция patch/runtime-кода, formatter, Linux Tier 1 и macOS best effort.
+- Описаны classloader topology Faster Rendering, остаточная зависимость payload от FR fallback в
+  `JavaAgentLoader`, installer targets и обязательная real-launch матрица до выпуска.
 
 ## [0.8.0] - 2026-07-17
 
