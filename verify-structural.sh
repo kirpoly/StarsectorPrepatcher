@@ -6,7 +6,6 @@ GAME_ROOT="$(cd "$MOD_ROOT/../.." && pwd)"
 CORE="$GAME_ROOT/starsector-core"
 BUILD="$MOD_ROOT/.build"
 AGENT_CLASSES="$BUILD/agent-classes"
-HYPER_CLASSES="$BUILD/hyperspace-classes"
 TEST_CLASSES="$BUILD/test-classes"
 REPORT_DIR="$BUILD/reports"
 EXPORTS=(
@@ -32,6 +31,7 @@ if (( $# == 0 )); then
     "$CORE/starfarer_obf.jar"
     "$CORE/fs.common_obf.jar"
     "$CORE/fs.sound_obf.jar"
+    "$CORE/starfarer.api.jar"
   )
 else
   CORE_JARS=("$@")
@@ -65,14 +65,13 @@ RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/st
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.LoadingSaveRuntimeRegressionTest
 } 2>&1 | tee "$REPORT_DIR/runtime-regression.txt"
 
-java "${EXPORTS[@]}" -cp "$HYPER_CLASSES" \
-  com.starsector.prepatcher.hyperspace.OfflineVerifier \
-  "$CORE/starfarer_obf.jar" "$CORE/starfarer.api.jar" \
+java "${EXPORTS[@]}" -cp "$TEST_CLASSES:$TEST_CP" \
+  com.starsector.prepatcher.agent.HyperspaceCompatibilityTest \
+  "$VERIFICATION_CONFIG" "$CORE/starfarer_obf.jar" "$CORE/starfarer.api.jar" \
   "$REPORT_DIR/hyperspace-verification.txt"
 
 java \
   "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar" \
-  "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherHyperspaceAgent.jar" \
   -version 2>&1 | tee "$REPORT_DIR/startup-smoke.txt"
 
 echo 'Documentation/structural/runtime/hyperspace/startup verification completed.'

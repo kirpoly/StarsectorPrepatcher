@@ -1,6 +1,7 @@
 package com.starsector.prepatcher.agent;
 
 import com.starsector.prepatcher.runtime.PrepatcherHooks;
+import com.starsector.prepatcher.hyperspace.HyperspaceHooks;
 
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
@@ -41,11 +42,12 @@ public final class PrepatcherAgent {
             }
 
             PrepatcherHooks.configure(config, modRoot);
+            HyperspaceHooks.configure(config);
             exportInternalAsm(instrumentation);
             ClassFileTransformer transformer = new PrepatcherTransformer(config);
             instrumentation.addTransformer(transformer, false);
-            System.setProperty("starsector.prepatcher.status", "structural-transformer-installed");
-            PrepatcherLog.info("Structural transformer installed. Each patch will be matched, applied,"
+            System.setProperty("starsector.prepatcher.status", "transformer-installed");
+            PrepatcherLog.info("Unified transformer installed. Each patch will be matched, applied,"
                     + " and verified independently as its target class loads.");
         } catch (Throwable ex) {
             System.setProperty("starsector.prepatcher.status", "agent-error");

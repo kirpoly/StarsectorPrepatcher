@@ -5,7 +5,7 @@ GAME_ROOT="$(cd "$MOD_ROOT/../.." && pwd)"
 CORE="$GAME_ROOT/starsector-core"
 BUILD="$MOD_ROOT/.build"
 rm -rf "$BUILD"
-mkdir -p "$BUILD/agent-classes" "$BUILD/hyperspace-classes" "$BUILD/bootstrap-classes" "$MOD_ROOT/agent" "$MOD_ROOT/jars"
+mkdir -p "$BUILD/agent-classes" "$BUILD/bootstrap-classes" "$MOD_ROOT/agent" "$MOD_ROOT/jars"
 CP_AGENT="$CORE/starfarer.api.jar:$CORE/starfarer_obf.jar:$CORE/fs.common_obf.jar:$CORE/fs.sound_obf.jar:$CORE/lwjgl.jar:$CORE/lwjgl_util.jar"
 CP_BOOT="$CORE/starfarer.api.jar:$CORE/starfarer_obf.jar:$CORE/log4j-1.2.9.jar"
 EXPORTS=(
@@ -14,8 +14,6 @@ EXPORTS=(
   --add-exports java.base/jdk.internal.org.objectweb.asm.tree.analysis=ALL-UNNAMED
 )
 find "$MOD_ROOT/source/agent" -name '*.java' -print0 | xargs -0 javac -encoding UTF-8 -source 17 -target 17 "${EXPORTS[@]}" -cp "$CP_AGENT" -d "$BUILD/agent-classes"
-find "$MOD_ROOT/source/hyperspace" -name '*.java' -print0 | xargs -0 javac -encoding UTF-8 -source 17 -target 17 "${EXPORTS[@]}" -cp "$CP_AGENT" -d "$BUILD/hyperspace-classes"
-cp "$MOD_ROOT/source/hyperspace-resources/hyperspace-targets.properties" "$BUILD/hyperspace-classes/"
 find "$MOD_ROOT/source/bootstrap" -name '*.java' -print0 | xargs -0 javac -encoding UTF-8 -source 17 -target 17 -cp "$CP_BOOT" -d "$BUILD/bootstrap-classes"
 printf '%s\n' \
   'Manifest-Version: 1.0' \
@@ -26,17 +24,9 @@ printf '%s\n' \
   'Can-Retransform-Classes: false' '' > "$BUILD/agent.mf"
 printf '%s\n' \
   'Manifest-Version: 1.0' \
-  'Implementation-Title: StarsectorPrepatcher Hyperspace Agent' \
-  'Implementation-Version: 0.8.0' \
-  'Premain-Class: com.starsector.prepatcher.hyperspace.HyperspaceAgent' \
-  'Can-Redefine-Classes: false' \
-  'Can-Retransform-Classes: false' '' > "$BUILD/hyperspace-agent.mf"
-printf '%s\n' \
-  'Manifest-Version: 1.0' \
   'Implementation-Title: StarsectorPrepatcher Bootstrap' \
   'Implementation-Version: 0.8.0' '' > "$BUILD/bootstrap.mf"
 jar cfm "$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar" "$BUILD/agent.mf" -C "$BUILD/agent-classes" .
-jar cfm "$MOD_ROOT/agent/StarsectorPrepatcherHyperspaceAgent.jar" "$BUILD/hyperspace-agent.mf" -C "$BUILD/hyperspace-classes" .
 jar cfm "$MOD_ROOT/jars/StarsectorPrepatcherBootstrap.jar" "$BUILD/bootstrap.mf" -C "$BUILD/bootstrap-classes" .
 
 # Keep the release manifest synchronized with the exact tree produced by this build.
@@ -55,7 +45,7 @@ fi
       printf '%s\n' "$top_level"
     fi
   done
-  find agent docs jars profiles source -type f -print
+  find agent docs jars media profiles source -type f -print
   printf '%s\n' 'logs/README.txt'
 ) | sed 's#^\./##' | LC_ALL=C sort -u > "$CHECKSUM_INPUTS"
 

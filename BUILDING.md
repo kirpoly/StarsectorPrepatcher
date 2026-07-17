@@ -27,7 +27,6 @@ Linux/macOS:
 
 ```text
 agent/StarsectorPrepatcherAgent.jar
-agent/StarsectorPrepatcherHyperspaceAgent.jar
 jars/StarsectorPrepatcherBootstrap.jar
 ```
 
@@ -45,10 +44,12 @@ Windows PowerShell:
 Для явного набора core JAR поддерживаются как именованный, так и прежний positional-вызов:
 
 ```powershell
+$core = (Resolve-Path '..\..\starsector-core').Path
 .\verify-structural.ps1 -CoreJars @(
-    'C:\Games\Starsector_test\starsector-core\starfarer_obf.jar',
-    'C:\Games\Starsector_test\starsector-core\fs.common_obf.jar',
-    'C:\Games\Starsector_test\starsector-core\fs.sound_obf.jar'
+    (Join-Path $core 'starfarer_obf.jar'),
+    (Join-Path $core 'fs.common_obf.jar'),
+    (Join-Path $core 'fs.sound_obf.jar'),
+    (Join-Path $core 'starfarer.api.jar')
 )
 ```
 
@@ -60,15 +61,16 @@ Linux/macOS:
 
 Проверка:
 
-1. заново собирает оба agent и bootstrap;
+1. заново собирает единый agent и bootstrap;
 2. компилирует tests;
 3. проверяет SemVer/changelog, относительные ссылки, достижимость документации и все SHA-256;
 4. трансформирует `starfarer_obf.jar`, `fs.common_obf.jar`, `fs.sound_obf.jar` в памяти;
 5. выполняет ASM `Analyzer + BasicVerifier` для concrete methods;
 6. проверяет idempotency/ownership/negative structural cases;
 7. запускает lifecycle, exp6, exp8 и loading/save runtime suites;
-8. отдельно проверяет exact-hash hyperspace targets из `starfarer.api.jar` и `starfarer_obf.jar`;
-9. запускает оба собранных javaagent в одной JVM и сохраняет startup smoke.
+8. проверяет локальные structural contracts hyperspace targets из `starfarer.api.jar` и
+   `starfarer_obf.jar` той установки, где находится мод — оригинальной либо переводной;
+9. запускает собранный javaagent и сохраняет startup smoke.
 
 Structural harness создаёт внутренний `.build/structural-all-enabled.properties` из aggressive
 profile и только там включает known-disabled loading/startup patches, чтобы продолжать проверять
@@ -85,5 +87,5 @@ gates для новых pre-load патчей описаны в [`docs/VALIDATIO
 ## Java 17 compatibility
 
 Scripts используют `-encoding UTF-8 -source 17 -target 17`. Из-за доступа к JDK-internal ASM вместо `--release 17`
-применяются compile-time `--add-exports`. Runtime vmparams flags не нужны: оба startup-agent вызывают
+применяются compile-time `--add-exports`. Runtime vmparams flags не нужны: startup-agent вызывает
 `Instrumentation.redefineModule()` до регистрации transformer.

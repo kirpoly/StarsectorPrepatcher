@@ -34,10 +34,12 @@
   называется `StarsectorPrepatcher`.
 - Java namespace переведён с `com.starsector.mapoptimizer` на `com.starsector.prepatcher` до
   публикации первого поддерживаемого API.
-- Переименованы agent/bootstrap JAR, конфигурационные файлы, runtime-логи, system properties и
+- Переименованы agent/bootstrap JAR, конфигурация, runtime-лог, system properties и
   ownership marker структурных патчей.
-- Основные конфигурационные файлы теперь называются `prepatcher.properties` и
-  `hyperspace-prepatcher.properties`.
+- Все патчи объединены в одном `StarsectorPrepatcherAgent.jar`, одном transformer и одном
+  `prepatcher.properties`; второй javaagent и дублирующая startup-инфраструктура удалены.
+- Hyperspace-патчи переведены с allowlist полных hash классов на независимые локальные structural
+  contracts. Совместимые переводные classfile теперь поддерживаются без отдельных hash-снимков.
 
 ### Поведение
 

@@ -38,6 +38,13 @@ public final class PrepatcherConfig {
     public final boolean rulesLiteralParser;
     public final boolean saveLoadProgressThrottle;
     public final boolean saveOutputBufferDedup;
+    public final boolean hyperspaceCulling;
+    public final boolean hyperspaceYClamp;
+    public final boolean skipNoOpTerrainLayer;
+    public final boolean terrainRandomReuse;
+    public final boolean automatonBufferReuse;
+    public final boolean starfieldCleanupBuffers;
+    public final boolean starfieldLinearRemoval;
     public final int intelMapLocationCacheMs;
     public final int intelArrowDataCacheMs;
     public final int intelEntityIndexTtlMs;
@@ -55,6 +62,7 @@ public final class PrepatcherConfig {
     public final int commRelayIndexTtlMs;
     public final int statsLogIntervalSeconds;
     public final int saveLoadProgressHz;
+    public final int starfieldRemoveAllThreshold;
 
     private PrepatcherConfig(Properties p) {
         properties.putAll(p);
@@ -86,6 +94,13 @@ public final class PrepatcherConfig {
         rulesLiteralParser = bool("patch.rulesLiteralParser", true);
         saveLoadProgressThrottle = bool("patch.saveLoadProgressThrottle", true);
         saveOutputBufferDedup = bool("patch.saveOutputBufferDedup", true);
+        hyperspaceCulling = bool("patch.hyperspaceCulling", true);
+        hyperspaceYClamp = bool("patch.hyperspaceYClamp", true);
+        skipNoOpTerrainLayer = bool("patch.skipNoOpTerrainLayer", true);
+        terrainRandomReuse = bool("patch.terrainRandomReuse", true);
+        automatonBufferReuse = bool("patch.automatonBufferReuse", true);
+        starfieldCleanupBuffers = bool("patch.starfieldCleanupBuffers", true);
+        starfieldLinearRemoval = bool("patch.starfieldLinearRemoval", true);
         intelMapLocationCacheMs = integer("intel.mapLocationCacheMs", 120, 0, 10_000);
         intelArrowDataCacheMs = integer("intel.arrowDataCacheMs", 120, 0, 10_000);
         intelEntityIndexTtlMs = integer("intel.entityIndexTtlMs", 500, 0, 60_000);
@@ -103,6 +118,7 @@ public final class PrepatcherConfig {
         commRelayIndexTtlMs = integer("commRelay.indexTtlMs", 250, 0, 60_000);
         statsLogIntervalSeconds = integer("logging.statsIntervalSeconds", 30, 0, 3600);
         saveLoadProgressHz = integer("saveLoad.progressHz", 15, 0, 240);
+        starfieldRemoveAllThreshold = integer("starfield.removeAllThreshold", 8, 1, 4096);
     }
 
     public static PrepatcherConfig load(Path file) {

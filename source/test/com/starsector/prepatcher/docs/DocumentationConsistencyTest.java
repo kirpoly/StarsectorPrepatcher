@@ -86,6 +86,7 @@ public final class DocumentationConsistencyTest {
         checkChecksums(root);
 
         Set<Path> markdown = collectCurrentMarkdown(root);
+        checkPortableDocumentation(markdown);
         checkForbiddenLayout(root);
         checkCurrentVersionSuffixes(markdown, changelog, modInfo, currentVersion);
         int patchCount = checkPatchValidationCoverage(root);
@@ -98,6 +99,13 @@ public final class DocumentationConsistencyTest {
                 + " relativeLinks=" + graph.relativeLinkCount
                 + " reachable=" + markdown.size()
                 + " patchScenarios=" + patchCount);
+    }
+
+    private static void checkPortableDocumentation(Set<Path> markdown) throws IOException {
+        for (Path path : markdown) {
+            require(!readUtf8(path).contains("C:\\Games\\Starsector_test"),
+                    "documentation contains a developer-local Starsector path: " + path);
+        }
     }
 
     private static Version readCurrentVersion(Path modInfo) throws IOException {
@@ -286,9 +294,12 @@ public final class DocumentationConsistencyTest {
                 "jars/StarsectorMapOptimizerBootstrap.jar",
                 "optimizer.properties",
                 "hyperspace-optimizer.properties",
+                "hyperspace-prepatcher.properties",
+                "agent/StarsectorPrepatcherHyperspaceAgent.jar",
                 "source/agent/com/starsector/mapoptimizer",
                 "source/bootstrap/com/starsector/mapoptimizer",
                 "source/hyperspace/com/starsector/mapoptimizer",
+                "source/hyperspace/com/starsector/prepatcher",
                 "source/test/com/starsector/mapoptimizer")) {
             require(!Files.exists(root.resolve(obsoletePath)),
                     "obsolete release path remains in StarsectorPrepatcher: " + obsoletePath);
@@ -298,8 +309,7 @@ public final class DocumentationConsistencyTest {
         require(releaseHeading.equals("# Отчёт о выпуске " + expected),
                 "release report H1 does not match mod_info.json version: " + releaseHeading);
         for (String relative : List.of(
-                "source/agent/com/starsector/prepatcher/agent/PrepatcherAgent.java",
-                "source/hyperspace/com/starsector/prepatcher/hyperspace/HyperspaceAgent.java")) {
+                "source/agent/com/starsector/prepatcher/agent/PrepatcherAgent.java")) {
             Path path = requiredFile(root.resolve(relative));
             Matcher matcher = JAVA_VERSION_CONSTANT.matcher(readUtf8(path));
             require(matcher.find(), "missing public VERSION constant: " + relative);
@@ -319,14 +329,13 @@ public final class DocumentationConsistencyTest {
                         relative + " manifest version " + matcher.group(1)
                                 + " does not match mod_info.json " + expected);
             }
-            require(count == 3,
-                    relative + " must define exactly three Implementation-Version values; found "
+            require(count == 2,
+                    relative + " must define exactly two Implementation-Version values; found "
                             + count);
         }
 
         for (String relative : List.of(
                 "agent/StarsectorPrepatcherAgent.jar",
-                "agent/StarsectorPrepatcherHyperspaceAgent.jar",
                 "jars/StarsectorPrepatcherBootstrap.jar")) {
             Path path = requiredFile(root.resolve(relative));
             try (JarFile jar = new JarFile(path.toFile())) {
@@ -467,7 +476,7 @@ public final class DocumentationConsistencyTest {
                     .sorted()
                     .forEach(inputs::add);
         }
-        for (String directory : List.of("agent", "docs", "jars", "profiles", "source")) {
+        for (String directory : List.of("agent", "docs", "jars", "media", "profiles", "source")) {
             Path base = root.resolve(directory);
             require(Files.isDirectory(base), "checksum input directory is missing: " + base);
             try (Stream<Path> files = Files.walk(base)) {

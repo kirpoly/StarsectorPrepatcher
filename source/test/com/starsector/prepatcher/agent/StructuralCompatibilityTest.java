@@ -38,6 +38,8 @@ import java.util.jar.JarFile;
 /** In-memory regression harness; it never writes modified game classes. */
 public final class StructuralCompatibilityTest {
     private static final String HOOKS = "com/starsector/prepatcher/runtime/PrepatcherHooks";
+    private static final String HYPERSPACE_HOOKS =
+            "com/starsector/prepatcher/hyperspace/HyperspaceHooks";
 
     private StructuralCompatibilityTest() {}
 
@@ -791,6 +793,24 @@ public final class StructuralCompatibilityTest {
             case PrepatcherTransformer.CAMPAIGN_GAME_MANAGER -> {
                 // This patch removes a redundant constructor chain and therefore has no runtime hook.
             }
+            case HyperspacePatches.BASE_TILED ->
+                    assertHookCount(bytes, HYPERSPACE_HOOKS, "seededRandom", 3);
+            case HyperspacePatches.HYPER_TERRAIN -> {
+                int layerFilters = countHook(bytes, HYPERSPACE_HOOKS, "filterLayers")
+                        + countHook(bytes, HYPERSPACE_HOOKS, "filterLayerSet");
+                require(layerFilters == 1,
+                        className + " layer filter hook expected=1 actual=" + layerFilters);
+                assertHookCount(bytes, HYPERSPACE_HOOKS, "seededRandom", 1);
+                assertHookCount(bytes, HYPERSPACE_HOOKS, "automatonCellsInternal", 2);
+            }
+            case HyperspacePatches.AUTOMATON -> {
+                assertHookCount(bytes, HYPERSPACE_HOOKS, "retainAutomatonSpare", 1);
+                assertHookCount(bytes, HYPERSPACE_HOOKS, "acquireAutomatonBuffer", 1);
+            }
+            case HyperspacePatches.STARFIELD -> {
+                assertHookCount(bytes, HYPERSPACE_HOOKS, "borrowArrayList", 1);
+                assertHookCount(bytes, HYPERSPACE_HOOKS, "removeAllAndRelease", 1);
+            }
             default -> throw new AssertionError("Unknown target " + className);
         }
         for (Map.Entry<String, Integer> entry : expected.entrySet()) {
@@ -1031,25 +1051,31 @@ public final class StructuralCompatibilityTest {
     }
 
     private static int countHook(byte[] bytes, String name) {
+        return countHook(bytes, HOOKS, name);
+    }
+
+    private static int countHook(byte[] bytes, String owner, String name) {
         int count = 0;
         ClassNode node = read(bytes);
         for (MethodNode method : node.methods) {
             for (AbstractInsnNode insn : method.instructions.toArray()) {
                 if (insn instanceof MethodInsnNode call && call.getOpcode() == Opcodes.INVOKESTATIC
-                        && call.owner.equals(HOOKS) && call.name.equals(name)) count++;
+                        && call.owner.equals(owner) && call.name.equals(name)) count++;
             }
         }
         return count;
     }
 
     private static void assertHookTargetsExist(byte[] transformed) {
-        Map<String, Integer> hooks = hookMethods();
+        Map<String, Integer> hooks = hookMethods(HOOKS);
+        Map<String, Integer> hyperspaceHooks = hookMethods(HYPERSPACE_HOOKS);
         ClassNode node = read(transformed);
         for (MethodNode method : node.methods) {
             for (AbstractInsnNode insn : method.instructions.toArray()) {
-                if (!(insn instanceof MethodInsnNode call) || !call.owner.equals(HOOKS)) continue;
+                if (!(insn instanceof MethodInsnNode call)
+                        || (!call.owner.equals(HOOKS) && !call.owner.equals(HYPERSPACE_HOOKS))) continue;
                 String key = call.name + call.desc;
-                Integer access = hooks.get(key);
+                Integer access = (call.owner.equals(HOOKS) ? hooks : hyperspaceHooks).get(key);
                 require(access != null, "missing runtime hook target " + key);
                 require(call.getOpcode() == Opcodes.INVOKESTATIC
                                 && (access & (Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC))
@@ -1059,16 +1085,21 @@ public final class StructuralCompatibilityTest {
         }
     }
 
-    private static Map<String, Integer> hookMethods() {
+    private static void assertHookCount(byte[] bytes, String owner, String name, int expected) {
+        int actual = countHook(bytes, owner, name);
+        require(actual == expected, name + " expected=" + expected + " actual=" + actual);
+    }
+
+    private static Map<String, Integer> hookMethods(String owner) {
         try (var stream = StructuralCompatibilityTest.class.getClassLoader()
-                .getResourceAsStream(HOOKS + ".class")) {
-            require(stream != null, "PrepatcherHooks.class is missing from the test classpath");
+                .getResourceAsStream(owner + ".class")) {
+            require(stream != null, owner + ".class is missing from the test classpath");
             ClassNode hooks = read(stream.readAllBytes());
             Map<String, Integer> result = new LinkedHashMap<>();
             for (MethodNode method : hooks.methods) result.put(method.name + method.desc, method.access);
             return result;
         } catch (Exception ex) {
-            throw new AssertionError("unable to inspect PrepatcherHooks linkage", ex);
+            throw new AssertionError("unable to inspect hook linkage for " + owner, ex);
         }
     }
 

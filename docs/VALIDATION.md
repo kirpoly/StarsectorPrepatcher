@@ -45,7 +45,7 @@ Javaagent-классы и их `static`/`ThreadLocal` живут до завер
 | Public alias semantics | pool/double buffer повторно мутирует массив, коллекцию или vector, ранее возвращённые vanilla-кодом | consumer удерживает старый return/argument; последующие frames не меняют его, если vanilla не меняла |
 | Неполная idempotency | первый найденный hook даёт `ALREADY_APPLIED`, поздние sites уже не проверяются | mutation test повреждает **последний** site при сохранённом marker и требует `SKIPPED_STRUCTURAL` |
 | Неверный inline fast path | guard найден по похожим `isEmpty()`/field calls, но стоит до стороннего пролога, читает другой field или обходит часть vanilla checks | data-flow связывает guard и исходную работу с теми же `this` fields; branch входит в исходную первую инструкцию или в точно заданную post-check boundary; negative tests меняют receiver, placement и порядок |
-| Exact build/target guard | hash взят из другой установки, whole-JAR guard реагирует на нерелевантные строки либо не проверена часть изменяемого bytecode | runtime smoke на целевой установке показывает enabled status; allowlist покрывает каждый фактически изменяемый class и exact site counts |
+| Ложная несовместимость локализованного JAR | whole-class hash реагирует на нерелевантные строки/constant pool | локальные structural contracts и exact site counts прогоняются на JAR текущей установки — оригинальной либо локализованной; whole-class hash не используется |
 | False-green verifier | успех определяется как `patched > 0`, а `UNCHANGED`/missing target допустим | exit `0` только при точном числе targets и sites; missing/unchanged/duplicate/failed дают non-zero |
 | TTL correctness | до истечения TTL не проверяется дешёвый mutable input: position, order, identity, tag | мутация сразу после build сравнивается с vanilla; явно доказано допустимое окно stale-данных либо есть live validation |
 | Failed-cache storm | failed build не memoize-ится и повторяет allocation/full scan каждый вызов | malformed/custom объект многократно вызывает path; build выполняется ограниченно, fallback остаётся полным |
@@ -63,7 +63,7 @@ Review не считается завершённым без следующих 
    возвращается public API или передаётся неизвестному callback, reuse запрещён без копии/ownership API.
 4. **Whole-patch postcondition:** проверяются все sites, descriptors, counts, scope hooks и marker.
    `ALREADY_APPLIED` допустим только после полной проверки сериализованного класса.
-5. **Guard contract:** перечислены все runtime inputs и причина каждого hash/pattern check. Disabled
+5. **Guard contract:** перечислены все runtime inputs и причина каждого structural pattern check. Disabled
    status должен быть заметен пользователю, а не только присутствовать в отдельном debug log.
 6. **Fallback contract:** malformed/custom/throwing inputs сохраняют vanilla result, order, identity,
    exception timing и не создают rebuild storm.

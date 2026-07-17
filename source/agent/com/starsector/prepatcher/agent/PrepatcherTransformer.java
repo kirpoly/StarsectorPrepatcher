@@ -73,7 +73,9 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             COURSE_WIDGET, BASE_LOCATION, BASE_CAMPAIGN_ENTITY, MEMORY, ECONOMY,
             MARKET, INTEL_MANAGER, SHIP, DYNAMIC_PARTICLE_GROUP, LOADING_UTILS,
             SCRIPT_STORE_RUNNER, RULES, SPEC_STORE, TEXTURE_LOADER, SOUND,
-            PROGRESS_INPUT, PROGRESS_OUTPUT, CAMPAIGN_GAME_MANAGER);
+            PROGRESS_INPUT, PROGRESS_OUTPUT, CAMPAIGN_GAME_MANAGER,
+            HyperspacePatches.BASE_TILED, HyperspacePatches.HYPER_TERRAIN,
+            HyperspacePatches.AUTOMATON, HyperspacePatches.STARFIELD);
     private static final String ENTITY_TOKEN_DESC = "Lcom/fs/starfarer/api/campaign/SectorEntityToken;";
     private static final String MAP_API_DESC = "Lcom/fs/starfarer/api/ui/SectorMapAPI;";
     private static final String INTEL_DESC = "Lcom/fs/starfarer/api/campaign/comm/IntelInfoPlugin;";
@@ -186,7 +188,38 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                     config.saveLoadProgressThrottle,
                     node -> patchSaveLoadProgressThrottle(node, "o00000"));
             case CAMPAIGN_GAME_MANAGER -> apply(state, "saveOutputBufferDedup",
-                    config.saveOutputBufferDedup, this::patchSaveOutputBufferDedup);            default -> { return null; }
+                    config.saveOutputBufferDedup, this::patchSaveOutputBufferDedup);
+            case HyperspacePatches.BASE_TILED -> {
+                applyHyperspace(state, "hyperspaceCulling", config.hyperspaceCulling,
+                        "culling", 2, HyperspacePatches::patchCull,
+                        HyperspacePatches::countPatchedCull);
+                applyHyperspace(state, "hyperspaceYClamp", config.hyperspaceYClamp,
+                        "yClamp", 2, HyperspacePatches::patchClamp,
+                        HyperspacePatches::countPatchedClamp);
+                applyHyperspace(state, "terrainRandomReuse", config.terrainRandomReuse,
+                        "random", 3, HyperspacePatches::patchRandom,
+                        HyperspacePatches::countPatchedRandom);
+            }
+            case HyperspacePatches.HYPER_TERRAIN -> {
+                applyHyperspace(state, "skipNoOpTerrainLayer", config.skipNoOpTerrainLayer,
+                        "noOpLayer", 1, HyperspacePatches::patchLayers,
+                        HyperspacePatches::countPatchedLayers);
+                applyHyperspace(state, "terrainRandomReuse", config.terrainRandomReuse,
+                        "random", 1, HyperspacePatches::patchRandom,
+                        HyperspacePatches::countPatchedRandom);
+                applyHyperspace(state, "automatonInternalReads", config.automatonBufferReuse,
+                        "internalCells", 2, HyperspacePatches::patchAutomatonInternalReads,
+                        HyperspacePatches::countPatchedAutomatonInternalReads);
+            }
+            case HyperspacePatches.AUTOMATON -> applyHyperspace(state,
+                    "automatonBufferReuse", config.automatonBufferReuse,
+                    "automatonBuffers", 1, HyperspacePatches::patchAutomaton,
+                    HyperspacePatches::countPatchedAutomaton);
+            case HyperspacePatches.STARFIELD -> applyHyperspace(state,
+                    "starfieldCleanupBuffers", config.starfieldCleanupBuffers,
+                    "cleanup", 1, HyperspacePatches::patchCleanup,
+                    HyperspacePatches::countPatchedCleanup);
+            default -> { return null; }
         }
 
         if (!state.changed) {
@@ -260,6 +293,23 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         }
     }
 
+    private void applyHyperspace(TransformState state, String patchId, boolean enabled,
+                                 String detail, int expected, CountPatchAction action,
+                                 CountPatchAction postcondition) {
+        apply(state, patchId, enabled, node -> {
+            if (hasPatchMarker(node, patchId)) {
+                int actual = postcondition.apply(node);
+                requireCount(detail + " postcondition sites", actual, expected);
+                throw already("structural marker and complete postcondition are present");
+            }
+            int actual = action.apply(node);
+            requireCount(detail + " structural sites", actual, expected);
+            PatchReport report = new PatchReport();
+            report.add(detail, actual);
+            return report;
+        });
+    }
+
     private void recordStructuralSkip(String className, String patchId, String reason) {
         int count = skippedPatches.incrementAndGet();
         System.setProperty("starsector.prepatcher.skippedPatches", Integer.toString(count));
@@ -305,7 +355,14 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             case SCRIPT_STORE_RUNNER, SPEC_STORE, TEXTURE_LOADER, SOUND -> config.startupLogAggregation;
             case RULES -> config.startupLogAggregation || config.rulesLiteralParser;
             case PROGRESS_INPUT, PROGRESS_OUTPUT -> config.saveLoadProgressThrottle;
-            case CAMPAIGN_GAME_MANAGER -> config.saveOutputBufferDedup;            default -> false;
+            case CAMPAIGN_GAME_MANAGER -> config.saveOutputBufferDedup;
+            case HyperspacePatches.BASE_TILED -> config.hyperspaceCulling
+                    || config.hyperspaceYClamp || config.terrainRandomReuse;
+            case HyperspacePatches.HYPER_TERRAIN -> config.skipNoOpTerrainLayer
+                    || config.terrainRandomReuse || config.automatonBufferReuse;
+            case HyperspacePatches.AUTOMATON -> config.automatonBufferReuse;
+            case HyperspacePatches.STARFIELD -> config.starfieldCleanupBuffers;
+            default -> false;
         };
     }
 
@@ -4305,6 +4362,11 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     @FunctionalInterface
     private interface PatchAction {
         PatchReport apply(ClassNode node);
+    }
+
+    @FunctionalInterface
+    private interface CountPatchAction {
+        int apply(ClassNode node);
     }
 
     private static final class TransformState {

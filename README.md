@@ -4,8 +4,10 @@
 
 Current version: **0.8.0**. Supported game build: **Starsector 0.98a-RC8**.
 
+[Watch the unplayable-vs-Prepatcher smoothness comparison (WebM)](media/smoothness_comparison_60fps.webm).
+
 StarsectorPrepatcher is a compatibility-first pre-load patching layer for Starsector. Its startup
-javaagents run before the game and mod classloaders begin normal loading, so guarded structural
+javaagent runs before the game and mod classloaders begin normal loading, so guarded structural
 patches can be applied at the point where the affected classes first enter the JVM.
 
 The project has a broader direction than map optimization alone:
@@ -22,19 +24,19 @@ documented and covered by compatibility tests.
 
 ## How it works
 
-The distribution contains a sandbox-safe mod bootstrap and two startup agents:
+The distribution contains a sandbox-safe mod bootstrap and one startup agent:
 
 ```text
 agent/StarsectorPrepatcherAgent.jar
-agent/StarsectorPrepatcherHyperspaceAgent.jar
 ```
 
-The main agent matches and verifies each structural patch independently. The hyperspace agent uses
-exact per-class guards for four Starsector target classes. Both fail open: an unknown, ambiguous, or
-partially changed target remains vanilla and the reason is written to the diagnostic log.
+The agent matches and verifies every patch independently, including the hyperspace patches. It does
+not use whole-class hashes. It checks whichever game files are installed, original or localized,
+and accepts them when the local bytecode contract still matches. Unknown, ambiguous, or partially
+changed sites remain vanilla and the reason is written to the diagnostic log.
 
 The bootstrap plugin does not perform bytecode work. It exposes agent status through the normal game
-log and warns when the mod is enabled without the startup agents.
+log and warns when the mod is enabled without the startup agent.
 
 ## Installation
 
@@ -44,15 +46,14 @@ log and warns when the mod is enabled without the startup agents.
 4. Enable **StarsectorPrepatcher** in the launcher and start the game.
 
 The installer creates a timestamped `vmparams` backup, replaces any existing entries for this
-installation, and places the pair after any other `-javaagent` options:
+installation, and places it after any other `-javaagent` options:
 
 ```text
 -javaagent:../mods/StarsectorPrepatcher/agent/StarsectorPrepatcherAgent.jar
--javaagent:../mods/StarsectorPrepatcher/agent/StarsectorPrepatcherHyperspaceAgent.jar
 ```
 
 The folder name must not contain whitespace and should remain `StarsectorPrepatcher` after
-installation. No additional `--add-exports` options are required; the agents export the required JDK
+installation. No additional `--add-exports` options are required; the agent exports the required JDK
 ASM packages through `Instrumentation.redefineModule()`.
 
 The prepatcher does not modify save data, and its runtime caches are never serialized.
@@ -73,10 +74,8 @@ The complete switch and invariant reference is in [`docs/PATCHES.md`](docs/PATCH
 
 ## Configuration and rollback
 
-Main settings are in `prepatcher.properties`; hyperspace settings are in
-`hyperspace-prepatcher.properties`. Every user-facing patch group has a dedicated `patch.*` switch
-and requires a full game restart. Setting the relevant agent's configuration to the following
-disables that entire agent:
+All settings are in `prepatcher.properties`. Every user-facing patch group has a dedicated `patch.*`
+switch and requires a full game restart. The following disables the entire prepatcher:
 
 ```properties
 enabled=false
@@ -86,7 +85,7 @@ enabled=false
 because they participated in confirmed mission-startup failures. They will not be re-enabled until
 their fixes pass an isolated startup and mission suite.
 
-Run `uninstall-agent.bat` to remove both managed entries from `vmparams`.
+Run `uninstall-agent.bat` to remove the managed entry from `vmparams`.
 
 ## Diagnostics and verification
 
@@ -94,15 +93,13 @@ Runtime logs:
 
 ```text
 mods\StarsectorPrepatcher\logs\prepatcher.log
-mods\StarsectorPrepatcher\logs\prepatcher-hyperspace.log
 ```
 
-The main agent records `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, or `SKIPPED_ERROR` for
-each patch. The hyperspace agent reports every guarded target and uses `target-guard-failed` when the
-current bytecode is outside the exact allowlist.
+The agent records `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, or `SKIPPED_ERROR` for every
+patch. Hyperspace targets use the same structural, per-patch status model as all other targets.
 
 Run `verify-structural.bat` on Windows or `./verify-structural.sh` on Linux/macOS for the complete
-documentation, structural, negative/idempotency, lifecycle/GC, runtime, hyperspace, and combined
+documentation, structural, negative/idempotency, lifecycle/GC, runtime, hyperspace, and agent
 startup suite. Build details are in [`BUILDING.md`](BUILDING.md).
 
 ## Documentation

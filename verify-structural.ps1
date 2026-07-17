@@ -10,7 +10,6 @@ $gameRoot = (Resolve-Path (Join-Path $modRoot '..\..')).Path
 $core = Join-Path $gameRoot 'starsector-core'
 $build = Join-Path $modRoot '.build'
 $agentClasses = Join-Path $build 'agent-classes'
-$hyperClasses = Join-Path $build 'hyperspace-classes'
 $testClasses = Join-Path $build 'test-classes'
 $reportDir = Join-Path $build 'reports'
 $utf8 = New-Object Text.UTF8Encoding($false)
@@ -57,7 +56,8 @@ if ($CoreJars.Count -gt 0) {
     $selectedCoreJars = @(
         (Join-Path $core 'starfarer_obf.jar'),
         (Join-Path $core 'fs.common_obf.jar'),
-        (Join-Path $core 'fs.sound_obf.jar')
+        (Join-Path $core 'fs.sound_obf.jar'),
+        (Join-Path $core 'starfarer.api.jar')
     )
 }
 $classPath = @($agentClasses, $testClasses) -join [IO.Path]::PathSeparator
@@ -135,7 +135,8 @@ $runtimeLines
 $hyperReport = Join-Path $reportDir 'hyperspace-verification.txt'
 $ErrorActionPreference = 'Continue'
 try {
-    $hyperOutput = @(& java @exports -cp $hyperClasses com.starsector.prepatcher.hyperspace.OfflineVerifier (Join-Path $core 'starfarer_obf.jar') (Join-Path $core 'starfarer.api.jar') $hyperReport 2>&1)
+    $hyperCp = @($testClasses, $testCp) -join [IO.Path]::PathSeparator
+    $hyperOutput = @(& java @exports -cp $hyperCp com.starsector.prepatcher.agent.HyperspaceCompatibilityTest $verificationConfig (Join-Path $core 'starfarer_obf.jar') (Join-Path $core 'starfarer.api.jar') $hyperReport 2>&1)
     $hyperExitCode = $LASTEXITCODE
 } finally {
     $ErrorActionPreference = $savedErrorActionPreference
@@ -146,10 +147,9 @@ if ($hyperExitCode -ne 0) { throw 'Hyperspace offline verification failed.' }
 
 $startupReport = Join-Path $reportDir 'startup-smoke.txt'
 $mainAgentJar = Join-Path $modRoot 'agent\StarsectorPrepatcherAgent.jar'
-$hyperAgentJar = Join-Path $modRoot 'agent\StarsectorPrepatcherHyperspaceAgent.jar'
 $ErrorActionPreference = 'Continue'
 try {
-    $startupOutput = @(& java "-javaagent:$mainAgentJar" "-javaagent:$hyperAgentJar" -version 2>&1)
+    $startupOutput = @(& java "-javaagent:$mainAgentJar" -version 2>&1)
     $startupExitCode = $LASTEXITCODE
 } finally {
     $ErrorActionPreference = $savedErrorActionPreference
@@ -157,6 +157,6 @@ try {
 $startupLines = @($startupOutput | ForEach-Object { $_.ToString() })
 $startupLines
 [IO.File]::WriteAllLines($startupReport, [string[]] $startupLines, $utf8)
-if ($startupExitCode -ne 0) { throw 'Combined javaagent startup smoke failed.' }
+if ($startupExitCode -ne 0) { throw 'Javaagent startup smoke failed.' }
 
 Write-Host 'Documentation/structural/runtime/hyperspace/startup verification completed.' -ForegroundColor Green

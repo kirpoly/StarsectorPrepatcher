@@ -5,11 +5,13 @@
 Основной agent выполняет независимое structural matching фактически загружаемого bytecode. Каждый
 блок имеет ownership marker, postcondition, ASM verification и fail-open fallback.
 
-Hyperspace-agent применяет узкий exact-target подход: проверяет SHA-256 фактически изменяемого
-класса и точное число каждого bytecode-паттерна. Allowlist содержит clean и подтверждённый
-локализованный варианты `HyperspaceTerrainPlugin`; изменения строк в остальном JAR не отключают
-независимые патчи. Неизвестный target-класс остаётся vanilla и переводит runtime status в заметный
-`target-guard-failed`.
+Hyperspace-патчи проходят тот же независимый structural pipeline единого agent: каждый патч
+проверяет target-класс, метод и descriptor, локальный bytecode-контракт, точное число точек
+внедрения, ownership marker, postcondition и результат ASM verification. Allowlist полных SHA-256
+не используется, поэтому оригинальный и переводной JAR принимаются автоматически, пока структура
+конкретного изменяемого участка совместима; изменения строк и constant pool этому не мешают. При
+неизвестном или неоднозначном участке только соответствующий патч остаётся vanilla со статусом
+`SKIPPED_STRUCTURAL`, а остальные патчи рассматриваются независимо.
 
 ## Main agent
 
@@ -48,7 +50,7 @@ Hyperspace-agent применяет узкий exact-target подход: про
 их выключенными. Они не возвращаются в default/safe/aggressive до изолированного исправления и
 успешного startup/mission прогона каждого переключателя по отдельности.
 
-## Hyperspace agent
+## Hyperspace
 
 | Config | Target | Изменение | Принятое поведение/риск |
 |---|---|---|---|
