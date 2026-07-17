@@ -25,6 +25,9 @@ public final class OptimizerConfig {
     public final boolean arrowVectorPool;
     public final boolean campaignListenerThrottle;
     public final boolean routeJumpPointIndex;
+    public final boolean campaignSnapshotReuse;
+    public final boolean entityScriptSnapshotReuse;
+    public final boolean emptyMemoryAdvanceFastPath;
 
     public final int intelMapLocationCacheMs;
     public final int intelArrowDataCacheMs;
@@ -59,6 +62,9 @@ public final class OptimizerConfig {
         arrowVectorPool = bool("patch.arrowVectorPool", true);
         campaignListenerThrottle = bool("patch.campaignListenerThrottle", true);
         routeJumpPointIndex = bool("patch.routeJumpPointIndex", true);
+        campaignSnapshotReuse = bool("patch.campaignSnapshotReuse", true);
+        entityScriptSnapshotReuse = bool("patch.entityScriptSnapshotReuse", true);
+        emptyMemoryAdvanceFastPath = bool("patch.emptyMemoryAdvanceFastPath", true);
 
         intelMapLocationCacheMs = integer("intel.mapLocationCacheMs", 120, 0, 10_000);
         intelArrowDataCacheMs = integer("intel.arrowDataCacheMs", 120, 0, 10_000);

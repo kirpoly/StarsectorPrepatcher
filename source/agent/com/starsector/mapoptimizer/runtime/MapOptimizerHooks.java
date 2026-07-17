@@ -21,7 +21,9 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.file.Path;
+import java.util.AbstractList;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.ConcurrentModificationException;
@@ -32,6 +34,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Random;
 import java.util.RandomAccess;
 import java.util.Set;
@@ -44,20 +47,33 @@ public final class MapOptimizerHooks {
     private static volatile Path modRoot;
 
     private static final ThreadLocal<Scratch> SCRATCH = ThreadLocal.withInitial(Scratch::new);
-    private static final Map<IntelInfoPlugin, IntelCache> INTEL_CACHE =
+    private static volatile Map<IntelInfoPlugin, IntelCache> INTEL_CACHE =
             Collections.synchronizedMap(new WeakHashMap<>());
-    private static final IdentityHashMap<LinkedHashMap<?, ?>, LabelIndex> LABEL_INDEXES =
+    private static volatile IdentityHashMap<LinkedHashMap<?, ?>, LabelIndex> LABEL_INDEXES =
             new IdentityHashMap<>();
-    private static final IdentityHashMap<List<?>, IntelEntityIndex> INTEL_ENTITY_INDEXES =
+    private static volatile IdentityHashMap<List<?>, IntelEntityIndex> INTEL_ENTITY_INDEXES =
             new IdentityHashMap<>();
-    private static final IdentityHashMap<Object, HitCache> HIT_CACHES = new IdentityHashMap<>();
-    private static final WeakHashMap<Object, Long> SAMPLE_CLEAR_TIMES = new WeakHashMap<>();
-    private static final Map<Object, CampaignListenerState> CAMPAIGN_LISTENER_STATES =
+    private static volatile IdentityHashMap<Object, HitCache> HIT_CACHES = new IdentityHashMap<>();
+    private static volatile WeakHashMap<Object, Long> SAMPLE_CLEAR_TIMES = new WeakHashMap<>();
+    private static volatile Map<Object, CampaignListenerState> CAMPAIGN_LISTENER_STATES =
             Collections.synchronizedMap(new WeakHashMap<>());
-    private static final Map<LocationAPI, RouteJumpIndex> ROUTE_JUMP_INDEXES =
+    private static volatile Map<LocationAPI, RouteJumpIndex> ROUTE_JUMP_INDEXES =
             Collections.synchronizedMap(new WeakHashMap<>());
-    private static final Map<Object, RouteSystemIndex> ROUTE_SYSTEM_INDEXES =
+    private static volatile Map<Object, RouteSystemIndex> ROUTE_SYSTEM_INDEXES =
             Collections.synchronizedMap(new WeakHashMap<>());
+    private static final Object CAMPAIGN_CACHE_LIFECYCLE_LOCK = new Object();
+
+    /**
+     * The engine reference must itself remain weak: lifecycle hooks are a cleanup
+     * trigger, not a new process-lifetime owner of campaign state.
+     */
+    private static volatile WeakReference<Object> activeCampaignEngine = new WeakReference<>(null);
+    private static volatile boolean campaignEngineObserved;
+    private static volatile boolean campaignCacheGenerationActive;
+    private static volatile long campaignCacheGeneration;
+    private static final long NO_CAMPAIGN_TRANSITION = -1L;
+    private static long pendingCampaignTransition = NO_CAMPAIGN_TRANSITION;
+    private static WeakReference<Object> pendingCampaignEngine = new WeakReference<>(null);
 
     private static final LongAdder RETAIN_CALLS = new LongAdder();
     private static final LongAdder RETAIN_UPPER_BOUND = new LongAdder();
@@ -85,8 +101,9 @@ public final class MapOptimizerHooks {
     private static final LongAdder ROUTE_SYSTEM_INDEX_HITS = new LongAdder();
     private static final LongAdder ROUTE_SYSTEM_INDEX_BUILDS = new LongAdder();
     private static final LongAdder ROUTE_SYSTEM_INDEX_FALLBACKS = new LongAdder();
+    private static final LongAdder CAMPAIGN_CACHE_RESETS = new LongAdder();
 
-    private static volatile NebulaCache nebulaCache;
+    private static volatile NebulaCacheSlot nebulaCacheSlot = new NebulaCacheSlot();
     private static volatile float cachedGridSpacing = -1f;
     private static volatile float cachedGridWidth = Float.NaN;
     private static volatile float cachedGridHeight = Float.NaN;
@@ -102,6 +119,131 @@ public final class MapOptimizerHooks {
             stats.setPriority(Thread.MIN_PRIORITY);
             stats.start();
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Campaign cache lifecycle
+    // ---------------------------------------------------------------------
+
+    /**
+     * Closes the current cache generation immediately before CampaignEngine
+     * publishes its structurally verified singleton-field write.
+     *
+     * All caches below are useful only inside one campaign generation. Several
+     * values intentionally contain locations, entities or UI objects that lead
+     * back to ObjectRepository.listener and therefore to CampaignEngine. Weak
+     * keys cannot break that value-to-key cycle, so changing the active engine is
+     * the authoritative eviction boundary.
+     *
+     * The lifecycle monitor is deliberately released before old roots are
+     * detached. Detachment swaps volatile map and nebula-slot references instead
+     * of acquiring their monitors: cache builders may call mod/game code, so
+     * cross-monitor clearing would permit an ABBA deadlock during a re-entrant
+     * reset. This hook is identity-idempotent and deliberately noexcept.
+     *
+     * @return a transition token for {@link #completeCampaignEngineChange}, or a
+     * negative value when the requested identity is already active
+     */
+    public static long beginCampaignEngineChange(Object engine) {
+        long transition = NO_CAMPAIGN_TRANSITION;
+        try {
+            synchronized (CAMPAIGN_CACHE_LIFECYCLE_LOCK) {
+                Object observed = activeCampaignEngine.get();
+                if (pendingCampaignTransition == NO_CAMPAIGN_TRANSITION
+                        && campaignEngineObserved && observed == engine
+                        && campaignCacheGenerationActive == (engine != null)) {
+                    return NO_CAMPAIGN_TRANSITION;
+                }
+                // Close the generation before eviction so no new cache path can
+                // enter while the old state is being detached.
+                campaignCacheGenerationActive = false;
+                transition = ++campaignCacheGeneration;
+                pendingCampaignTransition = transition;
+                pendingCampaignEngine = new WeakReference<>(engine);
+                CAMPAIGN_CACHE_RESETS.increment();
+            }
+            clearCampaignCaches();
+            return transition;
+        } catch (Throwable ignored) {
+            // CampaignEngine lifecycle semantics always take precedence over an
+            // optional optimization cache. Returning the no-op token leaves all
+            // stateful caches disabled if cleanup could not finish.
+            return NO_CAMPAIGN_TRANSITION;
+        }
+    }
+
+    /**
+     * Activates a successfully published campaign only after setInstance() has
+     * completed its Global/Factory updates and other normal-return work. A stale,
+     * mismatched or failed transition remains safely disabled.
+     */
+    public static void completeCampaignEngineChange(Object engine, long transition) {
+        boolean clearMismatchedGeneration = false;
+        try {
+            synchronized (CAMPAIGN_CACHE_LIFECYCLE_LOCK) {
+                boolean noOpMatches = transition == NO_CAMPAIGN_TRANSITION
+                        && pendingCampaignTransition == NO_CAMPAIGN_TRANSITION
+                        && campaignEngineObserved && activeCampaignEngine.get() == engine
+                        && campaignCacheGenerationActive == (engine != null);
+                if (noOpMatches) return;
+                if (transition != NO_CAMPAIGN_TRANSITION
+                        && pendingCampaignTransition == transition
+                        && pendingCampaignEngine.get() == engine) {
+                    activeCampaignEngine = new WeakReference<>(engine);
+                    campaignEngineObserved = true;
+                    pendingCampaignTransition = NO_CAMPAIGN_TRANSITION;
+                    pendingCampaignEngine = new WeakReference<>(null);
+                    // resetInstance(null) intentionally leaves caches inactive until
+                    // the next successfully completed non-null setInstance().
+                    campaignCacheGenerationActive = engine != null;
+                    return;
+                }
+
+                // Concurrent/out-of-order lifecycle calls are not expected from
+                // the game, but must still fail closed: never leave cache identity
+                // active for an engine that may no longer be the singleton.
+                campaignCacheGenerationActive = false;
+                campaignCacheGeneration++;
+                activeCampaignEngine = new WeakReference<>(null);
+                campaignEngineObserved = false;
+                pendingCampaignTransition = NO_CAMPAIGN_TRANSITION;
+                pendingCampaignEngine = new WeakReference<>(null);
+                CAMPAIGN_CACHE_RESETS.increment();
+                clearMismatchedGeneration = true;
+            }
+        } catch (Throwable ignored) {
+            // Fail closed: the generation remains inactive and hooks use vanilla.
+        }
+        if (clearMismatchedGeneration) clearCampaignCaches();
+    }
+
+    private static void clearCampaignCaches() {
+        // Detach each process-lifetime root instead of waiting for its monitor.
+        // In-flight calls retain only their local old map/slot; epoch checks stop
+        // them from publishing into a current generation, and the detached roots
+        // become collectible when those calls end.
+        INTEL_CACHE = Collections.synchronizedMap(new WeakHashMap<>());
+        LABEL_INDEXES = new IdentityHashMap<>();
+        INTEL_ENTITY_INDEXES = new IdentityHashMap<>();
+        HIT_CACHES = new IdentityHashMap<>();
+        SAMPLE_CLEAR_TIMES = new WeakHashMap<>();
+        CAMPAIGN_LISTENER_STATES = Collections.synchronizedMap(new WeakHashMap<>());
+        ROUTE_JUMP_INDEXES = Collections.synchronizedMap(new WeakHashMap<>());
+        ROUTE_SYSTEM_INDEXES = Collections.synchronizedMap(new WeakHashMap<>());
+        nebulaCacheSlot = new NebulaCacheSlot();
+        // Lifecycle callbacks run on the campaign/UI thread. Scratch frames are
+        // normally empty already; remove the ThreadLocal entry as a final guard.
+        SCRATCH.remove();
+    }
+
+    private static boolean campaignCachesReady(long generation) {
+        return campaignCacheGenerationActive && campaignCacheGeneration == generation
+                && activeCampaignEngine.get() != null;
+    }
+
+    private static boolean campaignCachesReady(long generation, Object engine) {
+        return campaignCacheGenerationActive && campaignCacheGeneration == generation
+                && activeCampaignEngine.get() == engine;
     }
 
     // ---------------------------------------------------------------------
@@ -242,6 +384,69 @@ public final class MapOptimizerHooks {
         return list;
     }
 
+    /**
+     * Reuses the defensive snapshots taken by BaseLocation.advance(). The
+     * returned object is deliberately exposed only as List: transformed sites
+     * are structurally proven to iterate it without mutation or escape.
+     * Collection.toArray(T[]) preserves the vanilla point-in-time copy while
+     * reusing the backing array after the first capacity warm-up.
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static List borrowLocationAdvanceSnapshot(Collection source) {
+        OptimizerConfig c = config;
+        if (c == null || !c.campaignSnapshotReuse) return new ArrayList(source);
+        return borrowCampaignSnapshot(source);
+    }
+
+    /** Same snapshot contract for BaseLocation.advanceEvenIfPaused(). */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static List borrowPausedLocationSnapshot(Collection source) {
+        OptimizerConfig c = config;
+        if (c == null || !c.campaignSnapshotReuse) return new ArrayList(source);
+        return borrowCampaignSnapshot(source);
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static List borrowCampaignSnapshot(Collection source) {
+        ScratchFrame frame = SCRATCH.get().scopeFrame();
+        SnapshotList snapshot = frame.campaignSnapshotAt(frame.campaignSnapshotIndex++);
+        snapshot.copyFrom(source);
+        return snapshot;
+    }
+
+    /**
+     * Reuses BaseCampaignEntity.runScripts()' defensive copy. Empty script
+     * lists use the JDK's allocation-free immutable empty list; non-empty lists
+     * keep the same point-in-time iteration semantics as the vanilla copy.
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static List borrowEntityScriptSnapshot(Collection source) {
+        OptimizerConfig c = config;
+        if (c == null || !c.entityScriptSnapshotReuse) return new ArrayList(source);
+        if (source.isEmpty()) return Collections.emptyList();
+        return borrowCampaignSnapshot(source);
+    }
+
+    /** Avoids allocating ArrayList.Itr for the overwhelmingly common empty Memory.expire list. */
+    @SuppressWarnings("rawtypes")
+    public static Iterator memoryExpireIterator(List source) {
+        OptimizerConfig c = config;
+        if (c != null && c.emptyMemoryAdvanceFastPath && source.isEmpty()) {
+            return Collections.emptyIterator();
+        }
+        return source.iterator();
+    }
+
+    /** Avoids allocating LinkedHashMap.ValueIterator for an empty Memory.require view. */
+    @SuppressWarnings("rawtypes")
+    public static Iterator memoryRequireIterator(Collection source) {
+        OptimizerConfig c = config;
+        if (c != null && c.emptyMemoryAdvanceFastPath && source.isEmpty()) {
+            return Collections.emptyIterator();
+        }
+        return source.iterator();
+    }
+
     @SuppressWarnings({"rawtypes", "unchecked"})
     public static HashSet borrowClassSet() {
         OptimizerConfig c = config;
@@ -286,26 +491,35 @@ public final class MapOptimizerHooks {
     @SuppressWarnings({"rawtypes", "unchecked"})
     public static Collection nearbyLabelIcons(LinkedHashMap icons, Object mapOwner, Object targetIcon) {
         OptimizerConfig c = config;
-        if (c == null || !c.labelSpatialCandidates || icons.size() < 64) {
+        long generation = campaignCacheGeneration;
+        if (c == null || !c.labelSpatialCandidates || !campaignCachesReady(generation)
+                || icons.size() < 64) {
             return icons.values();
         }
         try {
             LabelIndex index;
             long now = System.nanoTime();
-            synchronized (LABEL_INDEXES) {
-                index = LABEL_INDEXES.get(icons);
+            IdentityHashMap<LinkedHashMap<?, ?>, LabelIndex> labelIndexes = LABEL_INDEXES;
+            synchronized (labelIndexes) {
+                if (!campaignCachesReady(generation)) return icons.values();
+                index = labelIndexes.get(icons);
                 long ttlNs = c.labelIndexTtlMs * 1_000_000L;
                 if (index == null || index.size != icons.size()
                         || (ttlNs > 0L && now - index.builtAtNanos > ttlNs)) {
                     index = LabelIndex.build(icons, now);
-                    if (LABEL_INDEXES.size() >= 32 && !LABEL_INDEXES.containsKey(icons)) {
-                        Iterator<LinkedHashMap<?, ?>> iterator = LABEL_INDEXES.keySet().iterator();
+                    if (!campaignCachesReady(generation)) return icons.values();
+                    if (labelIndexes.size() >= 32 && !labelIndexes.containsKey(icons)) {
+                        Iterator<LinkedHashMap<?, ?>> iterator = labelIndexes.keySet().iterator();
                         if (iterator.hasNext()) {
                             iterator.next();
                             iterator.remove();
                         }
                     }
-                    LABEL_INDEXES.put(icons, index);
+                    labelIndexes.put(icons, index);
+                }
+                if (!campaignCachesReady(generation)) {
+                    labelIndexes.clear();
+                    return icons.values();
                 }
             }
             SectorEntityToken token = iconToken(targetIcon);
@@ -404,21 +618,36 @@ public final class MapOptimizerHooks {
 
     public static SectorEntityToken getMapLocationCached(IntelInfoPlugin plugin, SectorMapAPI map) {
         OptimizerConfig c = config;
-        if (c == null || !c.intelCallbackCache || c.intelMapLocationCacheMs <= 0) {
+        long generation = campaignCacheGeneration;
+        if (c == null || !c.intelCallbackCache || !campaignCachesReady(generation)
+                || c.intelMapLocationCacheMs <= 0) {
             return plugin.getMapLocation(map);
         }
         long now = System.nanoTime();
         long ttl = c.intelMapLocationCacheMs * 1_000_000L;
         IntelCache entry;
-        synchronized (INTEL_CACHE) {
-            entry = INTEL_CACHE.computeIfAbsent(plugin, ignored -> new IntelCache());
-            if (entry.mapForLocation == map && entry.locationValid && now - entry.locationAtNanos <= ttl) {
+        Map<IntelInfoPlugin, IntelCache> intelCache = INTEL_CACHE;
+        synchronized (intelCache) {
+            if (!campaignCachesReady(generation)) {
+                entry = null;
+            } else {
+                entry = intelCache.computeIfAbsent(plugin, ignored -> new IntelCache());
+                // WeakHashMap key operations may invoke user-defined hashCode.
+                // A re-entrant lifecycle change must not leave that late insert.
+                if (!campaignCachesReady(generation)) {
+                    intelCache.clear();
+                    entry = null;
+                }
+            }
+            if (entry != null && entry.mapForLocation == map && entry.locationValid
+                    && now - entry.locationAtNanos <= ttl) {
                 MAP_LOCATION_HITS.increment();
                 return entry.location;
             }
         }
+        if (entry == null) return plugin.getMapLocation(map);
         SectorEntityToken value = plugin.getMapLocation(map);
-        synchronized (INTEL_CACHE) {
+        synchronized (intelCache) {
             entry.mapForLocation = map;
             entry.location = value;
             entry.locationAtNanos = now;
@@ -431,21 +660,34 @@ public final class MapOptimizerHooks {
     @SuppressWarnings("rawtypes")
     public static List getArrowDataCached(IntelInfoPlugin plugin, SectorMapAPI map) {
         OptimizerConfig c = config;
-        if (c == null || !c.intelCallbackCache || c.intelArrowDataCacheMs <= 0) {
+        long generation = campaignCacheGeneration;
+        if (c == null || !c.intelCallbackCache || !campaignCachesReady(generation)
+                || c.intelArrowDataCacheMs <= 0) {
             return plugin.getArrowData(map);
         }
         long now = System.nanoTime();
         long ttl = c.intelArrowDataCacheMs * 1_000_000L;
         IntelCache entry;
-        synchronized (INTEL_CACHE) {
-            entry = INTEL_CACHE.computeIfAbsent(plugin, ignored -> new IntelCache());
-            if (entry.mapForArrows == map && entry.arrowsValid && now - entry.arrowsAtNanos <= ttl) {
+        Map<IntelInfoPlugin, IntelCache> intelCache = INTEL_CACHE;
+        synchronized (intelCache) {
+            if (!campaignCachesReady(generation)) {
+                entry = null;
+            } else {
+                entry = intelCache.computeIfAbsent(plugin, ignored -> new IntelCache());
+                if (!campaignCachesReady(generation)) {
+                    intelCache.clear();
+                    entry = null;
+                }
+            }
+            if (entry != null && entry.mapForArrows == map && entry.arrowsValid
+                    && now - entry.arrowsAtNanos <= ttl) {
                 ARROW_HITS.increment();
                 return entry.arrows;
             }
         }
+        if (entry == null) return plugin.getArrowData(map);
         List value = plugin.getArrowData(map);
-        synchronized (INTEL_CACHE) {
+        synchronized (intelCache) {
             entry.mapForArrows = map;
             entry.arrows = value;
             entry.arrowsAtNanos = now;
@@ -482,7 +724,9 @@ public final class MapOptimizerHooks {
     @SuppressWarnings("rawtypes")
     public static Object getIntelIconEntityIndexed(Object owner, List intelEntities, IntelInfoPlugin plugin) {
         OptimizerConfig c = config;
-        if (c == null || !c.intelEntityIndex || intelEntities == null || plugin == null) {
+        long generation = campaignCacheGeneration;
+        if (c == null || !c.intelEntityIndex || !campaignCachesReady(generation)
+                || intelEntities == null || plugin == null) {
             return invokeOriginalIntelIconLookup(owner, plugin);
         }
         try {
@@ -490,25 +734,39 @@ public final class MapOptimizerHooks {
             Object first = intelEntities.isEmpty() ? null : intelEntities.get(0);
             Object last = intelEntities.isEmpty() ? null : intelEntities.get(intelEntities.size() - 1);
             IntelEntityIndex index;
-            synchronized (INTEL_ENTITY_INDEXES) {
-                index = INTEL_ENTITY_INDEXES.get(intelEntities);
-                long ttlNs = c.intelEntityIndexTtlMs * 1_000_000L;
-                if (index == null || index.size != intelEntities.size()
-                        || index.first != first || index.last != last
-                        || (ttlNs > 0L && now - index.builtAtNanos > ttlNs)) {
-                    index = IntelEntityIndex.build(intelEntities, first, last, now);
-                    if (INTEL_ENTITY_INDEXES.size() >= 32 && !INTEL_ENTITY_INDEXES.containsKey(intelEntities)) {
-                        Iterator<List<?>> iterator = INTEL_ENTITY_INDEXES.keySet().iterator();
-                        if (iterator.hasNext()) {
-                            iterator.next();
-                            iterator.remove();
+            IdentityHashMap<List<?>, IntelEntityIndex> intelEntityIndexes = INTEL_ENTITY_INDEXES;
+            synchronized (intelEntityIndexes) {
+                if (!campaignCachesReady(generation)) {
+                    index = null;
+                } else {
+                    index = intelEntityIndexes.get(intelEntities);
+                    long ttlNs = c.intelEntityIndexTtlMs * 1_000_000L;
+                    if (index == null || index.size != intelEntities.size()
+                            || index.first != first || index.last != last
+                            || (ttlNs > 0L && now - index.builtAtNanos > ttlNs)) {
+                        index = IntelEntityIndex.build(intelEntities, first, last, now);
+                        if (!campaignCachesReady(generation)) {
+                            index = null;
+                        } else {
+                            if (intelEntityIndexes.size() >= 32
+                                    && !intelEntityIndexes.containsKey(intelEntities)) {
+                                Iterator<List<?>> iterator = intelEntityIndexes.keySet().iterator();
+                                if (iterator.hasNext()) {
+                                    iterator.next();
+                                    iterator.remove();
+                                }
+                            }
+                            intelEntityIndexes.put(intelEntities, index);
+                            INTEL_INDEX_BUILDS.increment();
                         }
                     }
-                    INTEL_ENTITY_INDEXES.put(intelEntities, index);
-                    INTEL_INDEX_BUILDS.increment();
+                    if (!campaignCachesReady(generation)) {
+                        intelEntityIndexes.clear();
+                        index = null;
+                    }
                 }
             }
-            if (!index.failed) {
+            if (index != null && !index.failed) {
                 INTEL_INDEX_HITS.increment();
                 return index.byPlugin.get(plugin);
             }
@@ -633,7 +891,10 @@ public final class MapOptimizerHooks {
 
     public static SectorEntityToken hitTestCached(Object handler, float x, float y, float radius) {
         OptimizerConfig c = config;
-        if (c == null || !c.hoverHitTestCache) return invokeOriginalHitTest(handler, x, y, radius);
+        long generation = campaignCacheGeneration;
+        if (c == null || !c.hoverHitTestCache || !campaignCachesReady(generation)) {
+            return invokeOriginalHitTest(handler, x, y, radius);
+        }
 
         HitCache cache = null;
         long now = 0L;
@@ -647,38 +908,48 @@ public final class MapOptimizerHooks {
             int iconCount = icons instanceof Map ? ((Map<?, ?>) icons).size() : -1;
             Object location = access.getLocation.invoke(map);
             now = System.nanoTime();
-            synchronized (HIT_CACHES) {
-                cache = HIT_CACHES.computeIfAbsent(handler, ignored -> new HitCache(c.hoverMaxCells));
-                if (HIT_CACHES.size() > 64) {
-                    Iterator<Object> iterator = HIT_CACHES.keySet().iterator();
-                    while (iterator.hasNext() && HIT_CACHES.size() > 64) {
-                        Object candidate = iterator.next();
-                        if (candidate != handler) iterator.remove();
+            IdentityHashMap<Object, HitCache> hitCaches = HIT_CACHES;
+            synchronized (hitCaches) {
+                if (campaignCachesReady(generation)) {
+                    cache = hitCaches.computeIfAbsent(
+                            handler, ignored -> new HitCache(c.hoverMaxCells));
+                    if (hitCaches.size() > 64) {
+                        Iterator<Object> iterator = hitCaches.keySet().iterator();
+                        while (iterator.hasNext() && hitCaches.size() > 64) {
+                            Object candidate = iterator.next();
+                            if (candidate != handler) iterator.remove();
+                        }
                     }
                 }
-            }
-            if (cache.location != location || cache.iconCount != iconCount
-                    || Float.floatToIntBits(cache.factor) != Float.floatToIntBits(factor)) {
-                cache.reset(location, iconCount, factor);
-            }
-            long minInterval = c.hoverMaxHz <= 0 ? 0L : 1_000_000_000L / c.hoverMaxHz;
-            if (cache.hasLast && minInterval > 0L && now - cache.lastAtNanos < minInterval) {
-                HOVER_HITS.increment();
-                return cache.lastResult;
-            }
-            if (c.hoverCellPixels > 0f && c.hoverCellTtlMs > 0 && c.hoverMaxCells > 0
-                    && Float.isFinite(factor) && factor > 0f) {
-                int cellX = safeFloorToInt((x * factor) / c.hoverCellPixels);
-                int cellY = safeFloorToInt((y * factor) / c.hoverCellPixels);
-                cellKey = cellKey(cellX, cellY)
-                        ^ ((long) Float.floatToIntBits(radius) * 0x9E3779B97F4A7C15L);
-                CellHit hit = cache.cells.get(cellKey);
-                if (hit != null && now - hit.atNanos <= c.hoverCellTtlMs * 1_000_000L) {
-                    cache.setLast(hit.value, now);
-                    HOVER_HITS.increment();
-                    return hit.value;
+                if (!campaignCachesReady(generation)) {
+                    hitCaches.clear();
+                    cache = null;
                 }
-                cacheCell = true;
+            }
+            if (cache != null) {
+                if (cache.location != location || cache.iconCount != iconCount
+                        || Float.floatToIntBits(cache.factor) != Float.floatToIntBits(factor)) {
+                    cache.reset(location, iconCount, factor);
+                }
+                long minInterval = c.hoverMaxHz <= 0 ? 0L : 1_000_000_000L / c.hoverMaxHz;
+                if (cache.hasLast && minInterval > 0L && now - cache.lastAtNanos < minInterval) {
+                    HOVER_HITS.increment();
+                    return cache.lastResult;
+                }
+                if (c.hoverCellPixels > 0f && c.hoverCellTtlMs > 0 && c.hoverMaxCells > 0
+                        && Float.isFinite(factor) && factor > 0f) {
+                    int cellX = safeFloorToInt((x * factor) / c.hoverCellPixels);
+                    int cellY = safeFloorToInt((y * factor) / c.hoverCellPixels);
+                    cellKey = cellKey(cellX, cellY)
+                            ^ ((long) Float.floatToIntBits(radius) * 0x9E3779B97F4A7C15L);
+                    CellHit hit = cache.cells.get(cellKey);
+                    if (hit != null && now - hit.atNanos <= c.hoverCellTtlMs * 1_000_000L) {
+                        cache.setLast(hit.value, now);
+                        HOVER_HITS.increment();
+                        return hit.value;
+                    }
+                    cacheCell = true;
+                }
             }
         } catch (Throwable ignored) {
             // Cache setup is optional. Invoke the original once, below, outside
@@ -815,7 +1086,8 @@ public final class MapOptimizerHooks {
     public static void updateSystemNebulasCached(Object owner, List systemNebulas,
                                                   List constellationLabels, List nebulaStars) {
         OptimizerConfig c = config;
-        if (c == null || !c.systemNebulaCache) {
+        long generation = campaignCacheGeneration;
+        if (c == null || !c.systemNebulaCache || !campaignCachesReady(generation)) {
             invokeOriginalSystemNebulaBuilder(owner);
             return;
         }
@@ -826,30 +1098,32 @@ public final class MapOptimizerHooks {
         try {
             SectorAPI sector = Global.getSector();
             if (sector != null) {
-                NebulaCache cache = getOrBuildNebulaCache(sector, c);
-                SystemNebulaAccess access = SystemNebulaAccess.ACCESS.get(owner.getClass());
-                for (int i = 0; i < cache.systemNebulaSystems.size(); i++) {
-                    StarSystemAPI system = cache.systemNebulaSystems.get(i);
-                    Object terrain = access.createNebula.invoke(null, system);
-                    if (!(terrain instanceof SectorEntityToken token)) {
-                        throw new IllegalStateException("createNebula returned " + terrain);
+                NebulaCache cache = getOrBuildNebulaCache(sector, c, generation);
+                if (cache != null) {
+                    SystemNebulaAccess access = SystemNebulaAccess.ACCESS.get(owner.getClass());
+                    for (int i = 0; i < cache.systemNebulaSystems.size(); i++) {
+                        StarSystemAPI system = cache.systemNebulaSystems.get(i);
+                        Object terrain = access.createNebula.invoke(null, system);
+                        if (!(terrain instanceof SectorEntityToken token)) {
+                            throw new IllegalStateException("createNebula returned " + terrain);
+                        }
+                        token.getCustomData().put("system", system);
+                        token.getCustomData().put("seed", Long.valueOf(cache.systemNebulaSeeds[i]));
+                        systemNebulas.add(terrain);
                     }
-                    token.getCustomData().put("system", system);
-                    token.getCustomData().put("seed", Long.valueOf(cache.systemNebulaSeeds[i]));
-                    systemNebulas.add(terrain);
-                }
-                for (Constellation constellation : cache.constellations) {
-                    Object label = access.createConstellationLabel.invoke(null, constellation);
-                    if (!(label instanceof SectorEntityToken token)) {
-                        throw new IllegalStateException("createConstellationLabel returned " + label);
+                    for (Constellation constellation : cache.constellations) {
+                        Object label = access.createConstellationLabel.invoke(null, constellation);
+                        if (!(label instanceof SectorEntityToken token)) {
+                            throw new IllegalStateException("createConstellationLabel returned " + label);
+                        }
+                        token.getCustomData().put("constellationLabel", Boolean.TRUE);
+                        token.getCustomData().put("constellation", constellation);
+                        constellationLabels.add(label);
                     }
-                    token.getCustomData().put("constellationLabel", Boolean.TRUE);
-                    token.getCustomData().put("constellation", constellation);
-                    constellationLabels.add(label);
+                    nebulaStars.addAll(cache.nebulaStars);
+                    NEBULA_HITS.increment();
+                    return;
                 }
-                nebulaStars.addAll(cache.nebulaStars);
-                NEBULA_HITS.increment();
-                return;
             }
         } catch (Throwable ex) {
             cacheFailure = ex;
@@ -867,24 +1141,38 @@ public final class MapOptimizerHooks {
         invokeOriginalSystemNebulaBuilder(owner);
     }
 
-    private static NebulaCache getOrBuildNebulaCache(SectorAPI sector, OptimizerConfig c) {
+    private static NebulaCache getOrBuildNebulaCache(SectorAPI sector, OptimizerConfig c,
+                                                      long generation) {
         int systems = sector.getStarSystems().size();
         long now = System.nanoTime();
-        NebulaCache current = nebulaCache;
-        if (current != null && current.sector.get() == sector && current.systemCount == systems
+        NebulaCacheSlot slot = nebulaCacheSlot;
+        NebulaCache current = slot.value;
+        if (campaignCachesReady(generation)
+                && nebulaCacheSlot == slot
+                && current != null && current.sector.get() == sector && current.systemCount == systems
                 && (c.systemNebulaMaxAgeMs <= 0
                     || now - current.createdAtNanos <= c.systemNebulaMaxAgeMs * 1_000_000L)) {
             return current;
         }
-        synchronized (MapOptimizerHooks.class) {
-            current = nebulaCache;
+        synchronized (slot) {
+            if (nebulaCacheSlot != slot || !campaignCachesReady(generation)) return null;
+            current = slot.value;
             if (current != null && current.sector.get() == sector && current.systemCount == systems
                     && (c.systemNebulaMaxAgeMs <= 0
                         || now - current.createdAtNanos <= c.systemNebulaMaxAgeMs * 1_000_000L)) {
                 return current;
             }
             NebulaCache built = buildNebulaMetadata(sector, now);
-            nebulaCache = built;
+            if (nebulaCacheSlot != slot || !campaignCachesReady(generation)) return null;
+            slot.value = built;
+            // A lifecycle transition may run between the pre-publication check
+            // and assignment. It swaps the static slot without waiting here, so
+            // this write can then reach only the detached slot. Clear it eagerly
+            // and refuse the stale result if either identity check changed.
+            if (nebulaCacheSlot != slot || !campaignCachesReady(generation)) {
+                slot.value = null;
+                return null;
+            }
             NEBULA_MISSES.increment();
             return built;
         }
@@ -976,20 +1264,36 @@ public final class MapOptimizerHooks {
     public static void forceClearSampleCacheThrottled(Object plugin) {
         if (plugin == null) return;
         OptimizerConfig c = config;
-        if (c == null || !c.sampleCacheClearThrottle || c.sampleCacheClearMinIntervalMs <= 0) {
+        long generation = campaignCacheGeneration;
+        if (c == null || !c.sampleCacheClearThrottle || !campaignCachesReady(generation)
+                || c.sampleCacheClearMinIntervalMs <= 0) {
             ((BaseTiledTerrain) plugin).forceClearSampleCache();
             return;
         }
         long now = System.nanoTime();
         long interval = c.sampleCacheClearMinIntervalMs * 1_000_000L;
-        synchronized (SAMPLE_CLEAR_TIMES) {
-            Long previous = SAMPLE_CLEAR_TIMES.get(plugin);
-            if (previous != null && now - previous < interval) {
-                SAMPLE_CLEAR_SKIPS.increment();
-                return;
+        WeakHashMap<Object, Long> sampleClearTimes = SAMPLE_CLEAR_TIMES;
+        synchronized (sampleClearTimes) {
+            if (!campaignCachesReady(generation)) {
+                // Fall through to the exact vanilla clear below.
+            } else {
+                Long previous = sampleClearTimes.get(plugin);
+                if (campaignCachesReady(generation)
+                        && previous != null && now - previous < interval) {
+                    SAMPLE_CLEAR_SKIPS.increment();
+                    return;
+                }
+                if (campaignCachesReady(generation)) {
+                    sampleClearTimes.put(plugin, now);
+                    if (!campaignCachesReady(generation)) {
+                        // Protect against a re-entrant reset from custom key code.
+                        sampleClearTimes.clear();
+                    }
+                }
             }
-            SAMPLE_CLEAR_TIMES.put(plugin, now);
         }
+        // A generation change only disables this optional throttle. The exact
+        // vanilla clear still runs, preserving all behavior and side effects.
         ((BaseTiledTerrain) plugin).forceClearSampleCache();
     }
 
@@ -1022,6 +1326,10 @@ public final class MapOptimizerHooks {
         } catch (Throwable ex) {
             return c.gridBaseSpacing;
         }
+    }
+
+    private static final class NebulaCacheSlot {
+        volatile NebulaCache value;
     }
 
     private static final class NebulaCache {
@@ -1061,7 +1369,9 @@ public final class MapOptimizerHooks {
     public static void readdChangeListenersIfNeeded(Object engine, List<?> systems, Object hyperspace) {
         if (engine == null) return;
         OptimizerConfig c = config;
-        if (c == null || !c.campaignListenerThrottle) {
+        long generation = campaignCacheGeneration;
+        if (c == null || !c.campaignListenerThrottle
+                || !campaignCachesReady(generation, engine)) {
             invokeReaddChangeListeners(engine);
             return;
         }
@@ -1072,6 +1382,7 @@ public final class MapOptimizerHooks {
         long now = 0L;
         boolean refresh = true;
         boolean compatibilityFallback = false;
+        Map<Object, CampaignListenerState> listenerStates = CAMPAIGN_LISTENER_STATES;
         try {
             size = systems == null ? -1 : systems.size();
             first = size > 0 ? systems.get(0) : null;
@@ -1079,15 +1390,23 @@ public final class MapOptimizerHooks {
             now = System.nanoTime();
             long auditNs = c.campaignListenerAuditMs * 1_000_000L;
 
-            synchronized (CAMPAIGN_LISTENER_STATES) {
-                CampaignListenerState state = CAMPAIGN_LISTENER_STATES.get(engine);
-                refresh = state == null
-                        || state.systems != systems
-                        || state.hyperspace != hyperspace
-                        || state.systemCount != size
-                        || state.firstSystem != first
-                        || state.lastSystem != last
-                        || (auditNs > 0L && now - state.refreshedAtNanos >= auditNs);
+            synchronized (listenerStates) {
+                if (!campaignCachesReady(generation, engine)) {
+                    compatibilityFallback = true;
+                } else {
+                    CampaignListenerState state = listenerStates.get(engine);
+                    if (!campaignCachesReady(generation, engine)) {
+                        compatibilityFallback = true;
+                    } else {
+                        refresh = state == null
+                                || state.systems != systems
+                                || state.hyperspace != hyperspace
+                                || state.systemCount != size
+                                || state.firstSystem != first
+                                || state.lastSystem != last
+                                || (auditNs > 0L && now - state.refreshedAtNanos >= auditNs);
+                    }
+                }
             }
         } catch (Throwable ex) {
             compatibilityFallback = true;
@@ -1100,7 +1419,7 @@ public final class MapOptimizerHooks {
             return;
         }
 
-        if (!refresh) {
+        if (!refresh && campaignCachesReady(generation, engine)) {
             CAMPAIGN_LISTENER_SKIPS.increment();
             return;
         }
@@ -1108,15 +1427,20 @@ public final class MapOptimizerHooks {
         // Keep exceptions from the vanilla method exact: do not catch and retry it.
         invokeReaddChangeListeners(engine);
         try {
-            synchronized (CAMPAIGN_LISTENER_STATES) {
-                CampaignListenerState state = CAMPAIGN_LISTENER_STATES.computeIfAbsent(
+            synchronized (listenerStates) {
+                if (!campaignCachesReady(generation, engine)) return;
+                CampaignListenerState state = listenerStates.computeIfAbsent(
                         engine, ignored -> new CampaignListenerState());
-                state.systems = systems;
-                state.hyperspace = hyperspace;
-                state.systemCount = size;
-                state.firstSystem = first;
-                state.lastSystem = last;
-                state.refreshedAtNanos = now;
+                if (!campaignCachesReady(generation, engine)) {
+                    listenerStates.clear();
+                } else {
+                    state.systems = systems;
+                    state.hyperspace = hyperspace;
+                    state.systemCount = size;
+                    state.firstSystem = first;
+                    state.lastSystem = last;
+                    state.refreshedAtNanos = now;
+                }
             }
         } catch (Throwable ignored) {
             // A failed bookkeeping update merely causes another vanilla refresh on
@@ -1180,7 +1504,9 @@ public final class MapOptimizerHooks {
         if (hyperspace == null) return null;
         List live = hyperspace.getJumpPoints();
         OptimizerConfig c = config;
-        if (c == null || !c.routeJumpPointIndex || c.routeIndexTtlMs <= 0
+        long generation = campaignCacheGeneration;
+        if (c == null || !c.routeJumpPointIndex || !campaignCachesReady(generation)
+                || c.routeIndexTtlMs <= 0
                 || system == null || live == null || !(live instanceof RandomAccess)
                 || live.size() < 32) {
             ROUTE_JUMP_INDEX_FALLBACKS.increment();
@@ -1190,13 +1516,37 @@ public final class MapOptimizerHooks {
         try {
             long now = System.nanoTime();
             RouteJumpIndex index;
-            synchronized (ROUTE_JUMP_INDEXES) {
-                index = ROUTE_JUMP_INDEXES.get(hyperspace);
-                if (index == null || !index.matches(live, now, c.routeIndexTtlMs)) {
-                    index = RouteJumpIndex.build(live, now);
-                    ROUTE_JUMP_INDEXES.put(hyperspace, index);
-                    ROUTE_JUMP_INDEX_BUILDS.increment();
+            Map<LocationAPI, RouteJumpIndex> routeJumpIndexes = ROUTE_JUMP_INDEXES;
+            synchronized (routeJumpIndexes) {
+                if (!campaignCachesReady(generation)) {
+                    index = null;
+                } else {
+                    index = routeJumpIndexes.get(hyperspace);
+                    if (!campaignCachesReady(generation)) {
+                        index = null;
+                    } else if (index == null || !index.matches(live, now, c.routeIndexTtlMs)) {
+                        index = RouteJumpIndex.build(live, now);
+                        if (!campaignCachesReady(generation)) {
+                            index = null;
+                        } else {
+                            routeJumpIndexes.put(hyperspace, index);
+                            if (!campaignCachesReady(generation)) {
+                                routeJumpIndexes.clear();
+                                index = null;
+                            } else {
+                                ROUTE_JUMP_INDEX_BUILDS.increment();
+                            }
+                        }
+                    }
+                    if (!campaignCachesReady(generation)) {
+                        routeJumpIndexes.clear();
+                        index = null;
+                    }
                 }
+            }
+            if (index == null) {
+                ROUTE_JUMP_INDEX_FALLBACKS.increment();
+                return live;
             }
             if (index.failed) {
                 ROUTE_JUMP_INDEX_FALLBACKS.increment();
@@ -1221,7 +1571,10 @@ public final class MapOptimizerHooks {
     public static List routeSystemsForAnchor(Object engine, Object anchor) {
         if (engine == null || anchor == null) return vanillaStarSystems(engine);
         OptimizerConfig c = config;
-        if (c == null || !c.routeJumpPointIndex || c.routeIndexTtlMs <= 0) {
+        long generation = campaignCacheGeneration;
+        if (c == null || !c.routeJumpPointIndex
+                || !campaignCachesReady(generation, engine)
+                || c.routeIndexTtlMs <= 0) {
             return vanillaStarSystems(engine);
         }
 
@@ -1231,15 +1584,35 @@ public final class MapOptimizerHooks {
             if (systems instanceof RandomAccess && systems.size() >= 32) {
                 long now = System.nanoTime();
                 RouteSystemIndex index;
-                synchronized (ROUTE_SYSTEM_INDEXES) {
-                    index = ROUTE_SYSTEM_INDEXES.get(engine);
-                    if (index == null || !index.matches(systems, now, c.routeIndexTtlMs)) {
-                        index = RouteSystemIndex.build(systems, now);
-                        ROUTE_SYSTEM_INDEXES.put(engine, index);
-                        ROUTE_SYSTEM_INDEX_BUILDS.increment();
+                Map<Object, RouteSystemIndex> routeSystemIndexes = ROUTE_SYSTEM_INDEXES;
+                synchronized (routeSystemIndexes) {
+                    if (!campaignCachesReady(generation, engine)) {
+                        index = null;
+                    } else {
+                        index = routeSystemIndexes.get(engine);
+                        if (!campaignCachesReady(generation, engine)) {
+                            index = null;
+                        } else if (index == null || !index.matches(systems, now, c.routeIndexTtlMs)) {
+                            index = RouteSystemIndex.build(systems, now);
+                            if (!campaignCachesReady(generation, engine)) {
+                                index = null;
+                            } else {
+                                routeSystemIndexes.put(engine, index);
+                                if (!campaignCachesReady(generation, engine)) {
+                                    routeSystemIndexes.clear();
+                                    index = null;
+                                } else {
+                                    ROUTE_SYSTEM_INDEX_BUILDS.increment();
+                                }
+                            }
+                        }
+                    }
+                    if (!campaignCachesReady(generation, engine)) {
+                        routeSystemIndexes.clear();
+                        index = null;
                     }
                 }
-                if (!index.failed) {
+                if (index != null && !index.failed) {
                     List candidates = index.byAnchor.get(anchor);
                     if (candidates != null) {
                         ROUTE_SYSTEM_INDEX_HITS.increment();
@@ -1610,7 +1983,8 @@ public final class MapOptimizerHooks {
                         + ", routeJumpIndexFallbacks=" + ROUTE_JUMP_INDEX_FALLBACKS.sumThenReset()
                         + ", routeSystemIndexHits=" + ROUTE_SYSTEM_INDEX_HITS.sumThenReset()
                         + ", routeSystemIndexBuilds=" + ROUTE_SYSTEM_INDEX_BUILDS.sumThenReset()
-                        + ", routeSystemIndexFallbacks=" + ROUTE_SYSTEM_INDEX_FALLBACKS.sumThenReset());
+                        + ", routeSystemIndexFallbacks=" + ROUTE_SYSTEM_INDEX_FALLBACKS.sumThenReset()
+                        + ", campaignCacheResets=" + CAMPAIGN_CACHE_RESETS.sumThenReset());
             } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();
                 return;
@@ -1650,6 +2024,15 @@ public final class MapOptimizerHooks {
                 new Vector2f(), new Vector2f(), new Vector2f(), new Vector2f()
         };
         int arrowVectorIndex;
+        final ArrayList<SnapshotList> campaignSnapshots = new ArrayList<>(3);
+        int campaignSnapshotIndex;
+
+        SnapshotList campaignSnapshotAt(int index) {
+            while (campaignSnapshots.size() <= index) {
+                campaignSnapshots.add(new SnapshotList());
+            }
+            return campaignSnapshots.get(index);
+        }
 
         void clear() {
             entityList.clear();
@@ -1662,6 +2045,100 @@ public final class MapOptimizerHooks {
             containsSourceSize = -1;
             labelCandidates.clear();
             arrowVectorIndex = 0;
+            for (int i = 0; i < campaignSnapshots.size(); i++) {
+                campaignSnapshots.get(i).clearSnapshot();
+            }
+            campaignSnapshotIndex = 0;
+        }
+    }
+
+    /** Array-backed, reusable read-only snapshot used only by verified loops. */
+    private static final class SnapshotList extends AbstractList<Object> implements RandomAccess {
+        private Object[] elements = new Object[0];
+        private int size;
+        private final ArrayList<SnapshotIterator> iterators = new ArrayList<>(2);
+        private int iteratorIndex;
+
+        void copyFrom(Collection<?> source) {
+            int oldSize = size;
+            try {
+                int newSize = source.size();
+                Object[] current = elements;
+                Object[] copied = source.toArray(current);
+                boolean reused = copied == current;
+                int copiedSize = reused ? newSize : copied.length;
+                if (reused && newSize < oldSize) {
+                    Arrays.fill(current, newSize, oldSize, null);
+                }
+                elements = copied;
+                size = copiedSize;
+                iteratorIndex = 0;
+                modCount++;
+            } catch (Throwable ex) {
+                // A custom Collection may fail after partially populating the
+                // supplied array. Never let that exceptional path pin campaign
+                // objects in the process-lifetime ThreadLocal.
+                if (elements != null) Arrays.fill(elements, null);
+                size = 0;
+                iteratorIndex = 0;
+                modCount++;
+                throw propagate(ex);
+            }
+        }
+
+        void clearSnapshot() {
+            if (size > 0) Arrays.fill(elements, 0, size, null);
+            size = 0;
+            iteratorIndex = 0;
+            modCount++;
+        }
+
+        @Override
+        public Object get(int index) {
+            if (index < 0 || index >= size) throw new IndexOutOfBoundsException(index);
+            return elements[index];
+        }
+
+        @Override
+        public int size() {
+            return size;
+        }
+
+        @Override
+        public Iterator<Object> iterator() {
+            while (iterators.size() <= iteratorIndex) {
+                iterators.add(new SnapshotIterator());
+            }
+            SnapshotIterator result = iterators.get(iteratorIndex++);
+            result.reset();
+            return result;
+        }
+
+        private final class SnapshotIterator implements Iterator<Object> {
+            private int cursor;
+            private int expectedModCount;
+
+            void reset() {
+                cursor = 0;
+                expectedModCount = modCount;
+            }
+
+            @Override
+            public boolean hasNext() {
+                return cursor != size;
+            }
+
+            @Override
+            public Object next() {
+                if (expectedModCount != modCount) throw new ConcurrentModificationException();
+                if (cursor >= size) throw new NoSuchElementException();
+                return elements[cursor++];
+            }
+        }
+
+        @SuppressWarnings("unchecked")
+        private static <T extends Throwable> RuntimeException propagate(Throwable ex) throws T {
+            throw (T) ex;
         }
     }
 }

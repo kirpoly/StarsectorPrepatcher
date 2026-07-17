@@ -9,6 +9,7 @@ import jdk.internal.org.objectweb.asm.tree.ClassNode;
 import jdk.internal.org.objectweb.asm.tree.FieldInsnNode;
 import jdk.internal.org.objectweb.asm.tree.FieldNode;
 import jdk.internal.org.objectweb.asm.tree.FrameNode;
+import jdk.internal.org.objectweb.asm.tree.InsnList;
 import jdk.internal.org.objectweb.asm.tree.InsnNode;
 import jdk.internal.org.objectweb.asm.tree.JumpInsnNode;
 import jdk.internal.org.objectweb.asm.tree.LabelNode;
@@ -50,7 +51,11 @@ public final class MapOptimizerTransformer implements ClassFileTransformer {
     static final String EVENTS = "com/fs/starfarer/campaign/comms/v2/EventsPanel";
     static final String CAMPAIGN_ENGINE = "com/fs/starfarer/campaign/CampaignEngine";
     static final String COURSE_WIDGET = "com/fs/starfarer/coreui/A/O0Oo";
-    static final Set<String> TARGET_CLASSES = Set.of(H, A, Z, EVENTS, CAMPAIGN_ENGINE, COURSE_WIDGET);
+    static final String BASE_LOCATION = "com/fs/starfarer/campaign/BaseLocation";
+    static final String BASE_CAMPAIGN_ENTITY = "com/fs/starfarer/campaign/BaseCampaignEntity";
+    static final String MEMORY = "com/fs/starfarer/campaign/rules/Memory";
+    static final Set<String> TARGET_CLASSES = Set.of(H, A, Z, EVENTS, CAMPAIGN_ENGINE,
+            COURSE_WIDGET, BASE_LOCATION, BASE_CAMPAIGN_ENTITY, MEMORY);
 
     private static final String ENTITY_TOKEN_DESC = "Lcom/fs/starfarer/api/campaign/SectorEntityToken;";
     private static final String MAP_API_DESC = "Lcom/fs/starfarer/api/ui/SectorMapAPI;";
@@ -62,7 +67,7 @@ public final class MapOptimizerTransformer implements ClassFileTransformer {
     private static final String HYPERSPACE_DESC = "Lcom/fs/starfarer/campaign/Hyperspace;";
     private static final String PATCH_MARKER_PREFIX = "smo$patched$";
     private static final String PATCH_MARKER_DESC = "Ljava/lang/String;";
-    private static final String PATCH_MARKER_VALUE_PREFIX = "StarsectorMapOptimizer:0.4.0-exp4:";
+    private static final String PATCH_MARKER_VALUE_PREFIX = "StarsectorMapOptimizer:0.4.0-exp6:";
 
     private final OptimizerConfig config;
     private final AtomicInteger patchedClasses = new AtomicInteger();
@@ -109,10 +114,20 @@ public final class MapOptimizerTransformer implements ClassFileTransformer {
                 apply(state, "intelExistingIconLookup", config.intelExistingIconLookup,
                         this::patchExistingIntelIconLookup);
             }
-            case CAMPAIGN_ENGINE -> apply(state, "campaignListenerThrottle",
-                    config.campaignListenerThrottle, this::patchCampaignListenerThrottle);
+            case CAMPAIGN_ENGINE -> {
+                apply(state, "campaignCacheLifecycle", campaignCacheLifecycleEnabled(),
+                        this::patchCampaignCacheLifecycle);
+                apply(state, "campaignListenerThrottle",
+                        config.campaignListenerThrottle, this::patchCampaignListenerThrottle);
+            }
             case COURSE_WIDGET -> apply(state, "routeJumpPointIndex",
                     config.routeJumpPointIndex, this::patchRouteJumpPointIndex);
+            case BASE_LOCATION -> apply(state, "campaignSnapshotReuse",
+                    config.campaignSnapshotReuse, this::patchCampaignSnapshotReuse);
+            case BASE_CAMPAIGN_ENTITY -> apply(state, "entityScriptSnapshotReuse",
+                    config.entityScriptSnapshotReuse, this::patchEntityScriptSnapshotReuse);
+            case MEMORY -> apply(state, "emptyMemoryAdvanceFastPath",
+                    config.emptyMemoryAdvanceFastPath, this::patchEmptyMemoryAdvanceFastPath);
             default -> { return null; }
         }
 
@@ -207,10 +222,20 @@ public final class MapOptimizerTransformer implements ClassFileTransformer {
             case Z -> config.intelCallbackCache || config.arrowVectorPool;
             case EVENTS -> config.intelCallbackCache || config.intelFastContains
                     || config.intelExistingIconLookup;
-            case CAMPAIGN_ENGINE -> config.campaignListenerThrottle;
+            case CAMPAIGN_ENGINE -> campaignCacheLifecycleEnabled() || config.campaignListenerThrottle;
             case COURSE_WIDGET -> config.routeJumpPointIndex;
+            case BASE_LOCATION -> config.campaignSnapshotReuse;
+            case BASE_CAMPAIGN_ENTITY -> config.entityScriptSnapshotReuse;
+            case MEMORY -> config.emptyMemoryAdvanceFastPath;
             default -> false;
         };
+    }
+
+    private boolean campaignCacheLifecycleEnabled() {
+        return config.labelSpatialCandidates || config.intelCallbackCache
+                || config.intelEntityIndex || config.hoverHitTestCache
+                || config.systemNebulaCache || config.sampleCacheClearThrottle
+                || config.campaignListenerThrottle || config.routeJumpPointIndex;
     }
 
     // ---------------------------------------------------------------------
@@ -787,6 +812,210 @@ public final class MapOptimizerTransformer implements ClassFileTransformer {
     // Campaign and route hot paths
     // ---------------------------------------------------------------------
 
+    private PatchReport patchCampaignCacheLifecycle(ClassNode node) {
+        String engineDesc = "L" + CAMPAIGN_ENGINE + ";";
+        String beginDesc = "(Ljava/lang/Object;)J";
+        String completeDesc = "(Ljava/lang/Object;J)V";
+        MethodNode reset = requireMethod(node, "resetInstance", "()V");
+        MethodNode set = requireMethod(node, "setInstance", "(" + engineDesc + ")V");
+        if ((reset.access & Opcodes.ACC_STATIC) == 0 || (set.access & Opcodes.ACC_STATIC) == 0) {
+            throw mismatch("CampaignEngine lifecycle methods are not static");
+        }
+        if ((reset.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0
+                || (set.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) {
+            throw mismatch("CampaignEngine lifecycle methods have no patchable code");
+        }
+
+        FieldNode singleton = null;
+        for (FieldNode field : node.fields) {
+            if ((field.access & Opcodes.ACC_STATIC) == 0 || !field.desc.equals(engineDesc)) continue;
+            if (singleton != null) {
+                throw mismatch("CampaignEngine has multiple static self-typed fields");
+            }
+            singleton = field;
+        }
+        if (singleton == null) throw mismatch("CampaignEngine singleton field was not found");
+        FieldInsnNode resetWrite = requireSingletonWrite(
+                reset, node.name, singleton.name, engineDesc, "resetInstance");
+        FieldInsnNode setWrite = requireSingletonWrite(
+                set, node.name, singleton.name, engineDesc, "setInstance");
+        Frame<SourceValue> resetFrame = frameBefore(reset, resetWrite, sourceFrames(node.name, reset));
+        Frame<SourceValue> setFrame = frameBefore(set, setWrite, sourceFrames(node.name, set));
+        if (resetFrame.getStackSize() < 1
+                || !sourceIsOpcode(resetFrame.getStack(resetFrame.getStackSize() - 1), Opcodes.ACONST_NULL)) {
+            throw mismatch("resetInstance singleton write is not produced by null");
+        }
+        if (setFrame.getStackSize() < 1
+                || !sourceIsLocal(setFrame.getStack(setFrame.getStackSize() - 1),
+                Opcodes.ALOAD, argumentLocal(set, 0))) {
+            throw mismatch("setInstance singleton write is not produced by its engine argument");
+        }
+
+        List<AbstractInsnNode> resetReturns = campaignReturns(reset);
+        List<AbstractInsnNode> setReturns = campaignReturns(set);
+        int resetBegins = countCalls(reset, Opcodes.INVOKESTATIC, HOOKS,
+                "beginCampaignEngineChange", beginDesc);
+        int setBegins = countCalls(set, Opcodes.INVOKESTATIC, HOOKS,
+                "beginCampaignEngineChange", beginDesc);
+        int resetCompletes = countCalls(reset, Opcodes.INVOKESTATIC, HOOKS,
+                "completeCampaignEngineChange", completeDesc);
+        int setCompletes = countCalls(set, Opcodes.INVOKESTATIC, HOOKS,
+                "completeCampaignEngineChange", completeDesc);
+        if (resetBegins == 1 && setBegins == 1
+                && resetCompletes == resetReturns.size() && setCompletes == setReturns.size()) {
+            int resetToken = requireCampaignBeginPlacement(
+                    reset, resetWrite, false, beginDesc);
+            int setToken = requireCampaignBeginPlacement(set, setWrite, true, beginDesc);
+            requireCampaignCompletionPlacement(
+                    reset, resetReturns, false, resetToken, completeDesc);
+            requireCampaignCompletionPlacement(
+                    set, setReturns, true, setToken, completeDesc);
+            requireCampaignTokenInitializer(reset, resetToken);
+            requireCampaignTokenInitializer(set, setToken);
+            throw already("CampaignEngine lifecycle cache hooks are already present");
+        }
+        if (resetBegins != 0 || setBegins != 0 || resetCompletes != 0 || setCompletes != 0) {
+            throw mismatch("CampaignEngine lifecycle hooks are partial or ambiguous: resetBegin="
+                    + resetBegins + ", setBegin=" + setBegins + ", resetComplete="
+                    + resetCompletes + ", setComplete=" + setCompletes);
+        }
+
+        int resetToken = reset.maxLocals;
+        reset.maxLocals += 2;
+        InsnList resetInitializer = new InsnList();
+        resetInitializer.add(new LdcInsnNode(Long.valueOf(-1L)));
+        resetInitializer.add(new VarInsnNode(Opcodes.LSTORE, resetToken));
+        reset.instructions.insert(resetInitializer);
+        InsnList resetPrefix = new InsnList();
+        resetPrefix.add(new InsnNode(Opcodes.ACONST_NULL));
+        resetPrefix.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                HOOKS, "beginCampaignEngineChange", beginDesc, false));
+        resetPrefix.add(new VarInsnNode(Opcodes.LSTORE, resetToken));
+        reset.instructions.insertBefore(resetWrite, resetPrefix);
+        for (AbstractInsnNode returnInsn : resetReturns) {
+            InsnList completion = new InsnList();
+            completion.add(new InsnNode(Opcodes.ACONST_NULL));
+            completion.add(new VarInsnNode(Opcodes.LLOAD, resetToken));
+            completion.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                    HOOKS, "completeCampaignEngineChange", completeDesc, false));
+            reset.instructions.insertBefore(returnInsn, completion);
+        }
+
+        int setToken = set.maxLocals;
+        set.maxLocals += 2;
+        InsnList setInitializer = new InsnList();
+        setInitializer.add(new LdcInsnNode(Long.valueOf(-1L)));
+        setInitializer.add(new VarInsnNode(Opcodes.LSTORE, setToken));
+        set.instructions.insert(setInitializer);
+        InsnList setPrefix = new InsnList();
+        setPrefix.add(new VarInsnNode(Opcodes.ALOAD, argumentLocal(set, 0)));
+        setPrefix.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                HOOKS, "beginCampaignEngineChange", beginDesc, false));
+        setPrefix.add(new VarInsnNode(Opcodes.LSTORE, setToken));
+        set.instructions.insertBefore(setWrite, setPrefix);
+        for (AbstractInsnNode returnInsn : setReturns) {
+            InsnList completion = new InsnList();
+            completion.add(new VarInsnNode(Opcodes.ALOAD, argumentLocal(set, 0)));
+            completion.add(new VarInsnNode(Opcodes.LLOAD, setToken));
+            completion.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                    HOOKS, "completeCampaignEngineChange", completeDesc, false));
+            set.instructions.insertBefore(returnInsn, completion);
+        }
+
+        requireCampaignBeginPlacement(reset, resetWrite, false, beginDesc);
+        requireCampaignBeginPlacement(set, setWrite, true, beginDesc);
+        requireCampaignCompletionPlacement(
+                reset, resetReturns, false, resetToken, completeDesc);
+        requireCampaignCompletionPlacement(
+                set, setReturns, true, setToken, completeDesc);
+        requireCampaignTokenInitializer(reset, resetToken);
+        requireCampaignTokenInitializer(set, setToken);
+        PatchReport report = new PatchReport();
+        report.add("campaign cache two-phase boundaries",
+                2 + resetReturns.size() + setReturns.size());
+        return report;
+    }
+
+    private static int requireCampaignBeginPlacement(MethodNode method, FieldInsnNode write,
+                                                     boolean engineArgument, String beginDesc) {
+        AbstractInsnNode storeInsn = previousMeaningful(write);
+        if (!(storeInsn instanceof VarInsnNode store) || store.getOpcode() != Opcodes.LSTORE) {
+            throw mismatch(method.name + " lifecycle transition token is not stored before publication");
+        }
+        AbstractInsnNode hookInsn = previousMeaningful(store);
+        MethodInsnNode hook = asMethod(hookInsn, method.name + " lifecycle hook");
+        requireCall(hook, Opcodes.INVOKESTATIC, HOOKS, "beginCampaignEngineChange", beginDesc,
+                method.name + " lifecycle hook");
+        AbstractInsnNode argument = previousMeaningful(hook);
+        if (engineArgument) {
+            requireVar(argument, Opcodes.ALOAD, argumentLocal(method, 0),
+                    method.name + " lifecycle engine argument");
+        } else if (argument == null || argument.getOpcode() != Opcodes.ACONST_NULL) {
+            throw mismatch(method.name + " lifecycle reset argument is not null");
+        }
+        return store.var;
+    }
+
+    private static void requireCampaignCompletionPlacement(
+            MethodNode method, List<AbstractInsnNode> returns, boolean engineArgument,
+            int tokenLocal, String completeDesc) {
+        for (AbstractInsnNode returnInsn : returns) {
+            MethodInsnNode hook = asMethod(previousMeaningful(returnInsn),
+                    method.name + " lifecycle completion hook");
+            requireCall(hook, Opcodes.INVOKESTATIC, HOOKS,
+                    "completeCampaignEngineChange", completeDesc,
+                    method.name + " lifecycle completion hook");
+            AbstractInsnNode token = previousMeaningful(hook);
+            requireVar(token, Opcodes.LLOAD, tokenLocal,
+                    method.name + " lifecycle completion token");
+            AbstractInsnNode argument = previousMeaningful(token);
+            if (engineArgument) {
+                requireVar(argument, Opcodes.ALOAD, argumentLocal(method, 0),
+                        method.name + " lifecycle completion engine argument");
+            } else if (argument == null || argument.getOpcode() != Opcodes.ACONST_NULL) {
+                throw mismatch(method.name + " lifecycle completion reset argument is not null");
+            }
+        }
+    }
+
+    private static void requireCampaignTokenInitializer(MethodNode method, int tokenLocal) {
+        AbstractInsnNode first = null;
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn.getOpcode() >= 0) {
+                first = insn;
+                break;
+            }
+        }
+        if (!(first instanceof LdcInsnNode ldc) || !(ldc.cst instanceof Long value)
+                || value.longValue() != -1L) {
+            throw mismatch(method.name + " lifecycle transition token initializer changed");
+        }
+        requireVar(nextMeaningful(first), Opcodes.LSTORE, tokenLocal,
+                method.name + " lifecycle transition token initializer");
+    }
+
+    private static List<AbstractInsnNode> campaignReturns(MethodNode method) {
+        ArrayList<AbstractInsnNode> returns = new ArrayList<>();
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn.getOpcode() == Opcodes.RETURN) returns.add(insn);
+        }
+        if (returns.isEmpty()) throw mismatch(method.name + " has no normal return");
+        return returns;
+    }
+
+    private static FieldInsnNode requireSingletonWrite(MethodNode method, String owner,
+                                                       String name, String desc, String label) {
+        FieldInsnNode result = null;
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (!(insn instanceof FieldInsnNode field) || field.getOpcode() != Opcodes.PUTSTATIC
+                    || !field.owner.equals(owner) || !field.name.equals(name) || !field.desc.equals(desc)) continue;
+            if (result != null) throw mismatch(label + " has multiple singleton writes");
+            result = field;
+        }
+        if (result == null) throw mismatch(label + " singleton write was not found");
+        return result;
+    }
+
     private PatchReport patchCampaignListenerThrottle(ClassNode node) {
         MethodNode refresh = requireMethod(node, "readdChangeListeners", "()V");
         if (containsWrite(refresh)) {
@@ -894,6 +1123,125 @@ public final class MapOptimizerTransformer implements ClassFileTransformer {
         PatchReport report = new PatchReport();
         report.add("route jump-point system index", 3);
         report.add("route hyperspace-anchor system index", 1);
+        return report;
+    }
+
+    private PatchReport patchCampaignSnapshotReuse(ClassNode node) {
+        String methodDesc = "(FLcom/fs/starfarer/util/A/new;)V";
+        String hookDesc = "(Ljava/util/Collection;)Ljava/util/List;";
+        AllocationSpec advanceSnapshots = new AllocationSpec(
+                "java/util/ArrayList", "(Ljava/util/Collection;)V",
+                "borrowLocationAdvanceSnapshot", hookDesc, 3);
+        AllocationSpec pausedSnapshots = new AllocationSpec(
+                "java/util/ArrayList", "(Ljava/util/Collection;)V",
+                "borrowPausedLocationSnapshot", hookDesc, 2);
+
+        MethodNode advance = requireMethod(node, "advance", methodDesc);
+        boolean advanceScopeInstalled = ensureScratchScope(
+                node.name, advance, "BaseLocation.advance");
+        int advanceChanged = replaceSnapshotAllocationGroup(node.name, advance,
+                advanceSnapshots, advanceScopeInstalled,
+                "BaseLocation.advance defensive snapshots");
+
+        MethodNode paused = requireMethod(node, "advanceEvenIfPaused", methodDesc);
+        boolean pausedScopeInstalled = ensureScratchScope(
+                node.name, paused, "BaseLocation.advanceEvenIfPaused");
+        int pausedChanged = replaceSnapshotAllocationGroup(node.name, paused,
+                pausedSnapshots, pausedScopeInstalled,
+                "BaseLocation.advanceEvenIfPaused defensive snapshots");
+
+        PatchReport report = new PatchReport();
+        report.add("reusable BaseLocation defensive snapshots",
+                advanceChanged + pausedChanged);
+        return report;
+    }
+
+    private PatchReport patchEntityScriptSnapshotReuse(ClassNode node) {
+        MethodNode runScripts = requireMethod(node, "runScripts", "(F)V");
+        boolean scopeInstalled = ensureScratchScope(
+                node.name, runScripts, "BaseCampaignEntity.runScripts");
+        AllocationSpec scripts = new AllocationSpec(
+                "java/util/ArrayList", "(Ljava/util/Collection;)V",
+                "borrowEntityScriptSnapshot",
+                "(Ljava/util/Collection;)Ljava/util/List;", 1);
+        int changed = replaceSnapshotAllocationGroup(node.name, runScripts,
+                scripts, scopeInstalled,
+                "BaseCampaignEntity.runScripts defensive snapshot");
+        PatchReport report = new PatchReport();
+        report.add("reusable entity-script snapshot", changed);
+        return report;
+    }
+
+    private PatchReport patchEmptyMemoryAdvanceFastPath(ClassNode node) {
+        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        String expireHookDesc = "(Ljava/util/List;)Ljava/util/Iterator;";
+        String requireHookDesc = "(Ljava/util/Collection;)Ljava/util/Iterator;";
+
+        List<MethodInsnNode> rawExpire = calls(advance, Opcodes.INVOKEINTERFACE,
+                "java/util/List", "iterator", "()Ljava/util/Iterator;");
+        List<MethodInsnNode> rawRequire = calls(advance, Opcodes.INVOKEINTERFACE,
+                "java/util/Collection", "iterator", "()Ljava/util/Iterator;");
+        List<MethodInsnNode> hookedExpire = calls(advance, Opcodes.INVOKESTATIC,
+                HOOKS, "memoryExpireIterator", expireHookDesc);
+        List<MethodInsnNode> hookedRequire = calls(advance, Opcodes.INVOKESTATIC,
+                HOOKS, "memoryRequireIterator", requireHookDesc);
+
+        boolean original = rawExpire.size() == 1 && rawRequire.size() == 1
+                && hookedExpire.isEmpty() && hookedRequire.isEmpty();
+        boolean patched = rawExpire.isEmpty() && rawRequire.isEmpty()
+                && hookedExpire.size() == 1 && hookedRequire.size() == 1;
+        if (!original && !patched) {
+            throw mismatch("Memory.advance iterator sites are missing, duplicated, or partially patched");
+        }
+
+        MethodInsnNode expireIterator = original ? rawExpire.get(0) : hookedExpire.get(0);
+        MethodInsnNode requireIterator = original ? rawRequire.get(0) : hookedRequire.get(0);
+        Frame<SourceValue>[] frames = sourceFrames(node.name, advance);
+        SourceValue expireSource = original
+                ? receiverSource(advance, expireIterator, frames)
+                : argumentSource(advance, expireIterator, frames, 0);
+        FieldInsnNode expireField = requireSourceField(expireSource,
+                Opcodes.GETFIELD, node.name, LIST_DESC, "Memory.advance expire list");
+
+        SourceValue requireSource = original
+                ? receiverSource(advance, requireIterator, frames)
+                : argumentSource(advance, requireIterator, frames, 0);
+        MethodInsnNode values = requireSourceMethod(requireSource,
+                Opcodes.INVOKEVIRTUAL, "java/util/LinkedHashMap", "values",
+                "()Ljava/util/Collection;", "Memory.advance require values view");
+        FieldInsnNode requireField = requireSourceField(receiverSource(advance, values, frames),
+                Opcodes.GETFIELD, node.name, LINKED_MAP_DESC, "Memory.advance require map");
+        if (expireField.name.equals(requireField.name)) {
+            throw mismatch("Memory.advance timed-entry fields unexpectedly alias");
+        }
+
+        MethodInsnNode convert = only(calls(advance, Opcodes.INVOKEVIRTUAL,
+                "com/fs/starfarer/campaign/CampaignClock", "convertToDays", "(F)F"),
+                "Memory.advance clock conversion");
+        AbstractInsnNode convertedStore = nextMeaningful(convert);
+        if (!(convertedStore instanceof VarInsnNode store) || store.getOpcode() != Opcodes.FSTORE) {
+            throw mismatch("Memory.advance clock conversion is not stored before timed-entry scans");
+        }
+        if (advance.instructions.indexOf(convertedStore) >= advance.instructions.indexOf(expireIterator)
+                || advance.instructions.indexOf(expireIterator)
+                >= advance.instructions.indexOf(requireIterator)) {
+            throw mismatch("Memory.advance restore/pause/clock/expiry ordering changed");
+        }
+
+        if (patched) {
+            throw already("Memory.advance empty iterator fast paths are already present");
+        }
+        makeStatic(expireIterator, HOOKS, "memoryExpireIterator", expireHookDesc);
+        makeStatic(requireIterator, HOOKS, "memoryRequireIterator", requireHookDesc);
+        requireCount("Memory.advance expire iterator hook",
+                countCalls(advance, Opcodes.INVOKESTATIC,
+                        HOOKS, "memoryExpireIterator", expireHookDesc), 1);
+        requireCount("Memory.advance require iterator hook",
+                countCalls(advance, Opcodes.INVOKESTATIC,
+                        HOOKS, "memoryRequireIterator", requireHookDesc), 1);
+
+        PatchReport report = new PatchReport();
+        report.add("allocation-free empty Memory iterators", 2);
         return report;
     }
 
@@ -1006,6 +1354,194 @@ public final class MapOptimizerTransformer implements ClassFileTransformer {
 
     private static boolean isReturnOpcode(int opcode) {
         return opcode >= Opcodes.IRETURN && opcode <= Opcodes.RETURN;
+    }
+
+    /**
+     * Replaces defensive-copy allocations whose compiler locals are reused
+     * later in the same large method. The ordinary scratch matcher intentionally
+     * requires a single assignment per local; this variant proves ownership from
+     * the SourceInterpreter value of each individual ASTORE instead.
+     */
+    private static int replaceSnapshotAllocationGroup(String owner, MethodNode method,
+                                                       AllocationSpec spec,
+                                                       boolean scopeInstalled, String label) {
+        List<SnapshotAllocationPlan> original = snapshotAllocationPlans(owner, method, spec);
+        List<SnapshotHookPlan> patched = snapshotHookPlans(method, spec);
+        boolean originalState = original.size() == spec.expected && patched.isEmpty();
+        boolean patchedState = original.isEmpty() && patched.size() == spec.expected;
+        if (patchedState) {
+            if (scopeInstalled) {
+                throw mismatch(label + " hooks exist without their required scratch scope");
+            }
+            for (int i = 0; i < patched.size(); i++) {
+                requireSnapshotUseContract(owner, method, patched.get(i).store,
+                        expectedSnapshotIterators(spec.hookName, i), label);
+            }
+            throw already(label + " hooks and assignment-scoped non-escape contracts are already present");
+        }
+        if (!originalState) {
+            throw mismatch(label + " has mixed, missing, or ambiguous allocation/hook sites");
+        }
+
+        for (int i = 0; i < original.size(); i++) {
+            SnapshotAllocationPlan plan = original.get(i);
+            requireSnapshotUseContract(owner, method, plan.store,
+                    expectedSnapshotIterators(spec.hookName, i), label);
+            method.instructions.remove(plan.allocation);
+            method.instructions.remove(plan.duplicate);
+            makeStatic(plan.constructor, HOOKS, spec.hookName, spec.hookDesc);
+        }
+        requireCount(label + " postcondition " + spec.hookName,
+                countCalls(method, Opcodes.INVOKESTATIC,
+                        HOOKS, spec.hookName, spec.hookDesc), spec.expected);
+        return original.size();
+    }
+
+    private static List<SnapshotAllocationPlan> snapshotAllocationPlans(
+            String owner, MethodNode method, AllocationSpec spec) {
+        Frame<SourceValue>[] frames = sourceFrames(owner, method);
+        List<SnapshotAllocationPlan> result = new ArrayList<>();
+        int rawConstructors = 0;
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESPECIAL
+                    && call.owner.equals(spec.type) && call.name.equals("<init>")
+                    && call.desc.equals(spec.constructorDesc)) rawConstructors++;
+            if (!(insn instanceof TypeInsnNode allocation)
+                    || allocation.getOpcode() != Opcodes.NEW
+                    || !allocation.desc.equals(spec.type)) continue;
+            AbstractInsnNode duplicate = nextMeaningful(allocation);
+            if (duplicate == null || duplicate.getOpcode() != Opcodes.DUP) continue;
+            MethodInsnNode constructor = null;
+            for (AbstractInsnNode cursor = duplicate.getNext(); cursor != null; cursor = cursor.getNext()) {
+                if (cursor instanceof MethodInsnNode call
+                        && call.getOpcode() == Opcodes.INVOKESPECIAL
+                        && call.owner.equals(spec.type) && call.name.equals("<init>")
+                        && call.desc.equals(spec.constructorDesc)) {
+                    SourceValue receiver = receiverSource(method, call, frames);
+                    if (sourceContains(receiver, duplicate)) constructor = call;
+                    break;
+                }
+                if (cursor.getOpcode() == Opcodes.NEW && cursor != allocation) break;
+            }
+            if (constructor == null) continue;
+            AbstractInsnNode stored = nextMeaningful(constructor);
+            if (!(stored instanceof VarInsnNode store) || store.getOpcode() != Opcodes.ASTORE) {
+                throw mismatch(spec.hookName + " snapshot result is not stored in a local");
+            }
+            result.add(new SnapshotAllocationPlan(allocation, duplicate, constructor, store));
+        }
+        if (rawConstructors != result.size()) {
+            throw mismatch(spec.hookName
+                    + " has constructors not paired by uninitialized-value data-flow");
+        }
+        return result;
+    }
+
+    private static List<SnapshotHookPlan> snapshotHookPlans(MethodNode method,
+                                                            AllocationSpec spec) {
+        List<SnapshotHookPlan> result = new ArrayList<>();
+        for (MethodInsnNode hook : calls(method, Opcodes.INVOKESTATIC,
+                HOOKS, spec.hookName, spec.hookDesc)) {
+            AbstractInsnNode stored = nextMeaningful(hook);
+            if (!(stored instanceof VarInsnNode store) || store.getOpcode() != Opcodes.ASTORE) {
+                throw mismatch(spec.hookName + " result is not stored directly in a local");
+            }
+            result.add(new SnapshotHookPlan(hook, store));
+        }
+        return result;
+    }
+
+    private static int expectedSnapshotIterators(String hookName, int ordinal) {
+        if (hookName.equals("borrowPausedLocationSnapshot") && ordinal == 0) return 2;
+        if (hookName.equals("borrowLocationAdvanceSnapshot")
+                || hookName.equals("borrowPausedLocationSnapshot")
+                || hookName.equals("borrowEntityScriptSnapshot")) return 1;
+        throw mismatch("no snapshot iterator contract for " + hookName);
+    }
+
+    private static void requireSnapshotUseContract(String owner, MethodNode method,
+                                                   VarInsnNode assignment, int expectedIterators,
+                                                   String label) {
+        int local = assignment.var;
+        Frame<SourceValue>[] frames = sourceFrames(owner, method);
+        Set<AbstractInsnNode> accountedLoads = new HashSet<>();
+        List<MethodInsnNode> iterators = new ArrayList<>();
+        Map<String, Integer> observed = new LinkedHashMap<>();
+
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (!(insn instanceof MethodInsnNode call)) continue;
+            if (call.getOpcode() != Opcodes.INVOKESTATIC
+                    && recordSnapshotUse(method, receiverSource(method, call, frames),
+                    local, assignment, frames, accountedLoads)) {
+                String key = call.getOpcode() + "|" + call.owner + "|" + call.name
+                        + "|" + call.desc + "|receiver";
+                observed.merge(key, 1, Integer::sum);
+                if (call.getOpcode() == Opcodes.INVOKEINTERFACE
+                        && call.owner.equals("java/util/List") && call.name.equals("iterator")
+                        && call.desc.equals("()Ljava/util/Iterator;")) {
+                    iterators.add(call);
+                }
+            }
+            Type[] args = Type.getArgumentTypes(call.desc);
+            for (int i = 0; i < args.length; i++) {
+                if (recordSnapshotUse(method, argumentSource(method, call, frames, i),
+                        local, assignment, frames, accountedLoads)) {
+                    String key = call.getOpcode() + "|" + call.owner + "|" + call.name
+                            + "|" + call.desc + "|arg" + i;
+                    observed.merge(key, 1, Integer::sum);
+                }
+            }
+        }
+
+        Map<String, Integer> expected = new LinkedHashMap<>();
+        expectUse(expected, Opcodes.INVOKEINTERFACE, "java/util/List", "iterator",
+                "()Ljava/util/Iterator;", -1, expectedIterators);
+        if (!observed.equals(expected)) {
+            throw mismatch(label + " assignment to local " + local
+                    + " use contract changed: expected " + expected + ", found " + observed);
+        }
+
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (!(insn instanceof VarInsnNode load) || load.getOpcode() != Opcodes.ALOAD
+                    || load.var != local) continue;
+            SourceValue origin = frameBefore(method, load, frames).getLocal(local);
+            if (!sourceContains(origin, assignment)) continue;
+            if (origin.insns.size() != 1) {
+                throw mismatch(label + " local " + local
+                        + " merges its snapshot assignment with another value");
+            }
+            if (!accountedLoads.contains(load)) {
+                throw mismatch(label + " local " + local
+                        + " has an unclassified alias/escape at instruction "
+                        + method.instructions.indexOf(load));
+            }
+        }
+        for (MethodInsnNode iterator : iterators) {
+            requireIteratorLifetime(owner, method, iterator,
+                    label + " assignment to local " + local);
+        }
+    }
+
+    private static boolean recordSnapshotUse(MethodNode method, SourceValue source,
+                                             int local, VarInsnNode assignment,
+                                             Frame<SourceValue>[] frames,
+                                             Set<AbstractInsnNode> accountedLoads) {
+        if (source == null || source.insns == null || source.insns.isEmpty()) return false;
+        boolean fromAssignment = false;
+        for (AbstractInsnNode producer : source.insns) {
+            if (!(producer instanceof VarInsnNode load)
+                    || load.getOpcode() != Opcodes.ALOAD || load.var != local) continue;
+            SourceValue origin = frameBefore(method, load, frames).getLocal(local);
+            if (!sourceContains(origin, assignment)) continue;
+            if (origin.insns.size() != 1) {
+                throw mismatch("snapshot local " + local
+                        + " merges its proven assignment with another value");
+            }
+            accountedLoads.add(load);
+            fromAssignment = true;
+        }
+        return fromAssignment;
     }
 
     private static int replaceAllocationGroup(String owner, MethodNode method,
@@ -1226,6 +1762,12 @@ public final class MapOptimizerTransformer implements ClassFileTransformer {
                 expectUse(expected, Opcodes.INVOKEINTERFACE, "java/util/List", "iterator",
                         "()Ljava/util/Iterator;", -1, 1);
             }
+            case "borrowLocationAdvanceSnapshot", "borrowEntityScriptSnapshot" ->
+                    expectUse(expected, Opcodes.INVOKEINTERFACE, "java/util/List", "iterator",
+                            "()Ljava/util/Iterator;", -1, 1);
+            case "borrowPausedLocationSnapshot" ->
+                    expectUse(expected, Opcodes.INVOKEINTERFACE, "java/util/List", "iterator",
+                            "()Ljava/util/Iterator;", -1, ordinal == 0 ? 2 : 1);
             case "borrowHitPoint" -> expectUse(expected, Opcodes.INVOKESTATIC,
                     "com/fs/starfarer/prototype/Utils", "*",
                     "(Lorg/lwjgl/util/vector/Vector2f;Lorg/lwjgl/util/vector/Vector2f;)F", 0, 2);
@@ -1871,6 +2413,11 @@ public final class MapOptimizerTransformer implements ClassFileTransformer {
         return found != null && found == local;
     }
 
+    private static boolean sourceIsOpcode(SourceValue value, int opcode) {
+        if (value == null || value.insns == null || value.insns.size() != 1) return false;
+        return value.insns.iterator().next().getOpcode() == opcode;
+    }
+
     private static boolean sourceIsFieldDesc(SourceValue value, String desc) {
         if (value == null || value.insns == null || value.insns.size() != 1) return false;
         AbstractInsnNode source = value.insns.iterator().next();
@@ -2114,6 +2661,11 @@ public final class MapOptimizerTransformer implements ClassFileTransformer {
 
     private record AllocationPlan(TypeInsnNode allocation, AbstractInsnNode duplicate,
                                   MethodInsnNode constructor, int local) {}
+
+    private record SnapshotAllocationPlan(TypeInsnNode allocation, AbstractInsnNode duplicate,
+                                          MethodInsnNode constructor, VarInsnNode store) {}
+
+    private record SnapshotHookPlan(MethodInsnNode hook, VarInsnNode store) {}
 
     private static final class PatchReport {
         int total;

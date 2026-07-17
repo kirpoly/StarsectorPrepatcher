@@ -23,7 +23,7 @@ printf '%s\n' \
 printf '%s\n' \
   'Manifest-Version: 1.0' \
   'Implementation-Title: Starsector Map Optimizer Bootstrap' \
-  'Implementation-Version: 0.4.0-exp4' '' > "$BUILD/bootstrap.mf"
+  'Implementation-Version: 0.4.0-exp6' '' > "$BUILD/bootstrap.mf"
 jar cfm "$MOD_ROOT/agent/StarsectorMapOptimizerAgent.jar" "$BUILD/agent.mf" -C "$BUILD/agent-classes" .
 jar cfm "$MOD_ROOT/jars/StarsectorMapOptimizerBootstrap.jar" "$BUILD/bootstrap.mf" -C "$BUILD/bootstrap-classes" .
 echo 'Build completed.'

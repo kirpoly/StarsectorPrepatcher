@@ -14,7 +14,7 @@ import java.util.Map;
 import java.util.Set;
 
 public final class MapOptimizerAgent {
-    public static final String VERSION = "0.4.0-exp4";
+    public static final String VERSION = "0.4.0-exp6";
 
     private MapOptimizerAgent() {}
 

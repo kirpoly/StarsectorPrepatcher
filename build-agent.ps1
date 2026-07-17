@@ -36,7 +36,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Bootstrap compilation failed.' }
 $agentManifest = Join-Path $build 'agent.mf'
 $bootstrapManifest = Join-Path $build 'bootstrap.mf'
 [IO.File]::WriteAllText($agentManifest, "Manifest-Version: 1.0`nPremain-Class: com.starsector.mapoptimizer.agent.MapOptimizerAgent`nCan-Redefine-Classes: false`nCan-Retransform-Classes: false`n`n", (New-Object Text.UTF8Encoding($false)))
-[IO.File]::WriteAllText($bootstrapManifest, "Manifest-Version: 1.0`nImplementation-Title: Starsector Map Optimizer Bootstrap`nImplementation-Version: 0.4.0-exp4`n`n", (New-Object Text.UTF8Encoding($false)))
+[IO.File]::WriteAllText($bootstrapManifest, "Manifest-Version: 1.0`nImplementation-Title: Starsector Map Optimizer Bootstrap`nImplementation-Version: 0.4.0-exp6`n`n", (New-Object Text.UTF8Encoding($false)))
 
 & jar cfm (Join-Path $modRoot 'agent\StarsectorMapOptimizerAgent.jar') $agentManifest -C $agentClasses .
 if ($LASTEXITCODE -ne 0) { throw 'Agent JAR creation failed.' }

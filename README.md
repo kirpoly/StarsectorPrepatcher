@@ -1,4 +1,4 @@
-# Starsector Map Optimizer 0.4.0-exp4
+# Starsector Map Optimizer 0.4.0-exp6
 
 Runtime-оптимизации sector/hyperspace/Intel map, campaign bookkeeping и route candidate scans
 для очень больших секторов Starsector. Основное исправление карты на реальном сохранении подняло
@@ -9,7 +9,7 @@ script classloader Starsector не может безопасно менять en
 
 ## Совместимость без SHA allowlist
 
-Версия exp4 не содержит проверок SHA игры или target-классов. Вместо решения «подходит ли весь JAR»
+Начиная с exp4 мод не содержит проверок SHA игры или target-классов. Вместо решения «подходит ли весь JAR»
 каждый патч отдельно:
 
 1. находит symbolic bytecode site;
@@ -66,6 +66,49 @@ icons.keySet().retainAll(entityArrayList);
 - повторные sample-cache clears;
 - количество grid lines в огромных секторах.
 
+### Жизненный цикл campaign-кэшей
+
+Начиная с exp5 все долгоживущие кэши привязаны к identity текущего `CampaignEngine`. Входы
+`CampaignEngine.setInstance()` и `resetInstance()` служат точной границей поколения: при загрузке,
+замене или выгрузке кампании очищаются Intel/label/hover/nebula/listener/route-кэши и текущий
+`ThreadLocal` scratch. Следующая кампания лениво перестраивает их при обычных обращениях, поэтому
+набор и поведение оптимизаций не меняются.
+
+Сам active engine хранится только через `WeakReference`. Между `resetInstance()` и следующим
+успешным завершением `setInstance()` stateful-кэши не заполняются: begin-hook закрывает поколение
+непосредственно перед singleton-записью, а completion-hook активирует новое только после обновления
+`Global`/factory и остальной штатной логики метода. Если lifecycle-site на другой сборке игры нельзя
+структурно подтвердить, эти кэши используют точный vanilla fallback вместо сохранения объектов
+неизвестного жизненного цикла. Каждая публикация в process-lifetime кэш дополнительно сверяет
+номер поколения под блокировкой: начатый до смены кампании вызов не может вернуть старый объект
+в уже очищенную static-структуру. При смене поколения volatile-ссылки на все восемь map-кэшей и
+отдельный nebula-slot заменяются новыми пустыми roots без ожидания их monitors; старые структуры
+больше не являются static-roots и освобождаются после завершения уже выполнявшихся вызовов.
+
+### Telemetry-driven campaign allocations (exp6)
+
+Отдельная profiler/JFR-сессия в огромном modded-секторе показала оставшийся allocation churn в
+vanilla campaign advance: defensive snapshots `BaseLocation`, snapshots script list у
+`BaseCampaignEntity` и iterator-объекты `Memory.advance()`. Exp6 добавляет три независимых,
+включённых по умолчанию блока:
+
+- `patch.campaignSnapshotReuse` повторно использует backing storage пяти point-in-time snapshots
+  в `BaseLocation.advance()/advanceEvenIfPaused()`;
+- `patch.entityScriptSnapshotReuse` делает то же для одного snapshot в
+  `BaseCampaignEntity.runScripts()`, а пустой список scripts обрабатывает без новой allocation;
+- `patch.emptyMemoryAdvanceFastPath` возвращает общий empty iterator только для пустых
+  expire/require containers; непустой путь вызывает исходный iterator.
+
+Snapshot создаётся заново по содержимому при каждом вызове. Transformer принимает только sites,
+где результат используется как `List` исключительно для iteration, без mutation или escape.
+Reusable storage живёт в reentrant scratch scope; ссылки на элементы обнуляются на каждом normal и
+exceptional exit. Поэтому эти три блока не являются cross-campaign кэшами и не должны удерживать
+entity, location или `CampaignEngine` после завершения вызова.
+
+Эта телеметрия обосновывает выбор targets, но ещё не измеряет эффект exp6. Численное утверждение об
+уменьшении allocations или frame time требует повторного контролируемого A/B-прогона на том же
+сохранении и сценарии.
+
 ### Campaign при закрытой карте
 
 Vanilla `CampaignEngine.advance()` каждый кадр вызывает `readdChangeListeners()` и обходит hyperspace
@@ -91,7 +134,8 @@ distance, tolerance и tie-break. Cache miss, malformed/custom data или runti
 - Каждый блок отключается независимо в `optimizer.properties`.
 - Повторная трансформация распознаётся как `ALREADY_APPLIED` и ничего не дублирует.
 - Любая структурная неоднозначность пропускает только затронутый блок.
-- Кэши transient и живут только в текущей JVM.
+- Кэши transient, очищаются на каждой смене `CampaignEngine` и не удерживают старую кампанию.
+- Exp6 snapshot scratch очищает campaign-object ссылки на каждом normal/exceptional exit.
 
 ## Проверка запуска
 

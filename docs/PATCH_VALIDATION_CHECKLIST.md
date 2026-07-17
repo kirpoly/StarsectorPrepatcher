@@ -52,10 +52,39 @@
 | `patch.systemNebulaCache` | повторно открыть system/global map, затем сменить систему | `nebulaHits`, `nebulaMisses` | synthetic entities каждый раз новые; star/nebula/constellation metadata актуальны после invalidation |
 | `patch.sampleCacheClearThrottle` | быстро закрывать/открывать hyperspace map | `sampleClearSkips` | после фактического clear и после истечения interval terrain samples корректны |
 | `patch.gridLineCap` | огромный сектор на min/max zoom | `Map grid LOD: ... spacing=...` | координаты и hit tests неизменны; меняется только плотность grid, без gaps/мерцания |
+| internal `campaignCacheLifecycle` | load → map/Intel/route → reload/reset, несколько поколений | `campaignCacheResets`; GC harness/heap roots | после reset все campaign caches пусты, старые engine собираются; до lifecycle-ready используется vanilla fallback |
 | `patch.campaignListenerThrottle` | закрытая карта, создание/удаление системы и custom list mutation | `campaignListenerRuns`, `campaignListenerSkips` | repositories получают правильный listener сразу при обычном изменении и не позже audit при прямой мутации |
+| `patch.campaignSnapshotReuse` | одинаковый campaign advance в hyperspace и системах, включая paused/reentrant/throwing callbacks | JFR allocation stacks `BaseLocation.advance`; counts пяти snapshot hooks | тот же point-in-time набор и порядок entities/plugins; no escape; normal/exceptional exits обнуляют campaign refs |
+| `patch.entityScriptSnapshotReuse` | entities с пустым и непустым script list, script добавляет/удаляет scripts и бросает exception | JFR allocation stacks `BaseCampaignEntity.runScripts`; count одного snapshot hook | тот же snapshot/order и число вызовов scripts; reentrant/exceptional cleanup не сохраняет entity/script refs |
+| `patch.emptyMemoryAdvanceFastPath` | тысячи пустых `Memory` плюс отдельные expire/require entries | JFR `ArrayList$Itr`/`LinkedHashMap$LinkedValueIterator` allocations; counts двух hooks | пустые scans остаются пустыми; expiration, require cleanup/order и iterator remove на непустом пути совпадают с vanilla |
 | `patch.routeJumpPointIndex` | построение маршрутов внутри/между системами, wormholes и одинаковые anchors | `routeJump/SystemIndex Hits/Builds/Fallbacks` | destination, distance и tie-break совпадают с vanilla; miss/malformed/custom getter использует полный список |
 
-## Состояние runtime smoke test 2026-07-17
+## Состояние exp6 allocation follow-up, 2026-07-17
+
+Новые targets выбраны по pre-change profiler/JFR-сессии большой modded-кампании: в ней видны
+defensive snapshot allocations `BaseLocation`/`BaseCampaignEntity` и значительный iterator churn
+`Memory`. Exp6 structural harness прошёл на двух core JAR: `18` transformed classes,
+`1 344` verified methods; positive/idempotency и negative ownership/scratch-scope cases
+подтверждены. Отдельный JVM runtime regression прошёл snapshot isolation/reuse/reentrancy/fallback,
+normal/exceptional no-retention и `Memory` empty/non-empty iterator order/remove/no-retention.
+
+Эти результаты закрывают S+N и отдельную JVM-проверку semantics/reachability. Они не являются
+реальным modded-campaign R/B и performance-доказательством exp6. Для R/B нужен графический запуск
+с `APPLIED` и целевыми сценариями; для P — одинаковые save, duration, game state и profiler
+settings с тремя новыми toggles off/on. Pre-change телеметрия подтверждает только активность и
+приоритет targets, а не измеренный эффект.
+
+## Состояние exp5 lifecycle validation, 2026-07-17
+
+Structural harness подтвердил четыре two-phase lifecycle hook (два begin + два completion) на clean
+и localized JAR, их token placement/idempotency и локальный skip при missing/wrong singleton write.
+Отдельный JVM harness против собранного agent JAR проверил очистку восьми maps, `nebulaCacheSlot.value`,
+scratch, inactive state между фазами, volatile map/nebula-slot detachment, out-of-order completion fail-closed,
+generation-active state/epoch и сборку прежних
+cache sentinel/engine arguments через `WeakReference` + `ReferenceQueue`. Полный графический
+многократный save-reload прогон exp5 остаётся отдельной интеграционной проверкой.
+
+## Состояние runtime smoke test exp4, 2026-07-17
 
 На большой modded-сборке применены все 17 sites для 14 patch id; в логе оптимизатора нет
 `WARN`, `ERROR`, `SKIPPED_STRUCTURAL` или `SKIPPED_ERROR`. Подтверждена активность:

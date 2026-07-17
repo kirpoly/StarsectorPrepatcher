@@ -60,8 +60,12 @@ public final class StructuralCompatibilityTest {
         }
 
         runNegativeRetainAllTests(config, Path.of(args[1]).toAbsolutePath().normalize());
+        runNegativeLifecycleTests(config, Path.of(args[1]).toAbsolutePath().normalize());
+        runExp6OwnershipTests(config, Path.of(args[1]).toAbsolutePath().normalize());
         System.out.println("OK negative-tests retainAll missing ambiguous unrelated-call unrelated-change"
-                + " marker-ownership scratch-scope-tamper wrapper-tamper wrapper-metadata idempotency");
+                + " marker-ownership scratch-scope-tamper wrapper-tamper wrapper-metadata idempotency"
+                + " lifecycle-missing-write lifecycle-wrong-source exp6-marker-ownership"
+                + " exp6-scratch-scope-tamper");
         System.out.println("SUMMARY jars=" + jars + " transformedClasses=" + classes
                 + " verifiedMethods=" + methods);
     }
@@ -130,6 +134,101 @@ public final class StructuralCompatibilityTest {
         verifyBytecode(ambiguousResult);
 
         runOwnershipAndWrapperTests(config, h);
+    }
+
+    private static void runNegativeLifecycleTests(OptimizerConfig config, Path jarPath) throws Exception {
+        byte[] campaign;
+        try (JarFile jar = new JarFile(jarPath.toFile())) {
+            campaign = jar.getInputStream(jar.getJarEntry(
+                    MapOptimizerTransformer.CAMPAIGN_ENGINE + ".class")).readAllBytes();
+        }
+
+        ClassNode missingWrite = read(campaign);
+        MethodNode reset = method(missingWrite, "resetInstance", "()V");
+        FieldInsnNode resetWrite = singletonWrite(missingWrite, reset);
+        reset.instructions.set(resetWrite, new InsnNode(Opcodes.POP));
+        assertLifecycleRejectedButIndependentPatchSurvives(config, write(missingWrite),
+                "missing resetInstance singleton write");
+
+        ClassNode wrongSource = read(campaign);
+        MethodNode set = method(wrongSource, "setInstance",
+                "(L" + MapOptimizerTransformer.CAMPAIGN_ENGINE + ";)V");
+        FieldInsnNode setWrite = singletonWrite(wrongSource, set);
+        AbstractInsnNode producer = previousMeaningful(setWrite);
+        require(producer instanceof VarInsnNode load && load.getOpcode() == Opcodes.ALOAD,
+                "setInstance singleton write producer changed in test input");
+        set.instructions.set(producer, new InsnNode(Opcodes.ACONST_NULL));
+        assertLifecycleRejectedButIndependentPatchSurvives(config, write(wrongSource),
+                "wrong setInstance singleton source");
+    }
+
+    private static void runExp6OwnershipTests(OptimizerConfig config, Path jarPath) throws Exception {
+        Map<String, String> patches = new LinkedHashMap<>();
+        patches.put(MapOptimizerTransformer.BASE_LOCATION, "campaignSnapshotReuse");
+        patches.put(MapOptimizerTransformer.BASE_CAMPAIGN_ENTITY, "entityScriptSnapshotReuse");
+        patches.put(MapOptimizerTransformer.MEMORY, "emptyMemoryAdvanceFastPath");
+
+        try (JarFile jar = new JarFile(jarPath.toFile())) {
+            for (Map.Entry<String, String> entry : patches.entrySet()) {
+                String className = entry.getKey();
+                String patchId = entry.getValue();
+                byte[] original = jar.getInputStream(jar.getJarEntry(className + ".class")).readAllBytes();
+                byte[] patched = new MapOptimizerTransformer(config)
+                        .transform(null, className, null, null, original);
+                require(patched != null, className + " baseline transform failed in ownership test");
+
+                ClassNode unowned = read(patched);
+                require(unowned.fields.removeIf(field -> field.name.equals("smo$patched$" + patchId)),
+                        className + " ownership marker was not emitted for " + patchId);
+                byte[] result = new MapOptimizerTransformer(config)
+                        .transform(null, className, null, null, write(unowned));
+                require(result == null, className + " foreign hook-shaped state was modified");
+                require("SKIPPED_STRUCTURAL".equals(System.getProperty(
+                                "starsector.mapoptimizer.patchStatus."
+                                        + className.replace('/', '.') + "." + patchId)),
+                        className + " foreign hook-shaped state was not rejected structurally");
+
+                if (className.equals(MapOptimizerTransformer.BASE_LOCATION)) {
+                    ClassNode unscoped = read(patched);
+                    removeScratchScope(method(unscoped, "advance",
+                            "(FLcom/fs/starfarer/util/A/new;)V"));
+                    byte[] unscopedResult = new MapOptimizerTransformer(config)
+                            .transform(null, className, null, null, write(unscoped));
+                    require(unscopedResult == null,
+                            "BaseLocation snapshot hooks without an advance scope were modified");
+                    require("SKIPPED_STRUCTURAL".equals(System.getProperty(
+                                    "starsector.mapoptimizer.patchStatus."
+                                            + className.replace('/', '.') + "." + patchId)),
+                            "BaseLocation snapshot hooks without an advance scope were accepted");
+                }
+            }
+        }
+    }
+
+    private static void assertLifecycleRejectedButIndependentPatchSurvives(
+            OptimizerConfig config, byte[] input, String scenario) {
+        byte[] result = new MapOptimizerTransformer(config).transform(
+                null, MapOptimizerTransformer.CAMPAIGN_ENGINE, null, null, input);
+        require(result != null, scenario + " blocked independent CampaignEngine patches");
+        require(countHook(result, "beginCampaignEngineChange") == 0
+                        && countHook(result, "completeCampaignEngineChange") == 0,
+                scenario + " was accepted by lifecycle matcher");
+        require(countHook(result, "readdChangeListenersIfNeeded") == 1,
+                scenario + " blocked campaign listener throttle");
+        verifyBytecode(result);
+    }
+
+    private static FieldInsnNode singletonWrite(ClassNode owner, MethodNode method) {
+        String desc = "L" + MapOptimizerTransformer.CAMPAIGN_ENGINE + ";";
+        FieldInsnNode result = null;
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (!(insn instanceof FieldInsnNode field) || field.getOpcode() != Opcodes.PUTSTATIC
+                    || !field.owner.equals(owner.name) || !field.desc.equals(desc)) continue;
+            require(result == null, method.name + " has multiple singleton writes in test input");
+            result = field;
+        }
+        require(result != null, method.name + " singleton write missing in test input");
+        return result;
     }
 
     private static void runOwnershipAndWrapperTests(OptimizerConfig config, byte[] h) {
@@ -325,10 +424,24 @@ public final class StructuralCompatibilityTest {
                 expected.put("fastContains", 1);
                 expected.put("existingIntelIconCandidates", 1);
             }
-            case MapOptimizerTransformer.CAMPAIGN_ENGINE -> expected.put("readdChangeListenersIfNeeded", 1);
+            case MapOptimizerTransformer.CAMPAIGN_ENGINE -> {
+                expected.put("beginCampaignEngineChange", 2);
+                expected.put("completeCampaignEngineChange", 2);
+                expected.put("readdChangeListenersIfNeeded", 1);
+            }
             case MapOptimizerTransformer.COURSE_WIDGET -> {
                 expected.put("routeJumpPointsForSystem", 3);
                 expected.put("routeSystemsForAnchor", 1);
+            }
+            case MapOptimizerTransformer.BASE_LOCATION -> {
+                expected.put("borrowLocationAdvanceSnapshot", 3);
+                expected.put("borrowPausedLocationSnapshot", 2);
+            }
+            case MapOptimizerTransformer.BASE_CAMPAIGN_ENTITY ->
+                    expected.put("borrowEntityScriptSnapshot", 1);
+            case MapOptimizerTransformer.MEMORY -> {
+                expected.put("memoryExpireIterator", 1);
+                expected.put("memoryRequireIterator", 1);
             }
             default -> throw new AssertionError("Unknown target " + className);
         }
@@ -348,6 +461,12 @@ public final class StructuralCompatibilityTest {
             assertScratchScope(bytes, "o00000", "(FF)V");
         } else if (className.equals(MapOptimizerTransformer.EVENTS)) {
             assertScratchScope(bytes, "addMissingIconsAndRows", "()V");
+        } else if (className.equals(MapOptimizerTransformer.BASE_LOCATION)) {
+            assertScratchScope(bytes, "advance", "(FLcom/fs/starfarer/util/A/new;)V");
+            assertScratchScope(bytes, "advanceEvenIfPaused",
+                    "(FLcom/fs/starfarer/util/A/new;)V");
+        } else if (className.equals(MapOptimizerTransformer.BASE_CAMPAIGN_ENTITY)) {
+            assertScratchScope(bytes, "runScripts", "(F)V");
         }
     }
 
