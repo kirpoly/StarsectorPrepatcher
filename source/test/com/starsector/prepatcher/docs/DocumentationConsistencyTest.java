@@ -54,7 +54,8 @@ public final class DocumentationConsistencyTest {
     private static final Set<String> CURRENT_DOC_ROOT_NAMES = Set.of(
             "PATCHES.MD",
             "COMPATIBILITY.MD",
-            "VALIDATION.MD");
+            "VALIDATION.MD",
+            "ROADMAP.MD");
 
     private DocumentationConsistencyTest() {}
 

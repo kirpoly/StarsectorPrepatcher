@@ -16,7 +16,10 @@
 
 ## [Unreleased]
 
-Пока нет пользовательских изменений после `0.8.0`.
+### Документация
+
+- Добавлен технический roadmap: обязательный name-independent structural discovery до загрузки
+  классов, декомпозиция patch/runtime-кода, formatter, Linux Tier 1 и macOS best effort.
 
 ## [0.8.0] - 2026-07-17
 

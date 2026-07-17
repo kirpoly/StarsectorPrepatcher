@@ -112,6 +112,7 @@ startup suite. Build details are in [`BUILDING.md`](BUILDING.md).
 - [`docs/PATCHES.md`](docs/PATCHES.md) — patch switches and behavioral invariants;
 - [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) — structural matching and fail-open rules;
 - [`docs/VALIDATION.md`](docs/VALIDATION.md) — regression and performance validation playbook;
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — structural discovery, architecture, tooling, and platform plan;
 - [`docs/releases/0.8.0.md`](docs/releases/0.8.0.md) — current detailed release report.
 
 StarsectorPrepatcher is distributed under the terms in [`LICENSE`](LICENSE).

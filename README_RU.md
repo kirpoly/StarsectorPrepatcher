@@ -114,6 +114,7 @@ hyperspace и startup единого agent. Сборка описана в [`BUI
 - [`docs/PATCHES.md`](docs/PATCHES.md) — переключатели патчей и поведенческие инварианты;
 - [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) — structural matching и fail-open правила;
 - [`docs/VALIDATION.md`](docs/VALIDATION.md) — playbook регрессионных и performance-проверок;
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — план structural discovery, архитектуры, tooling и платформ;
 - [`docs/releases/0.8.0.md`](docs/releases/0.8.0.md) — подробный отчёт текущего выпуска.
 
 Условия распространения находятся в [`LICENSE`](LICENSE).
