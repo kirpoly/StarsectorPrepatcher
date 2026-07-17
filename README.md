@@ -1,178 +1,118 @@
-# Starsector Map Optimizer 0.4.0-exp7
+# StarsectorPrepatcher
 
-Runtime-оптимизации sector/hyperspace/Intel map, campaign bookkeeping и route candidate scans
-для очень больших секторов Starsector. Основное исправление карты на реальном сохранении подняло
-сцену примерно с **10 FPS** до установленного предела **60 FPS**.
+[English](README.md) | [Русский](README_RU.md)
 
-Мод состоит из sandbox-safe bootstrap-плагина и startup `javaagent`. Javaagent обязателен: обычный
-script classloader Starsector не может безопасно менять engine bytecode до загрузки классов.
+Current version: **0.8.0**. Supported game build: **Starsector 0.98a-RC8**.
 
-## Совместимость без SHA allowlist
+StarsectorPrepatcher is a compatibility-first pre-load patching layer for Starsector. Its startup
+javaagents run before the game and mod classloaders begin normal loading, so guarded structural
+patches can be applied at the point where the affected classes first enter the JVM.
 
-Начиная с exp4 мод не содержит проверок SHA игры или target-классов. Вместо решения «подходит ли весь JAR»
-каждый патч отдельно:
+The project has a broader direction than map optimization alone:
 
-1. находит symbolic bytecode site;
-2. проверяет receiver, arguments и local values через ASM data-flow;
-3. требует однозначное ожидаемое число sites;
-4. применяет изменение транзакционно;
-5. ставит private synthetic ownership marker для безопасной идемпотентности;
-6. проверяет точные hook descriptors, postconditions, public API и весь полученный класс через
-   `BasicVerifier`.
+- maintain carefully verified performance and correctness patches for game internals;
+- provide a stable, documented API for useful capabilities that Starsector's public API does not
+  expose;
+- keep version-specific bytecode knowledge inside the prepatcher instead of duplicating it across
+  gameplay mods.
 
-Переводы строк, изменения несвязанных методов и другие безопасные модификации core JAR не блокируют
-подходящие патчи. Неизвестный или неоднозначный site получает `SKIPPED_STRUCTURAL`, при этом остальные
-патчи того же класса продолжают устанавливаться. Подробные контракты описаны в
-[`docs/STRUCTURAL_COMPATIBILITY.md`](docs/STRUCTURAL_COMPATIBILITY.md).
+The public API is a roadmap item, not a published compatibility surface in `0.8.0`. Its intended
+namespace is `com.starsector.prepatcher.api`; API types will only become supported once they are
+documented and covered by compatibility tests.
 
-## Установка
+## How it works
 
-1. Полностью закройте игру.
-2. Поместите каталог в `<Starsector>\mods\StarsectorMapOptimizer`.
-3. Запустите `install-agent.bat` из каталога мода.
-4. Включите мод в launcher и запустите Starsector.
-
-Installer создаёт резервную копию `vmparams` и добавляет:
+The distribution contains a sandbox-safe mod bootstrap and two startup agents:
 
 ```text
--javaagent:../mods/StarsectorMapOptimizer/agent/StarsectorMapOptimizerAgent.jar
+agent/StarsectorPrepatcherAgent.jar
+agent/StarsectorPrepatcherHyperspaceAgent.jar
 ```
 
-Telemetry javaagent можно оставить. Installer автоматически добавляет Map Optimizer после всех
-существующих `-javaagent`, чтобы структурный matcher видел уже изменённые ими bytes. Повторный
-запуск installer исправляет порядок старой установки, если Map Optimizer стоит раньше другого агента.
+The main agent matches and verifies each structural patch independently. The hyperspace agent uses
+exact per-class guards for four Starsector target classes. Both fail open: an unknown, ambiguous, or
+partially changed target remains vanilla and the reason is written to the diagnostic log.
 
-## Что исправляется
+The bootstrap plugin does not perform bytecode work. It exposes agent status through the normal game
+log and warns when the mod is enabled without the startup agents.
 
-### Sector/hyperspace/Intel map
+## Installation
 
-Главный per-frame дефект:
+1. Fully close Starsector.
+2. Extract the directory as `<Starsector>\mods\StarsectorPrepatcher`.
+3. Run `<Starsector>\mods\StarsectorPrepatcher\install-agent.bat`.
+4. Enable **StarsectorPrepatcher** in the launcher and start the game.
 
-```java
-icons.keySet().retainAll(entityArrayList);
-```
-
-заменяется линейной reconciliation. Vanilla entities используют reusable identity membership;
-для modded entity с собственными `equals/hashCode` автоматически используется reusable `HashSet`,
-сохраняющий Java collection semantics. Сложность меняется с `O(K × E)` на `O(K + E)`.
-
-Дополнительные блоки уменьшают:
-
-- временные `ArrayList`, `HashSet` и `Vector2f` allocations;
-- полный scan иконок при label layout и Intel reconciliation;
-- повторные `IntelInfoPlugin.getMapLocation/getArrowData` callbacks;
-- hover hit-tests и all-system hyperspace scans;
-- подготовку synthetic system-nebula entities;
-- повторные sample-cache clears;
-- количество grid lines в огромных секторах.
-
-### Жизненный цикл campaign-кэшей
-
-Начиная с exp5 все долгоживущие кэши привязаны к identity текущего `CampaignEngine`. Входы
-`CampaignEngine.setInstance()` и `resetInstance()` служат точной границей поколения: при загрузке,
-замене или выгрузке кампании очищаются Intel/label/hover/nebula/listener/route-кэши и текущий
-`ThreadLocal` scratch. Следующая кампания лениво перестраивает их при обычных обращениях, поэтому
-набор и поведение оптимизаций не меняются.
-
-Сам active engine хранится только через `WeakReference`. Между `resetInstance()` и следующим
-успешным завершением `setInstance()` stateful-кэши не заполняются: begin-hook закрывает поколение
-непосредственно перед singleton-записью, а completion-hook активирует новое только после обновления
-`Global`/factory и остальной штатной логики метода. Если lifecycle-site на другой сборке игры нельзя
-структурно подтвердить, эти кэши используют точный vanilla fallback вместо сохранения объектов
-неизвестного жизненного цикла. Каждая публикация в process-lifetime кэш дополнительно сверяет
-номер поколения под блокировкой: начатый до смены кампании вызов не может вернуть старый объект
-в уже очищенную static-структуру. При смене поколения volatile-ссылки на все восемь map-кэшей и
-отдельный nebula-slot заменяются новыми пустыми roots без ожидания их monitors; старые структуры
-больше не являются static-roots и освобождаются после завершения уже выполнявшихся вызовов.
-
-### Telemetry-driven campaign allocations (exp6)
-
-Отдельная profiler/JFR-сессия в огромном modded-секторе показала оставшийся allocation churn в
-vanilla campaign advance: defensive snapshots `BaseLocation`, snapshots script list у
-`BaseCampaignEntity` и iterator-объекты `Memory.advance()`. Exp6 добавляет три независимых,
-включённых по умолчанию блока:
-
-- `patch.campaignSnapshotReuse` повторно использует backing storage пяти point-in-time snapshots
-  в `BaseLocation.advance()/advanceEvenIfPaused()`;
-- `patch.entityScriptSnapshotReuse` делает то же для одного snapshot в
-  `BaseCampaignEntity.runScripts()`, а пустой список scripts обрабатывает без новой allocation;
-- `patch.emptyMemoryAdvanceFastPath` возвращает общий empty iterator только для пустых
-  expire/require containers; непустой путь вызывает исходный iterator.
-
-Snapshot создаётся заново по содержимому при каждом вызове. Transformer принимает только sites,
-где результат используется как `List` исключительно для iteration, без mutation или escape.
-Reusable storage живёт в reentrant scratch scope; ссылки на элементы обнуляются на каждом normal и
-exceptional exit. Поэтому эти три блока не являются cross-campaign кэшами и не должны удерживать
-entity, location или `CampaignEngine` после завершения вызова.
-
-Повторный прогон на том же seed, почти идентичном числе entities и том же наборе из 66 модов
-подтвердил, что exp6 убрал целевые snapshots/iterators и снизил steady allocation примерно с
-`4.347` до `2.184 MiB/frame`. Одновременно он выявил CPU-регрессию: каждый
-`BaseCampaignEntity.runScripts()` завершал общий scratch scope безусловным
-`IdentityHashMap.clear()`, который в JDK 17 проходит всю таблицу даже при нулевом размере. На
-проблемном сохранении этот пустой clear занял `64.48%` JFR CPU samples.
-
-Exp7 сохраняет все три allocation-оптимизации и пропускает только физическую очистку уже пустой
-identity-map. Непустой normal/exceptional путь по-прежнему очищает ссылки до выхода из scope.
-Численный frame-time результат exp7 требует отдельного повторного прогона в игре.
-
-### Campaign при закрытой карте
-
-Vanilla `CampaignEngine.advance()` каждый кадр вызывает `readdChangeListeners()` и обходит hyperspace
-и все star systems. Патч меняет только внутренний call site:
-
-- первый вызов выполняется полностью;
-- изменение backing systems/hyperspace вызывает немедленный refresh;
-- периодический audit покрывает необычные прямые мутации модами;
-- публичный `readdChangeListeners()` остаётся оригинальным.
-
-### Route/pathfinding
-
-`coreui.A.O0Oo` заменяет три полных hyperspace jump-point scans и один all-system anchor scan
-короткоживущими identity indexes. Оригинальный bytecode продолжает выполнять wormhole/star filters,
-distance, tolerance и tie-break. Cache miss, malformed/custom data или runtime error возвращают
-полный vanilla candidate list. Полный identity/relationship snapshot перепроверяется раз в TTL;
-консервативный профиль отключает этот патч.
-
-## Совместимость и безопасность
-
-- Публичные Starsector API и формат сохранений не меняются.
-- Wrapper-патчи сохраняют оригинальные методы как private synthetic fallback.
-- Каждый блок отключается независимо в `optimizer.properties`.
-- Повторная трансформация распознаётся как `ALREADY_APPLIED` и ничего не дублирует.
-- Любая структурная неоднозначность пропускает только затронутый блок.
-- Кэши transient, очищаются на каждой смене `CampaignEngine` и не удерживают старую кампанию.
-- Exp6 snapshot scratch очищает campaign-object ссылки на каждом normal/exceptional exit.
-
-## Проверка запуска
-
-Основной лог:
+The installer creates a timestamped `vmparams` backup, replaces any existing entries for this
+installation, and places the pair after any other `-javaagent` options:
 
 ```text
-mods\StarsectorMapOptimizer\logs\map-optimizer.log
+-javaagent:../mods/StarsectorPrepatcher/agent/StarsectorPrepatcherAgent.jar
+-javaagent:../mods/StarsectorPrepatcher/agent/StarsectorPrepatcherHyperspaceAgent.jar
 ```
 
-Для каждого загруженного target ожидаются строки `APPLIED`, `ALREADY_APPLIED`,
-`SKIPPED_STRUCTURAL` или `SKIPPED_ERROR`, затем сводная строка класса. UI-классы загружаются лениво,
-поэтому их строки появляются после первого открытия соответствующего экрана.
+The folder name must not contain whitespace and should remain `StarsectorPrepatcher` after
+installation. No additional `--add-exports` options are required; the agents export the required JDK
+ASM packages through `Instrumentation.redefineModule()`.
 
-Постоянный in-memory regression harness:
+The prepatcher does not modify save data, and its runtime caches are never serialized.
 
-```powershell
-.\verify-structural.ps1 -CoreJars `
-  'C:\Games\Starsector\starsector-core\starfarer_obf.jar', `
-  'C:\Games\Starsector_test\starsector-core\starfarer_obf.jar'
+## Current patch areas
+
+- sector, system, and Intel maps: reconciliation, spatial candidates, callbacks, hover checks,
+  entity indexes, nebula metadata, scratch collections, and grid LOD;
+- campaign and economy: lifecycle-bound caches, listener refresh, reusable snapshots, empty-script
+  and empty-memory fast paths, and comm-relay candidates;
+- routing: ordered jump-point and system indexes with vanilla selection and fallback semantics;
+- combat and particles: internal scratch collections and stable deferred cleanup;
+- loading and save paths: literal parsing, progress redraw, and output-path fixes;
+- hyperspace: terrain culling, layer selection, seeded random reuse, owner-local automaton buffers,
+  and moving-starfield cleanup.
+
+The complete switch and invariant reference is in [`docs/PATCHES.md`](docs/PATCHES.md).
+
+## Configuration and rollback
+
+Main settings are in `prepatcher.properties`; hyperspace settings are in
+`hyperspace-prepatcher.properties`. Every user-facing patch group has a dedicated `patch.*` switch
+and requires a full game restart. Setting the relevant agent's configuration to the following
+disables that entire agent:
+
+```properties
+enabled=false
 ```
 
-Harness не записывает изменённые game classes: он читает JAR, трансформирует bytes в памяти,
-проверяет наличие каждого hook descriptor в runtime JAR, все concrete methods, scratch exception
-frames, идемпотентность, ownership/metadata wrapper и отрицательные missing/ambiguous cases.
+`patch.loadingTextReader` and `patch.startupLogAggregation` remain disabled in all supplied profiles
+because they participated in confirmed mission-startup failures. They will not be re-enabled until
+their fixes pass an isolated startup and mission suite.
 
-Критерии доказательности и воспроизводимые сценарии для каждого блока собраны в
-[`docs/PATCH_VALIDATION_CHECKLIST.md`](docs/PATCH_VALIDATION_CHECKLIST.md). Успешный `APPLIED`
-подтверждает структурную совместимость, но утверждение о корректности или ускорении дополнительно
-требует behavior-проверки и одинаковой A/B-телеметрии.
+Run `uninstall-agent.bat` to remove both managed entries from `vmparams`.
 
-## Откат
+## Diagnostics and verification
 
-Запустите `uninstall-agent.bat`, отключите мод и перезапустите игру. Удаление безопасно для сохранений.
+Runtime logs:
+
+```text
+mods\StarsectorPrepatcher\logs\prepatcher.log
+mods\StarsectorPrepatcher\logs\prepatcher-hyperspace.log
+```
+
+The main agent records `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, or `SKIPPED_ERROR` for
+each patch. The hyperspace agent reports every guarded target and uses `target-guard-failed` when the
+current bytecode is outside the exact allowlist.
+
+Run `verify-structural.bat` on Windows or `./verify-structural.sh` on Linux/macOS for the complete
+documentation, structural, negative/idempotency, lifecycle/GC, runtime, hyperspace, and combined
+startup suite. Build details are in [`BUILDING.md`](BUILDING.md).
+
+## Documentation
+
+- [`README_RU.md`](README_RU.md) — Russian version of this overview;
+- [`CHANGELOG.md`](CHANGELOG.md) — public `X.Y.Z` release history;
+- [`BUILDING.md`](BUILDING.md) — build and verification workflow;
+- [`docs/PATCHES.md`](docs/PATCHES.md) — patch switches and behavioral invariants;
+- [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) — structural matching and fail-open rules;
+- [`docs/VALIDATION.md`](docs/VALIDATION.md) — regression and performance validation playbook;
+- [`docs/releases/0.8.0.md`](docs/releases/0.8.0.md) — current detailed release report.
+
+StarsectorPrepatcher is distributed under the terms in [`LICENSE`](LICENSE).

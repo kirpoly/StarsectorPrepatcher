@@ -1,2 +1,2 @@
-Runtime logs are written here.
-For Starsector 0.98a-RC8, up to six "Patched ..." lines are expected for CampaignEngine, O0Oo, H, A, Z and EventsPanel. UI classes load lazily.
+Runtime StarsectorPrepatcher logs are written here. Target classes may load lazily; use the final
+APPLIED/ALREADY_APPLIED/SKIPPED status summary instead of expecting a fixed line count.

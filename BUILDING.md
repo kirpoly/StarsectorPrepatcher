@@ -1,62 +1,89 @@
-# Сборка из исходников
+# Сборка StarsectorPrepatcher
 
-Требуется JDK 17+ и установленный Starsector 0.98a-RC8. Скрипты предполагают, что каталог мода расположен в `<Starsector>/mods/StarsectorMapOptimizer`.
+## Требования
 
-Windows:
+- JDK 17+;
+- установленная Starsector `0.98a-RC8`;
+- каталог мода расположен как `<Starsector>/mods/StarsectorPrepatcher`.
 
-```text
-build-agent.bat
-```
+Build scripts используют JDK-internal ASM, уже входящий в Java. В собранные JAR не добавляются
+сторонние ASM dependencies.
 
-Linux/macOS из каталога мода:
+## Сборка
 
-```bash
-chmod +x build-agent.sh
-./build-agent.sh
-```
-
-Agent использует ASM, встроенный в JDK (`jdk.internal.org.objectweb.asm`, `tree`, `tree.analysis`).
-На старте он открывает эти пакеты только своему unnamed module через
-`Instrumentation.redefineModule`; пользовательские `--add-exports` в `vmparams` не требуются.
-
-Сборка создаёт:
-
-```text
-agent/StarsectorMapOptimizerAgent.jar
-jars/StarsectorMapOptimizerBootstrap.jar
-```
-
-Структурный regression harness для одного или нескольких core JAR:
+Windows PowerShell:
 
 ```powershell
-.\verify-structural.ps1 -CoreJars 'C:\path\one.jar','C:\path\two.jar'
+.\build-agent.ps1
 ```
 
 Linux/macOS:
 
 ```bash
-chmod +x verify-structural.sh
-./verify-structural.sh /path/one.jar /path/two.jar
+./build-agent.sh
 ```
 
-Он пересобирает agent, затем выполняет все трансформации в памяти, проверяет точную runtime-linkage
-hooks, `BasicVerifier`, scratch exception frames, идемпотентность/ownership и отрицательные
-missing/ambiguous cases. После структурной проверки отдельный lifecycle harness загружает собранный
-agent JAR, заполняет все campaign-кэши фактических packaged-классов, переключает identity engine
-и проверяет two-phase inactive/complete boundary и очистку через `WeakReference`/`ReferenceQueue`.
-Game JAR не изменяется. Lifecycle
-harness намеренно завершается ошибкой при запуске JVM с `-XX:+DisableExplicitGC`, поскольку такой
-режим делает GC-проверку недоказательной.
+Создаются:
 
-Для `0.4.0-exp7` structural harness также должен подтвердить пять snapshot-sites
-`BaseLocation.advance()/advanceEvenIfPaused()`, один site `BaseCampaignEntity.runScripts()` и два
-iterator-sites `Memory.advance()`. Для snapshot-блоков проверяются точный constructor/data-flow
-contract, отсутствие mutation/escape, reentrant scratch scope и очистка normal/exceptional exits;
-для `Memory` — происхождение expire list и `LinkedHashMap.values()`, их порядок после clock
-conversion и сохранение исходного iterator на непустом пути.
+```text
+agent/StarsectorPrepatcherAgent.jar
+agent/StarsectorPrepatcherHyperspaceAgent.jar
+jars/StarsectorPrepatcherBootstrap.jar
+```
 
-Успешная сборка и structural verification подтверждают linkage/bytecode-контракт, но не измеряют
-выигрыш. Exp6 same-save telemetry уже подтвердила снижение allocations и обнаружила пустой
-`IdentityHashMap.clear()` как CPU-регрессию. Runtime harness exp7 доказывает её структурное
-устранение без ослабления normal/exceptional cleanup; итоговый frame time всё равно требует
-повторного profiler/JFR-прогона exp7 в том же campaign scenario.
+В конце сборка атомарно регенерирует `SHA256SUMS.txt` для поставляемых файлов. Сам manifest,
+runtime-логи и содержимое `.build/` в него не входят.
+
+## Полная проверка
+
+Windows PowerShell:
+
+```powershell
+.\verify-structural.ps1
+```
+
+Для явного набора core JAR поддерживаются как именованный, так и прежний positional-вызов:
+
+```powershell
+.\verify-structural.ps1 -CoreJars @(
+    'C:\Games\Starsector_test\starsector-core\starfarer_obf.jar',
+    'C:\Games\Starsector_test\starsector-core\fs.common_obf.jar',
+    'C:\Games\Starsector_test\starsector-core\fs.sound_obf.jar'
+)
+```
+
+Linux/macOS:
+
+```bash
+./verify-structural.sh
+```
+
+Проверка:
+
+1. заново собирает оба agent и bootstrap;
+2. компилирует tests;
+3. проверяет SemVer/changelog, относительные ссылки, достижимость документации и все SHA-256;
+4. трансформирует `starfarer_obf.jar`, `fs.common_obf.jar`, `fs.sound_obf.jar` в памяти;
+5. выполняет ASM `Analyzer + BasicVerifier` для concrete methods;
+6. проверяет idempotency/ownership/negative structural cases;
+7. запускает lifecycle, exp6, exp8 и loading/save runtime suites;
+8. отдельно проверяет exact-hash hyperspace targets из `starfarer.api.jar` и `starfarer_obf.jar`;
+9. запускает оба собранных javaagent в одной JVM и сохраняет startup smoke.
+
+Structural harness создаёт внутренний `.build/structural-all-enabled.properties` из aggressive
+profile и только там включает known-disabled loading/startup patches, чтобы продолжать проверять
+их bytecode-контракты. Этот файл не поставляется игроку и не используется startup smoke; во всех
+поставляемых профилях оба проблемных переключателя остаются `false`.
+
+Сырые отчёты `documentation-consistency.txt`, `structural-verification.txt`,
+`runtime-regression.txt`, `hyperspace-verification.txt` и `startup-smoke.txt` создаются в
+`.build/reports/` и намеренно не входят в документацию или дистрибутив.
+Краткие пользовательские изменения фиксируются в [`CHANGELOG.md`](CHANGELOG.md), а причины,
+измерения и остаточные риски — в [`docs/releases/`](docs/releases/0.8.0.md). Обязательные regression
+gates для новых pre-load патчей описаны в [`docs/VALIDATION.md`](docs/VALIDATION.md).
+
+## Java 17 compatibility
+
+Scripts используют `-encoding UTF-8 -source 17 -target 17`. Из-за доступа к JDK-internal ASM вместо `--release 17`
+применяются compile-time `--add-exports`. Runtime vmparams flags не нужны: оба startup-agent вызывают
+`Instrumentation.redefineModule()` до регистрации transformer.

@@ -3,32 +3,76 @@ set -euo pipefail
 
 MOD_ROOT="$(cd "$(dirname "$0")" && pwd)"
 GAME_ROOT="$(cd "$MOD_ROOT/../.." && pwd)"
+CORE="$GAME_ROOT/starsector-core"
 BUILD="$MOD_ROOT/.build"
 AGENT_CLASSES="$BUILD/agent-classes"
+HYPER_CLASSES="$BUILD/hyperspace-classes"
 TEST_CLASSES="$BUILD/test-classes"
+REPORT_DIR="$BUILD/reports"
+EXPORTS=(
+  --add-exports java.base/jdk.internal.org.objectweb.asm=ALL-UNNAMED
+  --add-exports java.base/jdk.internal.org.objectweb.asm.tree=ALL-UNNAMED
+  --add-exports java.base/jdk.internal.org.objectweb.asm.tree.analysis=ALL-UNNAMED
+)
 
 bash "$MOD_ROOT/build-agent.sh"
-mkdir -p "$TEST_CLASSES"
-find "$MOD_ROOT/source/test" -name '*.java' -print0 | xargs -0 javac -source 17 -target 17 \
-  --add-exports java.base/jdk.internal.org.objectweb.asm=ALL-UNNAMED \
-  --add-exports java.base/jdk.internal.org.objectweb.asm.tree=ALL-UNNAMED \
-  --add-exports java.base/jdk.internal.org.objectweb.asm.tree.analysis=ALL-UNNAMED \
-  -cp "$AGENT_CLASSES" -d "$TEST_CLASSES"
+rm -rf "$TEST_CLASSES"
+mkdir -p "$TEST_CLASSES" "$REPORT_DIR"
+
+TEST_CP="$AGENT_CLASSES:$CORE/starfarer.api.jar:$CORE/starfarer_obf.jar:$CORE/fs.common_obf.jar:$CORE/fs.sound_obf.jar:$CORE/lwjgl.jar:$CORE/lwjgl_util.jar"
+find "$MOD_ROOT/source/test" -name '*.java' -print0 | xargs -0 javac -encoding UTF-8 -source 17 -target 17 \
+  "${EXPORTS[@]}" -cp "$TEST_CP" -d "$TEST_CLASSES"
+
+java -cp "$TEST_CLASSES" \
+  com.starsector.prepatcher.docs.DocumentationConsistencyTest "$MOD_ROOT" \
+  2>&1 | tee "$REPORT_DIR/documentation-consistency.txt"
 
 if (( $# == 0 )); then
-  CORE_JARS=("$GAME_ROOT/starsector-core/starfarer_obf.jar")
+  CORE_JARS=(
+    "$CORE/starfarer_obf.jar"
+    "$CORE/fs.common_obf.jar"
+    "$CORE/fs.sound_obf.jar"
+  )
 else
   CORE_JARS=("$@")
 fi
 
 CLASS_PATH="$AGENT_CLASSES:$TEST_CLASSES"
-java \
-  --add-exports java.base/jdk.internal.org.objectweb.asm=ALL-UNNAMED \
-  --add-exports java.base/jdk.internal.org.objectweb.asm.tree=ALL-UNNAMED \
-  --add-exports java.base/jdk.internal.org.objectweb.asm.tree.analysis=ALL-UNNAMED \
-  -cp "$CLASS_PATH" com.starsector.mapoptimizer.agent.StructuralCompatibilityTest \
-  "$MOD_ROOT/optimizer.properties" "${CORE_JARS[@]}"
+VERIFICATION_CONFIG="$BUILD/structural-all-enabled.properties"
+{
+  printf '%s\n' '# Generated for structural coverage only; never shipped or used by startup smoke.'
+  sed \
+    -e 's/^patch\.loadingTextReader[[:space:]]*=.*/patch.loadingTextReader=true/' \
+    -e 's/^patch\.startupLogAggregation[[:space:]]*=.*/patch.startupLogAggregation=true/' \
+    "$MOD_ROOT/profiles/aggressive.properties"
+} > "$VERIFICATION_CONFIG"
+grep -qx 'patch.loadingTextReader=true' "$VERIFICATION_CONFIG"
+grep -qx 'patch.startupLogAggregation=true' "$VERIFICATION_CONFIG"
+java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
+  com.starsector.prepatcher.agent.StructuralCompatibilityTest \
+  "$VERIFICATION_CONFIG" "${CORE_JARS[@]}" \
+  2>&1 | tee "$REPORT_DIR/structural-verification.txt"
 
-LIFECYCLE_CLASS_PATH="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorMapOptimizerAgent.jar:$GAME_ROOT/starsector-core/starfarer.api.jar:$GAME_ROOT/starsector-core/starfarer_obf.jar:$GAME_ROOT/starsector-core/lwjgl.jar:$GAME_ROOT/starsector-core/lwjgl_util.jar"
-java -cp "$LIFECYCLE_CLASS_PATH" com.starsector.mapoptimizer.runtime.LifecycleGcRegressionTest
-java -cp "$LIFECYCLE_CLASS_PATH" com.starsector.mapoptimizer.runtime.Exp6RuntimeRegressionTest
+RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/starfarer.api.jar:$CORE/starfarer_obf.jar:$CORE/fs.common_obf.jar:$CORE/fs.sound_obf.jar:$CORE/lwjgl.jar:$CORE/lwjgl_util.jar"
+{
+  echo '== LifecycleGcRegressionTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.LifecycleGcRegressionTest
+  echo '== Exp6RuntimeRegressionTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.Exp6RuntimeRegressionTest
+  echo '== Exp8RuntimeRegressionTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.Exp8RuntimeRegressionTest
+  echo '== LoadingSaveRuntimeRegressionTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.LoadingSaveRuntimeRegressionTest
+} 2>&1 | tee "$REPORT_DIR/runtime-regression.txt"
+
+java "${EXPORTS[@]}" -cp "$HYPER_CLASSES" \
+  com.starsector.prepatcher.hyperspace.OfflineVerifier \
+  "$CORE/starfarer_obf.jar" "$CORE/starfarer.api.jar" \
+  "$REPORT_DIR/hyperspace-verification.txt"
+
+java \
+  "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar" \
+  "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherHyperspaceAgent.jar" \
+  -version 2>&1 | tee "$REPORT_DIR/startup-smoke.txt"
+
+echo 'Documentation/structural/runtime/hyperspace/startup verification completed.'

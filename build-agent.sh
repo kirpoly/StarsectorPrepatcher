@@ -5,25 +5,75 @@ GAME_ROOT="$(cd "$MOD_ROOT/../.." && pwd)"
 CORE="$GAME_ROOT/starsector-core"
 BUILD="$MOD_ROOT/.build"
 rm -rf "$BUILD"
-mkdir -p "$BUILD/agent-classes" "$BUILD/bootstrap-classes" "$MOD_ROOT/agent" "$MOD_ROOT/jars"
-CP_AGENT="$CORE/starfarer.api.jar:$CORE/starfarer_obf.jar:$CORE/lwjgl.jar:$CORE/lwjgl_util.jar"
+mkdir -p "$BUILD/agent-classes" "$BUILD/hyperspace-classes" "$BUILD/bootstrap-classes" "$MOD_ROOT/agent" "$MOD_ROOT/jars"
+CP_AGENT="$CORE/starfarer.api.jar:$CORE/starfarer_obf.jar:$CORE/fs.common_obf.jar:$CORE/fs.sound_obf.jar:$CORE/lwjgl.jar:$CORE/lwjgl_util.jar"
 CP_BOOT="$CORE/starfarer.api.jar:$CORE/starfarer_obf.jar:$CORE/log4j-1.2.9.jar"
-find "$MOD_ROOT/source/agent" -name '*.java' -print0 | xargs -0 javac -source 17 -target 17 \
-  --add-exports java.base/jdk.internal.org.objectweb.asm=ALL-UNNAMED \
-  --add-exports java.base/jdk.internal.org.objectweb.asm.tree=ALL-UNNAMED \
-  --add-exports java.base/jdk.internal.org.objectweb.asm.tree.analysis=ALL-UNNAMED \
-  -cp "$CP_AGENT" -d "$BUILD/agent-classes"
-find "$MOD_ROOT/source/bootstrap" -name '*.java' -print0 | xargs -0 javac -source 17 -target 17 \
-  -cp "$CP_BOOT" -d "$BUILD/bootstrap-classes"
+EXPORTS=(
+  --add-exports java.base/jdk.internal.org.objectweb.asm=ALL-UNNAMED
+  --add-exports java.base/jdk.internal.org.objectweb.asm.tree=ALL-UNNAMED
+  --add-exports java.base/jdk.internal.org.objectweb.asm.tree.analysis=ALL-UNNAMED
+)
+find "$MOD_ROOT/source/agent" -name '*.java' -print0 | xargs -0 javac -encoding UTF-8 -source 17 -target 17 "${EXPORTS[@]}" -cp "$CP_AGENT" -d "$BUILD/agent-classes"
+find "$MOD_ROOT/source/hyperspace" -name '*.java' -print0 | xargs -0 javac -encoding UTF-8 -source 17 -target 17 "${EXPORTS[@]}" -cp "$CP_AGENT" -d "$BUILD/hyperspace-classes"
+cp "$MOD_ROOT/source/hyperspace-resources/hyperspace-targets.properties" "$BUILD/hyperspace-classes/"
+find "$MOD_ROOT/source/bootstrap" -name '*.java' -print0 | xargs -0 javac -encoding UTF-8 -source 17 -target 17 -cp "$CP_BOOT" -d "$BUILD/bootstrap-classes"
 printf '%s\n' \
   'Manifest-Version: 1.0' \
-  'Premain-Class: com.starsector.mapoptimizer.agent.MapOptimizerAgent' \
+  'Implementation-Title: StarsectorPrepatcher Agent' \
+  'Implementation-Version: 0.8.0' \
+  'Premain-Class: com.starsector.prepatcher.agent.PrepatcherAgent' \
   'Can-Redefine-Classes: false' \
   'Can-Retransform-Classes: false' '' > "$BUILD/agent.mf"
 printf '%s\n' \
   'Manifest-Version: 1.0' \
-  'Implementation-Title: Starsector Map Optimizer Bootstrap' \
-  'Implementation-Version: 0.4.0-exp7' '' > "$BUILD/bootstrap.mf"
-jar cfm "$MOD_ROOT/agent/StarsectorMapOptimizerAgent.jar" "$BUILD/agent.mf" -C "$BUILD/agent-classes" .
-jar cfm "$MOD_ROOT/jars/StarsectorMapOptimizerBootstrap.jar" "$BUILD/bootstrap.mf" -C "$BUILD/bootstrap-classes" .
-echo 'Build completed.'
+  'Implementation-Title: StarsectorPrepatcher Hyperspace Agent' \
+  'Implementation-Version: 0.8.0' \
+  'Premain-Class: com.starsector.prepatcher.hyperspace.HyperspaceAgent' \
+  'Can-Redefine-Classes: false' \
+  'Can-Retransform-Classes: false' '' > "$BUILD/hyperspace-agent.mf"
+printf '%s\n' \
+  'Manifest-Version: 1.0' \
+  'Implementation-Title: StarsectorPrepatcher Bootstrap' \
+  'Implementation-Version: 0.8.0' '' > "$BUILD/bootstrap.mf"
+jar cfm "$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar" "$BUILD/agent.mf" -C "$BUILD/agent-classes" .
+jar cfm "$MOD_ROOT/agent/StarsectorPrepatcherHyperspaceAgent.jar" "$BUILD/hyperspace-agent.mf" -C "$BUILD/hyperspace-classes" .
+jar cfm "$MOD_ROOT/jars/StarsectorPrepatcherBootstrap.jar" "$BUILD/bootstrap.mf" -C "$BUILD/bootstrap-classes" .
+
+# Keep the release manifest synchronized with the exact tree produced by this build.
+# Runtime logs, build intermediates and SHA256SUMS.txt itself are intentionally excluded.
+CHECKSUM_INPUTS="$BUILD/checksum-inputs.txt"
+CHECKSUM_OUTPUT="$BUILD/SHA256SUMS.txt"
+if [[ ! -f "$MOD_ROOT/logs/README.txt" ]]; then
+  echo 'Required checksum input logs/README.txt is missing.' >&2
+  exit 1
+fi
+(
+  cd "$MOD_ROOT"
+  shopt -s nullglob
+  for top_level in * .[!.]* ..?*; do
+    if [[ -f "$top_level" && "$top_level" != 'SHA256SUMS.txt' ]]; then
+      printf '%s\n' "$top_level"
+    fi
+  done
+  find agent docs jars profiles source -type f -print
+  printf '%s\n' 'logs/README.txt'
+) | sed 's#^\./##' | LC_ALL=C sort -u > "$CHECKSUM_INPUTS"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  checksum_file() { sha256sum "$1"; }
+elif command -v shasum >/dev/null 2>&1; then
+  checksum_file() { shasum -a 256 "$1"; }
+else
+  echo 'Neither sha256sum nor shasum is available.' >&2
+  exit 1
+fi
+
+: > "$CHECKSUM_OUTPUT"
+while IFS= read -r relative_path; do
+  checksum_line="$(checksum_file "$MOD_ROOT/$relative_path")"
+  digest="${checksum_line%% *}"
+  printf '%s  %s\n' "$digest" "$relative_path" >> "$CHECKSUM_OUTPUT"
+done < "$CHECKSUM_INPUTS"
+mv "$CHECKSUM_OUTPUT" "$MOD_ROOT/SHA256SUMS.txt"
+
+echo 'Build and checksum manifest completed.'
