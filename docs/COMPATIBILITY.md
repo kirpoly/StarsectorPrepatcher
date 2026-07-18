@@ -120,6 +120,12 @@ known-disabled независимо от этого loader-исключения.
   после restore/pause path и до обоих scans; expire iterator предшествует require iterator.
   Inline guard читает те же два поля, стоит после исходного pause-return и до clock conversion.
   Partial/raw-hook mixture, другой map receiver, изменённый порядок и лишние sites отвергаются.
+- `CommodityOnMarket.reapplyEventMod`: принимается только точная vanilla-цепочка
+  `getCombinedTradeModQuantity -> unmodifyFlat("eMod") -> getModValueForQuantity -> modifyFlat`
+  с отдельной zero-quantity веткой и общим `RETURN`. Inline-патч добавляет один private transient
+  synthetic known-absent flag. Nonzero-ветка сохраняет исходный порядок remove -> calculate ->
+  conditional add; zero-ветка пропускает только повторное удаление после успешного remove.
+  Partial/foreign shape отвергается.
 - `CampaignEngine.setInstance/resetInstance`: существует единственное static поле типа
   `CampaignEngine`; `setInstance` записывает в него argument 0, а `resetInstance` — `null`.
   Begin-hooks с сохранением transition token должны непосредственно предшествовать подтверждённым
@@ -157,6 +163,12 @@ Comm-relay index намеренно использует такой же bounded
 выполняется раз в `commRelay.indexTtlMs`. Владелец релиза явно принимает задержку до TTL для прямого
 перемещения или замены средней системы сторонним модом; vanilla distance/tag/memory/tie loop над
 возвращёнными candidates не меняется. Значение `0` отключает runtime index.
+
+Commodity event-mod cache предполагает, что vanilla-private source id `eMod` принадлежит
+`CommodityOnMarket.reapplyEventMod`. Прямая запись сторонним модом в `available` stat с тем же id
+при сохранении нулевого combined trade quantity не инвалидирует known-absent flag и поэтому не
+поддерживается. Обычные public trade-mod методы поддерживаются: nonzero transition сначала очищает
+flag и выполняет полную vanilla-цепочку; первый zero-вызов после load тоже выполняет remove.
 
 Hyperspace diagnostics не участвует в tile-level clock/counter hot path. Значение
 `pooledRandomApprox` является накопительным и монотонным с запуска JVM: опубликованные пачки

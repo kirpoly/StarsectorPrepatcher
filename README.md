@@ -88,8 +88,9 @@ The prepatcher does not modify save data, and its runtime caches are never seria
 
 - sector, system, and Intel maps: reconciliation, spatial candidates, callbacks, hover checks,
   entity indexes, nebula metadata, scratch collections, and grid LOD;
-- campaign and economy: lifecycle-bound caches, listener refresh, reusable snapshots, empty-script
-  and empty-memory fast paths, and comm-relay candidates;
+- campaign and economy: lifecycle-bound caches, listener refresh, reusable snapshots, repeated
+  absent commodity event-mod removal suppression, empty-script and empty-memory fast paths, and
+  comm-relay candidates;
 - routing: ordered jump-point and system indexes with vanilla selection and fallback semantics;
 - combat and particles: internal scratch collections and stable deferred cleanup;
 - loading and save paths: literal parsing, progress redraw, and output-path fixes;

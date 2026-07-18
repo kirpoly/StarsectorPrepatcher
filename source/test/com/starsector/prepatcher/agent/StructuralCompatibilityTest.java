@@ -8,6 +8,7 @@ import jdk.internal.org.objectweb.asm.tree.AbstractInsnNode;
 import jdk.internal.org.objectweb.asm.tree.AnnotationNode;
 import jdk.internal.org.objectweb.asm.tree.ClassNode;
 import jdk.internal.org.objectweb.asm.tree.FieldInsnNode;
+import jdk.internal.org.objectweb.asm.tree.FieldNode;
 import jdk.internal.org.objectweb.asm.tree.FrameNode;
 import jdk.internal.org.objectweb.asm.tree.InsnList;
 import jdk.internal.org.objectweb.asm.tree.InsnNode;
@@ -63,6 +64,8 @@ public final class StructuralCompatibilityTest {
                 "patch.loadingTextReader must remain disabled when configuration is missing");
         require(!defaults.startupLogAggregation,
                 "patch.startupLogAggregation must remain disabled when configuration is missing");
+        require(!defaults.commodityEventModDirtyCache,
+                "behavior-changing commodity cache must remain disabled when configuration is missing");
         PrepatcherConfig config = PrepatcherConfig.load(configPath);
 
         int jars = 0;
@@ -450,6 +453,8 @@ public final class StructuralCompatibilityTest {
         patches.put(PrepatcherTransformer.ECONOMY,
                 List.of("economyLocationCache", "economySnapshotReuse"));
         patches.put(PrepatcherTransformer.MARKET, List.of("economySnapshotReuse"));
+        patches.put(PrepatcherTransformer.COMMODITY_ON_MARKET,
+                List.of("commodityEventModDirtyCache"));
         patches.put(PrepatcherTransformer.INTEL_MANAGER, List.of("commRelaySystemIndex"));
         patches.put(PrepatcherTransformer.SHIP, List.of("shipAdvanceScratch"));
         patches.put(PrepatcherTransformer.DYNAMIC_PARTICLE_GROUP, List.of("particleCleanup"));
@@ -801,6 +806,9 @@ public final class StructuralCompatibilityTest {
                 expected.put("borrowEconomyCollectionSnapshot", 1);
             }
             case PrepatcherTransformer.MARKET -> expected.put("borrowEconomyCollectionSnapshot", 2);
+            case PrepatcherTransformer.COMMODITY_ON_MARKET -> {
+                // Inline dirty cache; no cross-loader hook is required.
+            }
             case PrepatcherTransformer.INTEL_MANAGER -> expected.put("commRelayCandidateSystems", 1);
             case PrepatcherTransformer.SHIP -> {
                 expected.put("borrowShipList", 3);
@@ -897,6 +905,8 @@ public final class StructuralCompatibilityTest {
             assertScratchScope(bytes, "advanceMarketConditionsWhenPaused", "(F)V");
         } else if (className.equals(PrepatcherTransformer.MARKET)) {
             assertScratchScope(bytes, "advance", "(F)V");
+        } else if (className.equals(PrepatcherTransformer.COMMODITY_ON_MARKET)) {
+            assertCommodityEventModDirtyCache(bytes);
         } else if (className.equals(PrepatcherTransformer.INTEL_MANAGER)) {
             assertScratchScope(bytes, "findNearestCommRelayToReceive",
                     "(Lcom/fs/starfarer/api/campaign/SectorEntityToken;)"
@@ -906,6 +916,61 @@ public final class StructuralCompatibilityTest {
         } else if (className.equals(PrepatcherTransformer.DYNAMIC_PARTICLE_GROUP)) {
             assertScratchScope(bytes, "advance", "(F)V");
         }
+    }
+
+    private static void assertCommodityEventModDirtyCache(byte[] bytes) {
+        ClassNode node = read(bytes);
+        FieldNode knownAbsent = null;
+        for (FieldNode field : node.fields) {
+            if (!field.name.equals("smo$commodityEventModKnownAbsent")) continue;
+            require(knownAbsent == null,
+                    "duplicate CommodityOnMarket known-absent cache field");
+            knownAbsent = field;
+        }
+        int expectedAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT | Opcodes.ACC_SYNTHETIC;
+        require(knownAbsent != null && knownAbsent.desc.equals("Z")
+                        && knownAbsent.access == expectedAccess
+                        && knownAbsent.signature == null && knownAbsent.value == null,
+                "CommodityOnMarket known-absent cache field changed");
+
+        MethodNode method = method(node, "reapplyEventMod", "()V");
+        require(countCalls(method, Opcodes.INVOKEVIRTUAL, node.name,
+                        "getCombinedTradeModQuantity", "()F") == 1,
+                "CommodityOnMarket dirty cache lost quantity calculation");
+        require(countCalls(method, Opcodes.INVOKEVIRTUAL, node.name,
+                        "getModValueForQuantity", "(F)F") == 1,
+                "CommodityOnMarket dirty cache lost value calculation");
+        require(countCalls(method, Opcodes.INVOKEVIRTUAL,
+                        "com/fs/starfarer/api/combat/MutableStatWithTempMods",
+                        "unmodifyFlat", "(Ljava/lang/String;)V") == 2,
+                "CommodityOnMarket dirty cache removal count changed");
+        require(countCalls(method, Opcodes.INVOKEVIRTUAL,
+                        "com/fs/starfarer/api/combat/MutableStatWithTempMods",
+                        "modifyFlat", "(Ljava/lang/String;FLjava/lang/String;)V") == 1,
+                "CommodityOnMarket dirty cache modification count changed");
+
+        int cacheReads = 0;
+        int cacheWrites = 0;
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (!(insn instanceof FieldInsnNode field) || !field.owner.equals(node.name)) continue;
+            if (!field.name.equals("smo$commodityEventModKnownAbsent")
+                    || !field.desc.equals("Z")) continue;
+            if (field.getOpcode() == Opcodes.GETFIELD) cacheReads++;
+            if (field.getOpcode() == Opcodes.PUTFIELD) cacheWrites++;
+        }
+        require(cacheReads == 1 && cacheWrites == 2,
+                "CommodityOnMarket known-absent cache access changed");
+
+        List<MethodInsnNode> removals = calls(method, Opcodes.INVOKEVIRTUAL,
+                "com/fs/starfarer/api/combat/MutableStatWithTempMods",
+                "unmodifyFlat", "(Ljava/lang/String;)V");
+        List<MethodInsnNode> calculations = calls(method, Opcodes.INVOKEVIRTUAL,
+                node.name, "getModValueForQuantity", "(F)F");
+        require(method.instructions.indexOf(removals.get(0))
+                        < method.instructions.indexOf(calculations.get(0)),
+                "CommodityOnMarket nonzero slow path no longer removes eMod before calculation");
+        require(method.tryCatchBlocks.isEmpty(),
+                "CommodityOnMarket dirty cache gained an unexpected exception region");
     }
 
     private static void assertEntityScriptEmptyGuard(byte[] bytes) {

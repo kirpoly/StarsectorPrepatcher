@@ -30,6 +30,7 @@ public final class PrepatcherConfig {
     public final boolean emptyMemoryAdvanceFastPath;
     public final boolean economyLocationCache;
     public final boolean economySnapshotReuse;
+    public final boolean commodityEventModDirtyCache;
     public final boolean commRelaySystemIndex;
     public final boolean shipAdvanceScratch;
     public final boolean particleCleanup;
@@ -86,6 +87,7 @@ public final class PrepatcherConfig {
         emptyMemoryAdvanceFastPath = bool("patch.emptyMemoryAdvanceFastPath", true);
         economyLocationCache = bool("patch.economyLocationCache", true);
         economySnapshotReuse = bool("patch.economySnapshotReuse", true);
+        commodityEventModDirtyCache = bool("patch.commodityEventModDirtyCache", false);
         commRelaySystemIndex = bool("patch.commRelaySystemIndex", true);
         shipAdvanceScratch = bool("patch.shipAdvanceScratch", true);
         particleCleanup = bool("patch.particleCleanup", true);

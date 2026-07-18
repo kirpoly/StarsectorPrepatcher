@@ -89,8 +89,9 @@ Prepatcher не изменяет формат сохранений, а его ru
 
 - sector, system и Intel map: reconciliation, spatial candidates, callbacks, hover, entity indexes,
   nebula metadata, scratch collections и grid LOD;
-- campaign и economy: lifecycle-bound кэши, listener refresh, reusable snapshots, fast paths для
-  пустых scripts/Memory и comm-relay candidates;
+- campaign и economy: lifecycle-bound кэши, listener refresh, reusable snapshots, подавление
+  повторного удаления уже отсутствующего commodity event mod, fast paths для пустых scripts/Memory
+  и comm-relay candidates;
 - routing: упорядоченные jump-point/system indexes с vanilla selection/fallback;
 - combat и particles: внутренние scratch collections и стабильная deferred cleanup;
 - loading/save: literal parsing, progress redraw и исправления output path;

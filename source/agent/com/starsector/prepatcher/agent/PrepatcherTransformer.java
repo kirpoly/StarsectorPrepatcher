@@ -58,6 +58,8 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     static final String MEMORY = "com/fs/starfarer/campaign/rules/Memory";
     static final String ECONOMY = "com/fs/starfarer/campaign/econ/Economy";
     static final String MARKET = "com/fs/starfarer/campaign/econ/Market";
+    static final String COMMODITY_ON_MARKET =
+            "com/fs/starfarer/campaign/econ/CommodityOnMarket";
     static final String INTEL_MANAGER = "com/fs/starfarer/campaign/comms/v2/IntelManager";
     static final String SHIP = "com/fs/starfarer/combat/entities/Ship";
     static final String DYNAMIC_PARTICLE_GROUP = "com/fs/graphics/particle/DynamicParticleGroup";
@@ -72,7 +74,8 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     static final String CAMPAIGN_GAME_MANAGER = "com/fs/starfarer/campaign/save/CampaignGameManager";
     static final Set<String> TARGET_CLASSES = Set.of(H, A, Z, EVENTS, CAMPAIGN_ENGINE,
             COURSE_WIDGET, BASE_LOCATION, BASE_CAMPAIGN_ENTITY, MEMORY, ECONOMY,
-            MARKET, INTEL_MANAGER, SHIP, DYNAMIC_PARTICLE_GROUP, LOADING_UTILS,
+            MARKET, COMMODITY_ON_MARKET, INTEL_MANAGER, SHIP,
+            DYNAMIC_PARTICLE_GROUP, LOADING_UTILS,
             SCRIPT_STORE_RUNNER, RULES, SPEC_STORE, TEXTURE_LOADER, SOUND,
             PROGRESS_INPUT, PROGRESS_OUTPUT, CAMPAIGN_GAME_MANAGER,
             HyperspacePatches.BASE_TILED, HyperspacePatches.HYPER_TERRAIN,
@@ -184,6 +187,9 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             }
             case MARKET -> apply(state, "economySnapshotReuse", config.economySnapshotReuse,
                     this::patchMarketSnapshots);
+            case COMMODITY_ON_MARKET -> apply(state, "commodityEventModDirtyCache",
+                    config.commodityEventModDirtyCache,
+                    this::patchCommodityEventModDirtyCache);
             case INTEL_MANAGER -> apply(state, "commRelaySystemIndex", config.commRelaySystemIndex,
                     this::patchCommRelaySystemIndex);
             case SHIP -> apply(state, "shipAdvanceScratch", config.shipAdvanceScratch,
@@ -376,6 +382,7 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             case MEMORY -> config.emptyMemoryAdvanceFastPath;
             case ECONOMY -> config.economyLocationCache || config.economySnapshotReuse;
             case MARKET -> config.economySnapshotReuse;
+            case COMMODITY_ON_MARKET -> config.commodityEventModDirtyCache;
             case INTEL_MANAGER -> config.commRelaySystemIndex;
             case SHIP -> config.shipAdvanceScratch;
             case DYNAMIC_PARTICLE_GROUP -> config.particleCleanup;
@@ -2486,6 +2493,301 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         PatchReport report = new PatchReport();
         report.add("reusable Market condition/industry snapshots", changed);
         return report;
+    }
+
+    /**
+     * CommodityOnMarket.reapplyEventMod() normally calls unmodifyFlat("eMod")
+     * for every commodity every campaign frame, including the overwhelmingly
+     * common case where the combined recent-trade quantity is zero and the
+     * modifier was already removed on a previous frame.
+     *
+     * Only that proven-absent zero path is cached. The nonzero path retains the
+     * complete vanilla remove -> calculate -> conditional add sequence and its
+     * original float behavior. The private flag is transient, is set only after
+     * a successful removal, and is cleared before every nonzero update so loads,
+     * transitions, and exceptional exits all fail open.
+     */
+    private PatchReport patchCommodityEventModDirtyCache(ClassNode node) {
+        final String knownAbsentField = "smo$commodityEventModKnownAbsent";
+        final int stateAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT
+                | Opcodes.ACC_SYNTHETIC;
+        MethodNode method = requireMethod(node, "reapplyEventMod", "()V");
+
+        FieldNode knownAbsent = null;
+        for (FieldNode field : node.fields) {
+            if (!field.name.equals(knownAbsentField)) continue;
+            if (knownAbsent != null) {
+                throw mismatch("duplicate commodity event-mod known-absent field");
+            }
+            knownAbsent = field;
+        }
+        if (knownAbsent != null) {
+            if (!knownAbsent.desc.equals("Z") || knownAbsent.access != stateAccess
+                    || knownAbsent.signature != null || knownAbsent.value != null) {
+                throw mismatch("commodity event-mod known-absent field is foreign");
+            }
+            requireOptimizedCommodityEventModShape(node, method, knownAbsentField);
+            throw already("commodity event-mod zero-path cache postcondition matches");
+        }
+
+        String availableField = requireOriginalCommodityEventModShape(node, method);
+        node.fields.add(new FieldNode(Opcodes.ASM8, stateAccess,
+                knownAbsentField, "Z", null, null));
+        rewriteCommodityEventMod(method, node.name, availableField, knownAbsentField);
+        requireOptimizedCommodityEventModShape(node, method, knownAbsentField);
+
+        PatchReport report = new PatchReport();
+        report.add("proven-absent commodity event-mod removals", 1);
+        return report;
+    }
+
+    private static String requireOriginalCommodityEventModShape(ClassNode node,
+                                                                 MethodNode method) {
+        final String stat = "com/fs/starfarer/api/combat/MutableStatWithTempMods";
+        List<AbstractInsnNode> code = meaningfulInstructions(method);
+        requireCount("CommodityOnMarket.reapplyEventMod original instruction count",
+                code.size(), 31);
+        requireVar(code.get(0), Opcodes.ALOAD, 0, "event-mod quantity owner");
+        requireCall(asMethod(code.get(1), "event-mod quantity call"), Opcodes.INVOKEVIRTUAL,
+                node.name, "getCombinedTradeModQuantity", "()F", "event-mod quantity call");
+        requireVar(code.get(2), Opcodes.FSTORE, 1, "event-mod quantity local");
+        requireVar(code.get(3), Opcodes.FLOAD, 1, "event-mod quantity test");
+        if (code.get(4).getOpcode() != Opcodes.FCONST_0
+                || code.get(5).getOpcode() != Opcodes.FCMPL
+                || !(code.get(6) instanceof JumpInsnNode zeroQuantity)
+                || zeroQuantity.getOpcode() != Opcodes.IFEQ) {
+            throw mismatch("event-mod zero-quantity branch changed");
+        }
+
+        requireVar(code.get(7), Opcodes.ALOAD, 0, "event-mod available owner");
+        if (!(code.get(8) instanceof FieldInsnNode available)
+                || available.getOpcode() != Opcodes.GETFIELD
+                || !available.owner.equals(node.name) || !available.desc.equals("L" + stat + ";")) {
+            throw mismatch("event-mod available-stat field changed");
+        }
+        requireString(code.get(9), "eMod", "event-mod removal key");
+        requireCall(asMethod(code.get(10), "event-mod removal"), Opcodes.INVOKEVIRTUAL,
+                stat, "unmodifyFlat", "(Ljava/lang/String;)V", "event-mod removal");
+        requireVar(code.get(11), Opcodes.ALOAD, 0, "event-mod value owner");
+        requireVar(code.get(12), Opcodes.FLOAD, 1, "event-mod quantity argument");
+        requireCall(asMethod(code.get(13), "event-mod value call"), Opcodes.INVOKEVIRTUAL,
+                node.name, "getModValueForQuantity", "(F)F", "event-mod value call");
+        requireVar(code.get(14), Opcodes.FSTORE, 2, "event-mod value local");
+        requireVar(code.get(15), Opcodes.FLOAD, 2, "event-mod value test");
+        if (code.get(16).getOpcode() != Opcodes.FCONST_0
+                || code.get(17).getOpcode() != Opcodes.FCMPL
+                || !(code.get(18) instanceof JumpInsnNode zeroValue)
+                || zeroValue.getOpcode() != Opcodes.IFEQ) {
+            throw mismatch("event-mod zero-value branch changed");
+        }
+
+        requireVar(code.get(19), Opcodes.ALOAD, 0, "event-mod modification owner");
+        requireField(code.get(20), Opcodes.GETFIELD, node.name, available.name,
+                available.desc, "event-mod modification available field");
+        requireString(code.get(21), "eMod", "event-mod modification key");
+        requireVar(code.get(22), Opcodes.FLOAD, 2, "event-mod modification value");
+        requireString(code.get(23), "Recent trade/events", "event-mod description");
+        requireCall(asMethod(code.get(24), "event-mod modification"), Opcodes.INVOKEVIRTUAL,
+                stat, "modifyFlat", "(Ljava/lang/String;FLjava/lang/String;)V",
+                "event-mod modification");
+        if (!(code.get(25) instanceof JumpInsnNode done) || done.getOpcode() != Opcodes.GOTO) {
+            throw mismatch("event-mod nonzero completion branch changed");
+        }
+
+        requireVar(code.get(26), Opcodes.ALOAD, 0, "zero event-mod available owner");
+        requireField(code.get(27), Opcodes.GETFIELD, node.name, available.name,
+                available.desc, "zero event-mod available field");
+        requireString(code.get(28), "eMod", "zero event-mod removal key");
+        requireCall(asMethod(code.get(29), "zero event-mod removal"), Opcodes.INVOKEVIRTUAL,
+                stat, "unmodifyFlat", "(Ljava/lang/String;)V", "zero event-mod removal");
+        if (code.get(30).getOpcode() != Opcodes.RETURN
+                || nextMeaningful(zeroQuantity.label) != code.get(26)
+                || nextMeaningful(zeroValue.label) != code.get(30)
+                || nextMeaningful(done.label) != code.get(30)
+                || !method.tryCatchBlocks.isEmpty()) {
+            throw mismatch("event-mod original control flow changed");
+        }
+        return available.name;
+    }
+
+    private static void rewriteCommodityEventMod(MethodNode method, String owner,
+                                                  String availableField,
+                                                  String knownAbsentField) {
+        final String stat = "com/fs/starfarer/api/combat/MutableStatWithTempMods";
+        LabelNode zeroQuantity = new LabelNode();
+        LabelNode applyZeroRemoval = new LabelNode();
+        LabelNode done = new LabelNode();
+        InsnList code = new InsnList();
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, owner,
+                "getCombinedTradeModQuantity", "()F", false));
+        code.add(new VarInsnNode(Opcodes.FSTORE, 1));
+        code.add(new VarInsnNode(Opcodes.FLOAD, 1));
+        code.add(new InsnNode(Opcodes.FCONST_0));
+        code.add(new InsnNode(Opcodes.FCMPL));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, zeroQuantity));
+
+        // The nonzero path is the original implementation, with only a
+        // fail-open state clear inserted before the first operation that can throw.
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, knownAbsentField, "Z"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, availableField, "L" + stat + ";"));
+        code.add(new LdcInsnNode("eMod"));
+        code.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, stat,
+                "unmodifyFlat", "(Ljava/lang/String;)V", false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.FLOAD, 1));
+        code.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, owner,
+                "getModValueForQuantity", "(F)F", false));
+        code.add(new VarInsnNode(Opcodes.FSTORE, 2));
+        code.add(new VarInsnNode(Opcodes.FLOAD, 2));
+        code.add(new InsnNode(Opcodes.FCONST_0));
+        code.add(new InsnNode(Opcodes.FCMPL));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, availableField, "L" + stat + ";"));
+        code.add(new LdcInsnNode("eMod"));
+        code.add(new VarInsnNode(Opcodes.FLOAD, 2));
+        code.add(new LdcInsnNode("Recent trade/events"));
+        code.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, stat,
+                "modifyFlat", "(Ljava/lang/String;FLjava/lang/String;)V", false));
+        code.add(new JumpInsnNode(Opcodes.GOTO, done));
+
+        // Zero quantity always means that eMod must be absent. Once a successful
+        // removal established that invariant, repeated absent HashMap.remove()
+        // calls are unnecessary until a nonzero quantity clears the proof.
+        code.add(zeroQuantity);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, knownAbsentField, "Z"));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, applyZeroRemoval));
+        code.add(new InsnNode(Opcodes.RETURN));
+        code.add(applyZeroRemoval);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, availableField, "L" + stat + ";"));
+        code.add(new LdcInsnNode("eMod"));
+        code.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, stat,
+                "unmodifyFlat", "(Ljava/lang/String;)V", false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, knownAbsentField, "Z"));
+        code.add(done);
+        code.add(new InsnNode(Opcodes.RETURN));
+
+        method.instructions.clear();
+        method.instructions.add(code);
+        method.tryCatchBlocks.clear();
+        if (method.localVariables != null) method.localVariables.clear();
+        if (method.visibleLocalVariableAnnotations != null) {
+            method.visibleLocalVariableAnnotations.clear();
+        }
+        if (method.invisibleLocalVariableAnnotations != null) {
+            method.invisibleLocalVariableAnnotations.clear();
+        }
+        method.maxLocals = 3;
+        method.maxStack = 4;
+    }
+
+    private static void requireOptimizedCommodityEventModShape(ClassNode node,
+                                                                MethodNode method,
+                                                                String knownAbsentField) {
+        final String stat = "com/fs/starfarer/api/combat/MutableStatWithTempMods";
+        List<AbstractInsnNode> code = meaningfulInstructions(method);
+        requireCount("CommodityOnMarket.reapplyEventMod optimized instruction count",
+                code.size(), 41);
+        requireVar(code.get(0), Opcodes.ALOAD, 0, "cached event-mod quantity owner");
+        requireCall(asMethod(code.get(1), "cached event-mod quantity call"),
+                Opcodes.INVOKEVIRTUAL, node.name, "getCombinedTradeModQuantity", "()F",
+                "cached event-mod quantity call");
+        requireVar(code.get(2), Opcodes.FSTORE, 1, "cached event-mod quantity local");
+        requireVar(code.get(3), Opcodes.FLOAD, 1, "cached event-mod quantity test");
+        if (code.get(4).getOpcode() != Opcodes.FCONST_0
+                || code.get(5).getOpcode() != Opcodes.FCMPL
+                || !(code.get(6) instanceof JumpInsnNode zeroQuantity)
+                || zeroQuantity.getOpcode() != Opcodes.IFEQ) {
+            throw mismatch("cached event-mod zero-quantity branch changed");
+        }
+
+        requireVar(code.get(7), Opcodes.ALOAD, 0, "nonzero cache-state owner");
+        if (code.get(8).getOpcode() != Opcodes.ICONST_0) {
+            throw mismatch("nonzero event-mod cache clear value changed");
+        }
+        requireField(code.get(9), Opcodes.PUTFIELD, node.name, knownAbsentField, "Z",
+                "nonzero event-mod cache clear");
+        requireVar(code.get(10), Opcodes.ALOAD, 0, "cached event-mod available owner");
+        if (!(code.get(11) instanceof FieldInsnNode available)
+                || available.getOpcode() != Opcodes.GETFIELD
+                || !available.owner.equals(node.name) || !available.desc.equals("L" + stat + ";")) {
+            throw mismatch("cached event-mod available-stat field changed");
+        }
+        requireString(code.get(12), "eMod", "cached event-mod removal key");
+        requireCall(asMethod(code.get(13), "cached event-mod nonzero removal"),
+                Opcodes.INVOKEVIRTUAL, stat, "unmodifyFlat", "(Ljava/lang/String;)V",
+                "cached event-mod nonzero removal");
+        requireVar(code.get(14), Opcodes.ALOAD, 0, "cached event-mod value owner");
+        requireVar(code.get(15), Opcodes.FLOAD, 1, "cached event-mod value argument");
+        requireCall(asMethod(code.get(16), "cached event-mod value call"),
+                Opcodes.INVOKEVIRTUAL, node.name, "getModValueForQuantity", "(F)F",
+                "cached event-mod value call");
+        requireVar(code.get(17), Opcodes.FSTORE, 2, "cached event-mod value local");
+        requireVar(code.get(18), Opcodes.FLOAD, 2, "cached event-mod zero test");
+        if (code.get(19).getOpcode() != Opcodes.FCONST_0
+                || code.get(20).getOpcode() != Opcodes.FCMPL
+                || !(code.get(21) instanceof JumpInsnNode zeroValue)
+                || zeroValue.getOpcode() != Opcodes.IFEQ) {
+            throw mismatch("cached event-mod zero-value branch changed");
+        }
+        requireVar(code.get(22), Opcodes.ALOAD, 0, "cached event-mod modification owner");
+        requireField(code.get(23), Opcodes.GETFIELD, node.name, available.name,
+                available.desc, "cached event-mod modification available field");
+        requireString(code.get(24), "eMod", "cached event-mod modification key");
+        requireVar(code.get(25), Opcodes.FLOAD, 2, "cached event-mod modification value");
+        requireString(code.get(26), "Recent trade/events", "cached event-mod description");
+        requireCall(asMethod(code.get(27), "cached event-mod modification"),
+                Opcodes.INVOKEVIRTUAL, stat, "modifyFlat",
+                "(Ljava/lang/String;FLjava/lang/String;)V", "cached event-mod modification");
+        if (!(code.get(28) instanceof JumpInsnNode nonzeroDone)
+                || nonzeroDone.getOpcode() != Opcodes.GOTO) {
+            throw mismatch("cached event-mod nonzero completion branch changed");
+        }
+
+        requireVar(code.get(29), Opcodes.ALOAD, 0, "zero event-mod cache owner");
+        requireField(code.get(30), Opcodes.GETFIELD, node.name, knownAbsentField, "Z",
+                "zero event-mod cache read");
+        if (!(code.get(31) instanceof JumpInsnNode unknown)
+                || unknown.getOpcode() != Opcodes.IFEQ
+                || code.get(32).getOpcode() != Opcodes.RETURN) {
+            throw mismatch("zero event-mod cache guard changed");
+        }
+        requireVar(code.get(33), Opcodes.ALOAD, 0, "zero event-mod removal owner");
+        requireField(code.get(34), Opcodes.GETFIELD, node.name, available.name,
+                available.desc, "zero event-mod removal available field");
+        requireString(code.get(35), "eMod", "zero event-mod removal key");
+        requireCall(asMethod(code.get(36), "zero event-mod removal"),
+                Opcodes.INVOKEVIRTUAL, stat, "unmodifyFlat", "(Ljava/lang/String;)V",
+                "zero event-mod removal");
+        requireVar(code.get(37), Opcodes.ALOAD, 0, "zero event-mod proof owner");
+        if (code.get(38).getOpcode() != Opcodes.ICONST_1) {
+            throw mismatch("zero event-mod proof value changed");
+        }
+        requireField(code.get(39), Opcodes.PUTFIELD, node.name, knownAbsentField, "Z",
+                "zero event-mod proof write");
+        if (code.get(40).getOpcode() != Opcodes.RETURN
+                || nextMeaningful(zeroQuantity.label) != code.get(29)
+                || nextMeaningful(unknown.label) != code.get(33)
+                || nextMeaningful(zeroValue.label) != code.get(40)
+                || nextMeaningful(nonzeroDone.label) != code.get(40)
+                || !method.tryCatchBlocks.isEmpty()) {
+            throw mismatch("cached event-mod optimized control flow changed");
+        }
+    }
+
+    private static void requireString(AbstractInsnNode insn, String expected, String label) {
+        if (!(insn instanceof LdcInsnNode ldc) || !expected.equals(ldc.cst)) {
+            throw mismatch(label + " changed");
+        }
     }
 
     private static int replaceEconomyMarketsSnapshot(MethodNode method, boolean scopeInstalled,

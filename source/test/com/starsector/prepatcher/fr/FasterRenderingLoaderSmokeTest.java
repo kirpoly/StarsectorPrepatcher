@@ -27,6 +27,8 @@ public final class FasterRenderingLoaderSmokeTest {
             "com.fs.starfarer.campaign.CampaignEngine";
     private static final String INTEL_MANAGER =
             "com.fs.starfarer.campaign.comms.v2.IntelManager";
+    private static final String COMMODITY_ON_MARKET =
+            "com.fs.starfarer.campaign.econ.CommodityOnMarket";
     private static final String VECTOR_2F = "org.lwjgl.util.vector.Vector2f";
     private static final String RUNTIME_HOOKS =
             "com.fs.starfarer.api.StarsectorPrepatcherHooks";
@@ -58,6 +60,7 @@ public final class FasterRenderingLoaderSmokeTest {
         Class<?> global = load(system, GLOBAL);
         Class<?> campaignEngine = load(system, CAMPAIGN_ENGINE);
         Class<?> intelManager = load(system, INTEL_MANAGER);
+        Class<?> commodityOnMarket = load(system, COMMODITY_ON_MARKET);
         Class<?> hooks = load(system, RUNTIME_HOOKS);
         Class<?> hyperspaceHooks = load(system, HYPERSPACE_HOOKS);
         Class<?> bridge = load(system, RUNTIME_BRIDGE);
@@ -66,6 +69,7 @@ public final class FasterRenderingLoaderSmokeTest {
         assertDefinedBy(system, global);
         assertDefinedBy(system, campaignEngine);
         assertDefinedBy(system, intelManager);
+        assertDefinedBy(system, commodityOnMarket);
         assertDefinedBy(system, hooks);
         assertDefinedBy(system, hyperspaceHooks);
         assertDefinedBy(system, bridge);
@@ -87,6 +91,12 @@ public final class FasterRenderingLoaderSmokeTest {
         require("APPLIED".equals(intelPatchStatus),
                 "FR did not transform the real comm-relay caller: status="
                         + intelPatchStatus);
+        String commodityPatchStatus = System.getProperty(
+                "starsector.prepatcher.patchStatus." + COMMODITY_ON_MARKET
+                        + ".commodityEventModDirtyCache");
+        require("APPLIED".equals(commodityPatchStatus),
+                "FR did not transform CommodityOnMarket: status="
+                        + commodityPatchStatus);
 
         Class<?> agent = load(system, AGENT);
         ClassLoader agentLoader = agent.getClassLoader();
@@ -110,6 +120,8 @@ public final class FasterRenderingLoaderSmokeTest {
                 + ".commRelayCandidateSystems" + descriptor);
         System.out.println("OK transformed caller " + INTEL_MANAGER
                 + " commRelaySystemIndex=" + intelPatchStatus);
+        System.out.println("OK transformed economy target " + COMMODITY_ON_MARKET
+                + " commodityEventModDirtyCache=" + commodityPatchStatus);
         System.out.println("OK runtime payload inventory classes=" + runtimeClassCount);
     }
 

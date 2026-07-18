@@ -16,7 +16,12 @@
 
 ## [Unreleased]
 
-Пока нет пользовательских изменений после `0.9.0`.
+### Добавлено
+
+- `patch.commodityEventModDirtyCache` устраняет повторный `unmodifyFlat("eMod")`, когда
+  `CommodityOnMarket` уже подтвердил нулевое recent-trade quantity и отсутствие модификатора.
+  Первый zero-вызов после создания/загрузки и весь nonzero-путь остаются vanilla; transient-флаг
+  не меняет cadence market/condition/industry callbacks.
 
 ## [0.9.0] - 2026-07-18
 
