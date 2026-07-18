@@ -185,7 +185,7 @@ Telemetry schema `0.7.1`: старый `pooledRandom` называется `pool
 Structural proof показывает однозначность site, linkage, no-escape и verifier postconditions, но
 не доказывает величину ускорения. Runtime и performance evidence создаётся в `.build/reports/`, а
 проверенные выводы сохраняются в отчёте выпуска, например
-[`releases/0.9.0.md`](releases/0.9.0.md).
+[`releases/0.9.1.md`](releases/0.9.1.md).
 
 Если несколько javaagent меняют одни и те же классы, располагайте Prepatcher после них:
 transformer увидит bytes, возвращённые ранее зарегистрированными агентами. Installer обеспечивает
