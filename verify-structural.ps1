@@ -104,6 +104,25 @@ $structuralLines
 [IO.File]::WriteAllLines($structuralReport, [string[]] $structuralLines, $utf8)
 if ($structuralExitCode -ne 0) { throw 'Structural compatibility verification failed.' }
 
+$directMarketTransformerReport = Join-Path $reportDir 'direct-market-transformer.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $directMarketTransformerCp = @($testClasses, $testCp) -join [IO.Path]::PathSeparator
+    $directMarketTransformerOutput = @(& java @exports -cp $directMarketTransformerCp `
+        com.starsector.prepatcher.agent.DirectMarketObserveTransformerTest 2>&1)
+    $directMarketTransformerExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$directMarketTransformerLines = @(
+    $directMarketTransformerOutput | ForEach-Object { $_.ToString() })
+$directMarketTransformerLines
+[IO.File]::WriteAllLines(
+    $directMarketTransformerReport, [string[]] $directMarketTransformerLines, $utf8)
+if ($directMarketTransformerExitCode -ne 0) {
+    throw 'Direct Market.advance transformer verification failed.'
+}
+
 $runtimeCp = @(
     $testClasses,
     (Join-Path $modRoot 'agent\StarsectorPrepatcherAgent.jar'),
@@ -120,6 +139,8 @@ foreach ($test in @(
     'com.starsector.prepatcher.runtime.LifecycleGcRegressionTest',
     'com.starsector.prepatcher.runtime.Exp6RuntimeRegressionTest',
     'com.starsector.prepatcher.runtime.Exp8RuntimeRegressionTest',
+    'com.starsector.prepatcher.runtime.RemoteMarketSchedulerRuntimeTest',
+    'com.starsector.prepatcher.runtime.DirectMarketObservationRuntimeTest',
     'com.starsector.prepatcher.runtime.LoadingSaveRuntimeRegressionTest'
 )) {
     $runtimeLines.Add("== $test ==")

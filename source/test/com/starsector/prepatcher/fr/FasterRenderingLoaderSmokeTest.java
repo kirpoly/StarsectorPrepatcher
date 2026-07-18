@@ -40,7 +40,7 @@ public final class FasterRenderingLoaderSmokeTest {
             "com.starsector.prepatcher.agent.PrepatcherAgent";
     private static final String RUNTIME_ENTRY_PREFIX =
             "com/fs/starfarer/api/StarsectorPrepatcher";
-    private static final int EXPECTED_RUNTIME_CLASS_COUNT = 48;
+    private static final int EXPECTED_RUNTIME_CLASS_COUNT = 55;
 
     private FasterRenderingLoaderSmokeTest() {}
 

@@ -184,9 +184,15 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                         this::patchEconomyLocationCache);
                 apply(state, "economySnapshotReuse", config.economySnapshotReuse,
                         this::patchEconomySnapshots);
+                apply(state, "remoteMarketScheduler", config.remoteMarketScheduler,
+                        this::patchRemoteMarketScheduler);
             }
-            case MARKET -> apply(state, "economySnapshotReuse", config.economySnapshotReuse,
-                    this::patchMarketSnapshots);
+            case MARKET -> {
+                apply(state, "economySnapshotReuse", config.economySnapshotReuse,
+                        this::patchMarketSnapshots);
+                apply(state, "directMarketObservation", config.directMarketObservation,
+                        this::patchDirectMarketObservationEntry);
+            }
             case COMMODITY_ON_MARKET -> apply(state, "commodityEventModDirtyCache",
                     config.commodityEventModDirtyCache,
                     this::patchCommodityEventModDirtyCache);
@@ -221,8 +227,12 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             case PROGRESS_OUTPUT -> apply(state, "saveLoadProgressThrottle",
                     config.saveLoadProgressThrottle,
                     node -> patchSaveLoadProgressThrottle(node, "o00000"));
-            case CAMPAIGN_GAME_MANAGER -> apply(state, "saveOutputBufferDedup",
-                    config.saveOutputBufferDedup, this::patchSaveOutputBufferDedup);
+            case CAMPAIGN_GAME_MANAGER -> {
+                apply(state, "saveOutputBufferDedup",
+                        config.saveOutputBufferDedup, this::patchSaveOutputBufferDedup);
+                apply(state, "remoteMarketScheduler", config.remoteMarketScheduler,
+                        this::patchRemoteMarketSaveFlush);
+            }
             case HyperspacePatches.BASE_TILED -> {
                 applyHyperspace(state, "hyperspaceCulling", config.hyperspaceCulling,
                         "culling", 2, HyperspacePatches::patchCull,
@@ -380,8 +390,9 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             case BASE_LOCATION -> config.campaignSnapshotReuse;
             case BASE_CAMPAIGN_ENTITY -> config.entityScriptSnapshotReuse;
             case MEMORY -> config.emptyMemoryAdvanceFastPath;
-            case ECONOMY -> config.economyLocationCache || config.economySnapshotReuse;
-            case MARKET -> config.economySnapshotReuse;
+            case ECONOMY -> config.economyLocationCache || config.economySnapshotReuse
+                    || config.remoteMarketScheduler;
+            case MARKET -> config.economySnapshotReuse || config.directMarketObservation;
             case COMMODITY_ON_MARKET -> config.commodityEventModDirtyCache;
             case INTEL_MANAGER -> config.commRelaySystemIndex;
             case SHIP -> config.shipAdvanceScratch;
@@ -390,7 +401,8 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             case SCRIPT_STORE_RUNNER, SPEC_STORE, TEXTURE_LOADER, SOUND -> config.startupLogAggregation;
             case RULES -> config.startupLogAggregation || config.rulesLiteralParser;
             case PROGRESS_INPUT, PROGRESS_OUTPUT -> config.saveLoadProgressThrottle;
-            case CAMPAIGN_GAME_MANAGER -> config.saveOutputBufferDedup;
+            case CAMPAIGN_GAME_MANAGER -> config.saveOutputBufferDedup
+                    || config.remoteMarketScheduler;
             case HyperspacePatches.BASE_TILED -> config.hyperspaceCulling
                     || config.hyperspaceYClamp || config.terrainRandomReuse;
             case HyperspacePatches.HYPER_TERRAIN -> config.skipNoOpTerrainLayer
@@ -406,7 +418,8 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 || config.intelEntityIndex || config.hoverHitTestCache
                 || config.systemNebulaCache || config.sampleCacheClearThrottle
                 || config.campaignListenerThrottle || config.routeJumpPointIndex
-                || config.economyLocationCache || config.commRelaySystemIndex;
+                || config.economyLocationCache || config.remoteMarketScheduler
+                || config.commRelaySystemIndex;
     }
 
 
@@ -695,6 +708,32 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         removeRange(method, plans.get(0).start, plans.get(0).end);
         PatchReport report = new PatchReport();
         report.add("outer1MiBBufferRemoved", 1);
+        return report;
+    }
+
+    private PatchReport patchRemoteMarketSaveFlush(ClassNode node) {
+        MethodNode method = requireMethod(node, "o00000",
+                "(Lcom/fs/starfarer/campaign/CampaignEngine$o;JZ)Ljava/lang/String;");
+        int hooks = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "flushRemoteMarketsBeforeSave", "()V");
+        if (hooks == 1) {
+            AbstractInsnNode first = firstMeaningful(method);
+            if (!(first instanceof MethodInsnNode call)
+                    || !callMatches(call, Opcodes.INVOKESTATIC, HOOKS,
+                    "flushRemoteMarketsBeforeSave", "()V")) {
+                throw mismatch("remote-market save flush is not the first save instruction");
+            }
+            throw already("remote-market save flush postcondition matches");
+        }
+        requireCount("remote-market save flush hooks", hooks, 0);
+
+        method.instructions.insert(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                HOOKS, "flushRemoteMarketsBeforeSave", "()V", false));
+        requireCount("remote-market save flush hooks",
+                countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                        "flushRemoteMarketsBeforeSave", "()V"), 1);
+        PatchReport report = new PatchReport();
+        report.add("pending remote-market time flushed before save", 1);
         return report;
     }
 
@@ -2473,6 +2512,115 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
 
         PatchReport report = new PatchReport();
         report.add("reusable Economy market/condition snapshots", changed);
+        return report;
+    }
+
+    private PatchReport patchRemoteMarketScheduler(ClassNode node) {
+        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        // The scheduler uses the existing re-entrant scratch-scope depth as its
+        // central-loop ownership guard. Install it even when economy snapshot
+        // reuse is disabled so nested Economy.advance() calls fail open without
+        // overwriting the outer scheduling frame.
+        boolean scopeInstalled = ensureScratchScope(node.name, advance,
+                "Economy.advance remote-market scheduler");
+        String market = "com/fs/starfarer/api/campaign/econ/MarketAPI";
+        String scheduledDesc = "(L" + market + ";F)V";
+        List<MethodInsnNode> originals = calls(advance, Opcodes.INVOKEINTERFACE,
+                market, "advance", "(F)V");
+        int beginHooks = countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
+                "beginRemoteMarketFrame", "()V");
+        int scheduleHooks = countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
+                "advanceMarketScheduled", scheduledDesc);
+
+        boolean patched = originals.isEmpty() && beginHooks == 1 && scheduleHooks == 1;
+        if (patched) {
+            AbstractInsnNode first = firstMeaningful(advance);
+            AbstractInsnNode expected = first;
+            if (first instanceof MethodInsnNode scratch
+                    && callMatches(scratch, Opcodes.INVOKESTATIC, HOOKS,
+                    "beginScratchScope", "()V")) {
+                expected = nextMeaningful(first);
+            }
+            if (!(expected instanceof MethodInsnNode begin)
+                    || !callMatches(begin, Opcodes.INVOKESTATIC, HOOKS,
+                    "beginRemoteMarketFrame", "()V")) {
+                throw mismatch("Economy remote-market frame hook is not at the verified entry point");
+            }
+            throw already("Economy remote-market scheduler hooks and call-site postcondition match");
+        }
+
+        if (originals.size() != 1 || beginHooks != 0 || scheduleHooks != 0) {
+            throw mismatch("Economy market-advance call is missing, duplicated, or partially patched");
+        }
+
+        MethodInsnNode beginHook = new MethodInsnNode(Opcodes.INVOKESTATIC,
+                HOOKS, "beginRemoteMarketFrame", "()V", false);
+        AbstractInsnNode entry = firstMeaningful(advance);
+        if (entry instanceof MethodInsnNode scratch
+                && callMatches(scratch, Opcodes.INVOKESTATIC, HOOKS,
+                "beginScratchScope", "()V")) {
+            advance.instructions.insert(entry, beginHook);
+        } else {
+            advance.instructions.insertBefore(entry, beginHook);
+        }
+        MethodInsnNode original = originals.get(0);
+        advance.instructions.set(original, new MethodInsnNode(Opcodes.INVOKESTATIC,
+                HOOKS, "advanceMarketScheduled", scheduledDesc, false));
+
+        requireCount("remote-market frame hooks",
+                countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
+                        "beginRemoteMarketFrame", "()V"), 1);
+        requireCount("remote-market scheduled calls",
+                countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
+                        "advanceMarketScheduled", scheduledDesc), 1);
+
+        PatchReport report = new PatchReport();
+        report.add("staggered central market loop", 1);
+        report.add("remote-market reentrancy scope", scopeInstalled ? 1 : 0);
+        return report;
+    }
+
+    private PatchReport patchDirectMarketObservationEntry(ClassNode node) {
+        MethodNode method = requireMethod(node, "advance", "(F)V");
+        String descriptor = "(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;F)V";
+        int existing = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "observeMarketAdvanceEntry", descriptor);
+        if (existing == 1) {
+            AbstractInsnNode expected = firstMeaningful(method);
+            if (expected instanceof MethodInsnNode scratch
+                    && callMatches(scratch, Opcodes.INVOKESTATIC, HOOKS,
+                    "beginScratchScope", "()V")) {
+                expected = nextMeaningful(expected);
+            }
+            if (!(expected instanceof VarInsnNode owner)
+                    || owner.getOpcode() != Opcodes.ALOAD || owner.var != 0
+                    || !(nextMeaningful(expected) instanceof VarInsnNode amount)
+                    || amount.getOpcode() != Opcodes.FLOAD || amount.var != 1
+                    || !(nextMeaningful(amount) instanceof MethodInsnNode hook)
+                    || !callMatches(hook, Opcodes.INVOKESTATIC, HOOKS,
+                    "observeMarketAdvanceEntry", descriptor)) {
+                throw mismatch("Market.advance observation entry hook is not at the verified entry point");
+            }
+            throw already("Market.advance observation entry hook is present");
+        }
+        requireCount("Market.advance observation entry hook", existing, 0);
+
+        InsnList prologue = new InsnList();
+        prologue.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prologue.add(new VarInsnNode(Opcodes.FLOAD, 1));
+        prologue.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "observeMarketAdvanceEntry", descriptor, false));
+        AbstractInsnNode entry = firstMeaningful(method);
+        if (entry instanceof MethodInsnNode scratch
+                && callMatches(scratch, Opcodes.INVOKESTATIC, HOOKS,
+                "beginScratchScope", "()V")) {
+            method.instructions.insert(entry, prologue);
+        } else {
+            method.instructions.insertBefore(entry, prologue);
+        }
+
+        PatchReport report = new PatchReport();
+        report.add("marketAdvanceEntry", 1);
         return report;
     }
 

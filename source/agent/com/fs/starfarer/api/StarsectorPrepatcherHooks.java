@@ -1,12 +1,15 @@
 package com.fs.starfarer.api;
 
 import com.fs.starfarer.api.campaign.JumpPointAPI;
+import com.fs.starfarer.api.campaign.CampaignUIAPI;
+import com.fs.starfarer.api.campaign.InteractionDialogAPI;
 import com.fs.starfarer.api.campaign.LocationAPI;
 import com.fs.starfarer.api.campaign.SectorAPI;
 import com.fs.starfarer.api.campaign.SectorEntityToken;
 import com.fs.starfarer.api.campaign.StarSystemAPI;
 import com.fs.starfarer.api.campaign.comm.IntelInfoPlugin;
 import com.fs.starfarer.api.campaign.econ.MarketAPI;
+import com.fs.starfarer.api.campaign.rules.MemoryAPI;
 import com.fs.starfarer.campaign.CampaignEngine;
 import com.fs.starfarer.campaign.econ.Economy;
 import com.fs.starfarer.campaign.econ.reach.ReachEconomy;
@@ -28,7 +31,12 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -49,12 +57,26 @@ import java.util.Random;
 import java.util.RandomAccess;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.DoubleAdder;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.stream.Collectors;
 
 /** Runtime entry points called by transformed Starsector classes. */
 public final class StarsectorPrepatcherHooks {
     private static volatile PrepatcherConfig config;
     private static volatile Path modRoot;
+
+    private static final int MARKET_ORIGIN_NONE = 0;
+    private static final int MARKET_ORIGIN_SCHEDULED = 1;
+    private static final int MARKET_ORIGIN_SCHEDULER_FALLBACK = 2;
+    private static final int MARKET_ORIGIN_SAVE_FLUSH = 3;
+    private static final int MARKET_ORIGIN_DIRECT_CALL_SITE = 4;
+    private static final ThreadLocal<MarketAdvanceObservationContext> MARKET_ADVANCE_CONTEXT =
+            ThreadLocal.withInitial(MarketAdvanceObservationContext::new);
+    private static volatile DirectMarketObserver DIRECT_MARKET_OBSERVER;
 
     private static final ThreadLocal<Scratch> SCRATCH = ThreadLocal.withInitial(Scratch::new);
     private static final ThreadLocal<TextReadScratch> TEXT_READ_SCRATCH =
@@ -75,6 +97,8 @@ public final class StarsectorPrepatcherHooks {
             Collections.synchronizedMap(new WeakHashMap<>());
     private static volatile Map<ReachEconomy, EconomyLocationState> ECONOMY_LOCATION_STATES =
             Collections.synchronizedMap(new WeakHashMap<>());
+    private static volatile Map<MarketAPI, RemoteMarketScheduleState> REMOTE_MARKET_STATES =
+            Collections.synchronizedMap(new IdentityHashMap<>());
     private static volatile Map<Object, CommRelaySystemIndex> COMM_RELAY_SYSTEM_INDEXES =
             Collections.synchronizedMap(new WeakHashMap<>());
     private static final Object CAMPAIGN_CACHE_LIFECYCLE_LOCK = new Object();
@@ -94,6 +118,11 @@ public final class StarsectorPrepatcherHooks {
     private static volatile boolean campaignEngineObserved;
     private static volatile boolean campaignCacheGenerationActive;
     private static volatile long campaignCacheGeneration;
+    private static volatile long remoteMarketFrame;
+    private static volatile long remoteMarketFrameGeneration = -1L;
+    private static volatile LocationAPI remoteMarketCurrentLocation;
+    private static volatile MarketAPI remoteMarketInteractionMarket;
+    private static volatile float remoteMarketSecondsPerDay = Float.NaN;
     private static final long NO_CAMPAIGN_TRANSITION = -1L;
     private static long pendingCampaignTransition = NO_CAMPAIGN_TRANSITION;
     private static WeakReference<Object> pendingCampaignEngine = new WeakReference<>(null);
@@ -129,6 +158,13 @@ public final class StarsectorPrepatcherHooks {
     private static final LongAdder ECONOMY_LOCATION_DIRTY = new LongAdder();
     private static final LongAdder ECONOMY_LOCATION_SKIPS = new LongAdder();
     private static final LongAdder ECONOMY_SNAPSHOT_ELEMENTS = new LongAdder();
+    private static final LongAdder REMOTE_MARKET_FRAMES = new LongAdder();
+    private static final LongAdder REMOTE_MARKET_FULL_ADVANCES = new LongAdder();
+    private static final LongAdder REMOTE_MARKET_DEFERRED_CALLS = new LongAdder();
+    private static final LongAdder REMOTE_MARKET_HOT_ADVANCES = new LongAdder();
+    private static final LongAdder REMOTE_MARKET_HIDDEN_ADVANCES = new LongAdder();
+    private static final LongAdder REMOTE_MARKET_SAVE_FLUSHES = new LongAdder();
+    private static final LongAdder REMOTE_MARKET_FALLBACKS = new LongAdder();
     private static final LongAdder SHIP_SCRATCH_LISTS = new LongAdder();
     private static final LongAdder SHIP_SCRATCH_SETS = new LongAdder();
     private static final LongAdder PARTICLE_GROUPS = new LongAdder();
@@ -162,6 +198,17 @@ public final class StarsectorPrepatcherHooks {
     static void configure(PrepatcherConfig optimizerConfig, Path root) {
         config = optimizerConfig;
         modRoot = root;
+        if (optimizerConfig.directMarketObservation) {
+            try {
+                DirectMarketObserver observer = new DirectMarketObserver(optimizerConfig, root);
+                DIRECT_MARKET_OBSERVER = observer;
+                observer.start();
+            } catch (Throwable failure) {
+                DIRECT_MARKET_OBSERVER = null;
+                PrepatcherLog.error("Direct Market.advance observation initialization failed; "
+                        + "market behavior remains unchanged and observation is disabled.", failure);
+            }
+        }
         if (optimizerConfig.statsLogIntervalSeconds > 0) {
             Thread stats = new Thread(StarsectorPrepatcherHooks::statsLoop, "StarsectorPrepatcher-Stats");
             stats.setDaemon(true);
@@ -446,7 +493,13 @@ public final class StarsectorPrepatcherHooks {
         ROUTE_JUMP_INDEXES = Collections.synchronizedMap(new WeakHashMap<>());
         ROUTE_SYSTEM_INDEXES = Collections.synchronizedMap(new WeakHashMap<>());
         ECONOMY_LOCATION_STATES = Collections.synchronizedMap(new WeakHashMap<>());
+        REMOTE_MARKET_STATES = Collections.synchronizedMap(new IdentityHashMap<>());
         COMM_RELAY_SYSTEM_INDEXES = Collections.synchronizedMap(new WeakHashMap<>());
+        remoteMarketFrame = 0L;
+        remoteMarketFrameGeneration = -1L;
+        remoteMarketCurrentLocation = null;
+        remoteMarketInteractionMarket = null;
+        remoteMarketSecondsPerDay = Float.NaN;
         nebulaCacheSlot = new NebulaCacheSlot();
         // A lifecycle callback may be re-entrant inside a transformed scratch
         // scope. Detach the old Scratch without clearing collections that the
@@ -806,6 +859,398 @@ public final class StarsectorPrepatcherHooks {
         result.addAll(source);
         ECONOMY_SNAPSHOT_ELEMENTS.add(source.size());
         return result;
+    }
+
+    // ---------------------------------------------------------------------
+    // Direct Market.advance observation
+    // ---------------------------------------------------------------------
+
+    /**
+     * Observation-only replacement for direct mod call sites. The original
+     * MarketAPI.advance call remains synchronous and receives the exact same
+     * receiver and amount. Telemetry failures are deliberately swallowed so the
+     * wrapper can never suppress or replace game/mod behavior.
+     */
+    public static void observeDirectMarketAdvance(MarketAPI market, float amount,
+                                                   long siteId, String metadata) {
+        DirectMarketObserver observer = DIRECT_MARKET_OBSERVER;
+        MarketAdvanceObservationContext context = MARKET_ADVANCE_CONTEXT.get();
+        boolean recursive = context.depth > 0;
+        DirectMarketCallToken token = null;
+        if (observer != null) {
+            try {
+                token = observer.beginDirectCall(context, market, amount,
+                        siteId, metadata, recursive);
+            } catch (Throwable ignored) {
+                token = null;
+            }
+        }
+
+        int previousOrigin = context.origin;
+        int previousDepth = context.depth;
+        long previousSiteId = context.siteId;
+        context.origin = MARKET_ORIGIN_DIRECT_CALL_SITE;
+        context.depth = previousDepth + 1;
+        context.siteId = siteId;
+        boolean success = false;
+        try {
+            market.advance(amount);
+            success = true;
+        } finally {
+            context.origin = previousOrigin;
+            context.depth = previousDepth;
+            context.siteId = previousSiteId;
+            if (observer != null) {
+                try {
+                    observer.endDirectCall(token, success);
+                } catch (Throwable ignored) {
+                    // Never mask the original return value or exception.
+                }
+            }
+        }
+    }
+
+    /** Entry probe inserted into the concrete vanilla Market.advance method. */
+    public static void observeMarketAdvanceEntry(MarketAPI market, float amount) {
+        DirectMarketObserver observer = DIRECT_MARKET_OBSERVER;
+        if (observer == null) return;
+        try {
+            MarketAdvanceObservationContext context = MARKET_ADVANCE_CONTEXT.get();
+            observer.observeMarketEntry(context.origin, context.siteId, market, amount);
+        } catch (Throwable ignored) {
+            // Observation is strictly fail-open.
+        }
+    }
+
+    private static void invokeObservedMarketAdvance(MarketAPI market, float amount, int origin) {
+        DirectMarketObserver observer = DIRECT_MARKET_OBSERVER;
+        if (observer == null) {
+            market.advance(amount);
+            return;
+        }
+        MarketAdvanceObservationContext context = MARKET_ADVANCE_CONTEXT.get();
+        int previousOrigin = context.origin;
+        int previousDepth = context.depth;
+        long previousSiteId = context.siteId;
+        context.origin = origin;
+        context.depth = previousDepth + 1;
+        context.siteId = 0L;
+        try {
+            market.advance(amount);
+        } finally {
+            context.origin = previousOrigin;
+            context.depth = previousDepth;
+            context.siteId = previousSiteId;
+        }
+    }
+
+    /**
+     * Captures the shared policy inputs for one Economy.advance() pass. The
+     * transformed market loop calls this exactly once before it begins. Remote
+     * markets are then assigned stable phases without repeating Global/UI/clock
+     * lookups for every market.
+     */
+    public static void beginRemoteMarketFrame() {
+        // patchRemoteMarketScheduler guarantees that Economy.advance owns a
+        // scratch scope. A nested Economy.advance therefore has depth > 1; it
+        // must run vanilla-immediate without overwriting the outer pass context.
+        if (SCRATCH.get().scopeDepth != 1) {
+            REMOTE_MARKET_FALLBACKS.increment();
+            return;
+        }
+
+        PrepatcherConfig c = config;
+        long generation = campaignCacheGeneration;
+        if (c == null || !c.remoteMarketScheduler || !campaignCachesReady(generation)) {
+            remoteMarketFrameGeneration = -1L;
+            remoteMarketCurrentLocation = null;
+            remoteMarketInteractionMarket = null;
+            remoteMarketSecondsPerDay = Float.NaN;
+            return;
+        }
+
+        try {
+            SectorAPI sector = Global.getSector();
+            if (sector == null) throw new IllegalStateException("Global sector is unavailable");
+
+            LocationAPI currentLocation = sector.getCurrentLocation();
+            MarketAPI interactionMarket = null;
+            if (c.remoteMarketHotInteraction) {
+                CampaignUIAPI ui = sector.getCampaignUI();
+                InteractionDialogAPI dialog = ui == null ? null : ui.getCurrentInteractionDialog();
+                SectorEntityToken target = dialog == null ? null : dialog.getInteractionTarget();
+                interactionMarket = target == null ? null : target.getMarket();
+            }
+
+            float secondsPerDay = sector.getClock() == null
+                    ? Float.NaN : sector.getClock().getSecondsPerDay();
+            long next = remoteMarketFrame + 1L;
+            if (next <= 0L) next = 1L;
+
+            // Publish dependent values first and the generation last. A hook
+            // that observes the generation therefore sees a complete context.
+            remoteMarketFrame = next;
+            remoteMarketCurrentLocation = currentLocation;
+            remoteMarketInteractionMarket = interactionMarket;
+            remoteMarketSecondsPerDay = secondsPerDay;
+            remoteMarketFrameGeneration = generation;
+            REMOTE_MARKET_FRAMES.increment();
+        } catch (Throwable ignored) {
+            remoteMarketFrameGeneration = -1L;
+            remoteMarketCurrentLocation = null;
+            remoteMarketInteractionMarket = null;
+            remoteMarketSecondsPerDay = Float.NaN;
+            REMOTE_MARKET_FALLBACKS.increment();
+        }
+    }
+
+    /**
+     * Full staggered scheduler for the Economy.advance() market loop.
+     *
+     * <p>Only the engine's central loop is transformed. Direct calls by mods to
+     * MarketAPI.advance() remain immediate. Remote calls accumulate their exact
+     * original amount and are delivered in original market-list order on the
+     * market's stable phase, or sooner when a frame/day safety cap is reached.
+     * Current-location, interaction and (by default) player-owned markets stay
+     * full-rate.</p>
+     */
+    public static void advanceMarketScheduled(MarketAPI market, float amount) {
+        if (market == null) throw new NullPointerException("market");
+
+        PrepatcherConfig c = config;
+        long generation = campaignCacheGeneration;
+        long frame = remoteMarketFrame;
+        if (c == null || !c.remoteMarketScheduler
+                || SCRATCH.get().scopeDepth != 1
+                || !campaignCachesReady(generation)
+                || remoteMarketFrameGeneration != generation
+                || !Float.isFinite(amount) || amount < 0f) {
+            REMOTE_MARKET_FALLBACKS.increment();
+            invokeObservedMarketAdvance(market, amount, MARKET_ORIGIN_SCHEDULER_FALLBACK);
+            return;
+        }
+
+        // Market itself overrides equals/hashCode, and modded MarketAPI
+        // implementations may do the same. Scheduling state is therefore keyed
+        // strictly by object identity. The map is transient and reset on every
+        // campaign lifecycle transition, so it cannot leak into saves or across
+        // games.
+
+        RemoteMarketScheduleState state;
+        boolean created = false;
+        boolean mapFallback = false;
+        try {
+            Map<MarketAPI, RemoteMarketScheduleState> states = REMOTE_MARKET_STATES;
+            synchronized (states) {
+                if (states != REMOTE_MARKET_STATES || !campaignCachesReady(generation)) {
+                    mapFallback = true;
+                    state = null;
+                } else {
+                    state = states.get(market);
+                    if (state == null) {
+                        state = new RemoteMarketScheduleState();
+                        states.put(market, state);
+                        created = true;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            REMOTE_MARKET_FALLBACKS.increment();
+            invokeObservedMarketAdvance(market, amount, MARKET_ORIGIN_SCHEDULER_FALLBACK);
+            return;
+        }
+        if (mapFallback || state == null) {
+            REMOTE_MARKET_FALLBACKS.increment();
+            invokeObservedMarketAdvance(market, amount, MARKET_ORIGIN_SCHEDULER_FALLBACK);
+            return;
+        }
+
+        boolean auditMemory;
+        boolean cachedMemoryFullRate;
+        boolean directFallback;
+        synchronized (state) {
+            directFallback = state.inAdvance || state.lastCallFrame == frame;
+            if (directFallback) {
+                auditMemory = false;
+                cachedMemoryFullRate = false;
+            } else {
+                state.lastCallFrame = frame;
+                auditMemory = !c.remoteMarketFullRateMemoryKey.isEmpty()
+                        && (state.lastPolicyAuditFrame == Long.MIN_VALUE
+                        || frame - state.lastPolicyAuditFrame
+                        >= c.remoteMarketPolicyAuditFrames);
+                if (auditMemory) state.lastPolicyAuditFrame = frame;
+                cachedMemoryFullRate = state.memoryFullRate;
+            }
+        }
+        if (directFallback) {
+            // Re-entrant Economy.advance() or a duplicate market entry: do not
+            // coalesce a call whose vanilla multiplicity is observable.
+            REMOTE_MARKET_FALLBACKS.increment();
+            invokeObservedMarketAdvance(market, amount, MARKET_ORIGIN_SCHEDULER_FALLBACK);
+            return;
+        }
+
+        boolean hot = false;
+        boolean hidden = false;
+        boolean memoryFullRate = cachedMemoryFullRate;
+        int interval;
+        int phase;
+        try {
+            if (c.remoteMarketHotCurrentLocation
+                    && market.getContainingLocation() == remoteMarketCurrentLocation) {
+                hot = true;
+            }
+            if (c.remoteMarketHotPlayerOwned && market.isPlayerOwned()) hot = true;
+            if (c.remoteMarketHotInteraction && market == remoteMarketInteractionMarket) hot = true;
+
+            if (auditMemory) {
+                MemoryAPI memory = market.getMemoryWithoutUpdate();
+                memoryFullRate = memory != null
+                        && memory.getBoolean(c.remoteMarketFullRateMemoryKey);
+            }
+            if (memoryFullRate) hot = true;
+
+            hidden = market.isHidden();
+            interval = hidden ? c.remoteMarketHiddenFrames : c.remoteMarketFrames;
+            phase = stableMarketPhase(market, interval);
+        } catch (Throwable ignored) {
+            hot = true;
+            interval = 1;
+            phase = 0;
+            REMOTE_MARKET_FALLBACKS.increment();
+        }
+
+        float totalAmount;
+        boolean run;
+        synchronized (state) {
+            if (auditMemory) state.memoryFullRate = memoryFullRate;
+
+            totalAmount = state.pendingAmount + amount;
+            boolean finiteTotal = Float.isFinite(totalAmount) && totalAmount >= 0f;
+            boolean dueByPhase = interval <= 1 || Math.floorMod(frame, interval) == phase;
+            boolean dueByFrameCap = state.deferredCalls >= c.remoteMarketMaxDeferredFrames - 1;
+            boolean dueByDayCap = false;
+            float secondsPerDay = remoteMarketSecondsPerDay;
+            if (c.remoteMarketMaxDeferredGameDays > 0f
+                    && Float.isFinite(secondsPerDay) && secondsPerDay > 0f
+                    && finiteTotal) {
+                dueByDayCap = totalAmount / secondsPerDay
+                        >= c.remoteMarketMaxDeferredGameDays;
+            }
+
+            // A newly observed market is always advanced immediately. This
+            // avoids loading/creation with uninitialized plugin state; its next
+            // due call uses the stable global phase and becomes staggered.
+            run = created || hot || dueByPhase || dueByFrameCap || dueByDayCap || !finiteTotal;
+            if (!run) {
+                state.pendingAmount = totalAmount;
+                state.deferredCalls++;
+                REMOTE_MARKET_DEFERRED_CALLS.increment();
+                return;
+            }
+
+            state.pendingAmount = 0f;
+            state.deferredCalls = 0;
+            state.inAdvance = true;
+            state.lastAdvanceFrame = frame;
+        }
+
+        try {
+            invokeObservedMarketAdvance(market, totalAmount, MARKET_ORIGIN_SCHEDULED);
+            REMOTE_MARKET_FULL_ADVANCES.increment();
+            if (hot) REMOTE_MARKET_HOT_ADVANCES.increment();
+            if (hidden) REMOTE_MARKET_HIDDEN_ADVANCES.increment();
+        } finally {
+            synchronized (state) {
+                state.inAdvance = false;
+            }
+        }
+    }
+
+    /**
+     * Applies accumulated remote-market time before XStream observes the
+     * campaign. This keeps transient scheduler state out of the save format and
+     * prevents a save/load boundary from discarding up to one scheduling window.
+     * Failures are logged and left pending rather than aborting the save.
+     */
+    public static void flushRemoteMarketsBeforeSave() {
+        PrepatcherConfig c = config;
+        long generation = campaignCacheGeneration;
+        if (c == null || !c.remoteMarketScheduler || !campaignCachesReady(generation)) return;
+
+        ArrayList<MarketAPI> markets = new ArrayList<>();
+        ArrayList<RemoteMarketScheduleState> statesToFlush = new ArrayList<>();
+        ArrayList<Float> amounts = new ArrayList<>();
+        try {
+            Map<MarketAPI, RemoteMarketScheduleState> states = REMOTE_MARKET_STATES;
+            synchronized (states) {
+                if (states != REMOTE_MARKET_STATES || !campaignCachesReady(generation)) return;
+                for (Map.Entry<MarketAPI, RemoteMarketScheduleState> entry : states.entrySet()) {
+                    MarketAPI market = entry.getKey();
+                    RemoteMarketScheduleState state = entry.getValue();
+                    if (market == null || state == null) continue;
+                    synchronized (state) {
+                        if (state.inAdvance || !(state.pendingAmount > 0f)) continue;
+                        float pending = state.pendingAmount;
+                        state.pendingAmount = 0f;
+                        state.deferredCalls = 0;
+                        state.inAdvance = true;
+                        markets.add(market);
+                        statesToFlush.add(state);
+                        amounts.add(pending);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            REMOTE_MARKET_FALLBACKS.increment();
+            return;
+        }
+
+        for (int i = 0; i < markets.size(); i++) {
+            MarketAPI market = markets.get(i);
+            RemoteMarketScheduleState state = statesToFlush.get(i);
+            float pending = amounts.get(i);
+            boolean success = false;
+            try {
+                invokeObservedMarketAdvance(market, pending, MARKET_ORIGIN_SAVE_FLUSH);
+                success = true;
+                REMOTE_MARKET_SAVE_FLUSHES.increment();
+            } catch (Throwable failure) {
+                REMOTE_MARKET_FALLBACKS.increment();
+                PrepatcherLog.warn("Remote-market save flush failed for "
+                        + safeMarketId(market) + "; pending time remains deferred: "
+                        + failure.getClass().getName() + ": " + failure.getMessage());
+            } finally {
+                synchronized (state) {
+                    if (!success) state.pendingAmount += pending;
+                    state.inAdvance = false;
+                    if (success) state.lastAdvanceFrame = remoteMarketFrame;
+                }
+            }
+        }
+    }
+
+    private static int stableMarketPhase(MarketAPI market, int interval) {
+        if (interval <= 1) return 0;
+        int hash = System.identityHashCode(market);
+        try {
+            String id = market.getId();
+            if (id != null) hash = 31 * hash + id.hashCode();
+        } catch (Throwable ignored) {
+            // Identity still provides a stable phase for this process.
+        }
+        hash ^= hash >>> 16;
+        return Math.floorMod(hash, interval);
+    }
+
+    private static String safeMarketId(MarketAPI market) {
+        try {
+            String id = market == null ? null : market.getId();
+            return id == null ? String.valueOf(market) : id;
+        } catch (Throwable ignored) {
+            return market == null ? "null" : market.getClass().getName();
+        }
     }
 
     /** Three frame-local command/group lists in Ship.advance(). */
@@ -2075,6 +2520,17 @@ public final class StarsectorPrepatcherHooks {
         }
     }
 
+    /** Transient per-market state for the aggressive central Economy scheduler. */
+    private static final class RemoteMarketScheduleState {
+        float pendingAmount;
+        int deferredCalls;
+        long lastCallFrame = Long.MIN_VALUE;
+        long lastAdvanceFrame = Long.MIN_VALUE;
+        long lastPolicyAuditFrame = Long.MIN_VALUE;
+        boolean memoryFullRate;
+        boolean inAdvance;
+    }
+
     private static final class CommRelaySystemEntry {
         final int ordinal;
         final StarSystemAPI system;
@@ -2726,6 +3182,13 @@ public final class StarsectorPrepatcherHooks {
                         + ", economyLocationDirty=" + ECONOMY_LOCATION_DIRTY.sumThenReset()
                         + ", economyLocationSkips=" + ECONOMY_LOCATION_SKIPS.sumThenReset()
                         + ", economySnapshotElements=" + ECONOMY_SNAPSHOT_ELEMENTS.sumThenReset()
+                        + ", remoteMarketFrames=" + REMOTE_MARKET_FRAMES.sumThenReset()
+                        + ", remoteMarketFullAdvances=" + REMOTE_MARKET_FULL_ADVANCES.sumThenReset()
+                        + ", remoteMarketDeferredCalls=" + REMOTE_MARKET_DEFERRED_CALLS.sumThenReset()
+                        + ", remoteMarketHotAdvances=" + REMOTE_MARKET_HOT_ADVANCES.sumThenReset()
+                        + ", remoteMarketHiddenAdvances=" + REMOTE_MARKET_HIDDEN_ADVANCES.sumThenReset()
+                        + ", remoteMarketSaveFlushes=" + REMOTE_MARKET_SAVE_FLUSHES.sumThenReset()
+                        + ", remoteMarketFallbacks=" + REMOTE_MARKET_FALLBACKS.sumThenReset()
                         + ", commRelayIndexHits=" + COMM_RELAY_INDEX_HITS.sumThenReset()
                         + ", commRelayIndexBuilds=" + COMM_RELAY_INDEX_BUILDS.sumThenReset()
                         + ", commRelayIndexFallbacks=" + COMM_RELAY_INDEX_FALLBACKS.sumThenReset()
@@ -2754,6 +3217,648 @@ public final class StarsectorPrepatcherHooks {
             }
         }
     }
+
+    private static final class MarketAdvanceObservationContext {
+        int origin = MARKET_ORIGIN_NONE;
+        int depth;
+        long siteId;
+        final long[] observerSiteIds = new long[8];
+        final String[] observerMetadata = new String[8];
+        final DirectMarketSiteStats[] observerStats = new DirectMarketSiteStats[8];
+    }
+
+    private static final class DirectMarketCallToken {
+        final DirectMarketSiteStats stats;
+        final boolean timed;
+        final long startNanos;
+
+        DirectMarketCallToken(DirectMarketSiteStats stats, boolean timed, long startNanos) {
+            this.stats = stats;
+            this.timed = timed;
+            this.startNanos = startNanos;
+        }
+    }
+
+    /**
+     * Low-overhead aggregate observer for direct Market.advance call sites.
+     * All maps retain only strings/numbers and never MarketAPI instances.
+     */
+    private static final class DirectMarketObserver {
+        private static final DateTimeFormatter SESSION_FORMAT =
+                DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS").withZone(ZoneOffset.UTC);
+        private static final String SITE_HEADER =
+                "site_id,source,class,method,descriptor,line,ordinal,amount_source,call_owner,opcode\n";
+        private static final String OBSERVATION_HEADER =
+                "timestamp_utc,interval_seconds,site_id,source,class,method,descriptor,line,ordinal,"
+                        + "amount_source,call_owner,opcode,interval_calls,cumulative_calls,calls_per_second,"
+                        + "sampled_calls,sampled_inclusive_ns,estimated_inclusive_ns,avg_sample_ns,"
+                        + "exceptions,recursive_calls,finite_amounts,amount_sum,amount_avg,"
+                        + "zero_amount,negative_amount,nan_amount,null_market,approx_unique_markets_sampled\n";
+        private static final String STACK_HEADER =
+                "timestamp_utc,site_id,samples,stack\n";
+        private static final String SUMMARY_HEADER =
+                "timestamp_utc,interval_seconds,scheduled_entries,scheduler_fallback_entries,"
+                        + "save_flush_entries,direct_callsite_entries,unknown_entries,"
+                        + "direct_wrapper_calls,site_count,site_overflow_calls,metadata_collisions\n";
+        private static final String UNKNOWN_HEADER =
+                "timestamp_utc,samples,stack\n";
+
+        private final int timingSampleEvery;
+        private final int stackSampleEvery;
+        private final int maxStacksPerSite;
+        private final int reportIntervalSeconds;
+        private final int maxSites;
+        private final int unknownStackSampleLimit;
+        private final Path sessionDir;
+        private final Path sitesFile;
+        private final Path observationsFile;
+        private final Path stacksFile;
+        private final Path summaryFile;
+        private final Path unknownFile;
+        private final ConcurrentHashMap<Long, DirectMarketSiteStats> sites =
+                new ConcurrentHashMap<>();
+        private final DirectMarketSiteStats overflowSite =
+                DirectMarketSiteStats.overflow();
+        private final ConcurrentHashMap<String, LongAdder> unknownStacks =
+                new ConcurrentHashMap<>();
+        private final AtomicInteger unknownStackSamples = new AtomicInteger();
+        private final LongAdder scheduledEntries = new LongAdder();
+        private final LongAdder schedulerFallbackEntries = new LongAdder();
+        private final LongAdder saveFlushEntries = new LongAdder();
+        private final LongAdder directCallsiteEntries = new LongAdder();
+        private final LongAdder unknownEntries = new LongAdder();
+        private final LongAdder directWrapperCalls = new LongAdder();
+        private final LongAdder siteOverflowCalls = new LongAdder();
+        private final LongAdder metadataCollisions = new LongAdder();
+        private volatile long lastReportNanos = System.nanoTime();
+
+        DirectMarketObserver(PrepatcherConfig configuration, Path root) throws IOException {
+            timingSampleEvery = configuration.directMarketTimingSampleEvery;
+            stackSampleEvery = configuration.directMarketStackSampleEvery;
+            maxStacksPerSite = configuration.directMarketMaxStacksPerSite;
+            reportIntervalSeconds = configuration.directMarketReportIntervalSeconds;
+            maxSites = configuration.directMarketMaxSites;
+            unknownStackSampleLimit = configuration.directMarketUnknownStackSamples;
+
+            String sessionName = "session-" + SESSION_FORMAT.format(Instant.now())
+                    + "-pid" + ProcessHandle.current().pid();
+            Path base = root.resolve("logs").resolve("direct-market-observe");
+            sessionDir = base.resolve(sessionName);
+            Files.createDirectories(sessionDir);
+            sitesFile = sessionDir.resolve("call-sites.csv");
+            observationsFile = sessionDir.resolve("observations.csv");
+            stacksFile = sessionDir.resolve("stacks.csv");
+            summaryFile = sessionDir.resolve("summary.csv");
+            unknownFile = sessionDir.resolve("unknown-stacks.csv");
+
+            Files.writeString(sitesFile, SITE_HEADER, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE_NEW);
+            Files.writeString(observationsFile, OBSERVATION_HEADER, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE_NEW);
+            Files.writeString(stacksFile, STACK_HEADER, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE_NEW);
+            Files.writeString(summaryFile, SUMMARY_HEADER, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE_NEW);
+            Files.writeString(unknownFile, UNKNOWN_HEADER, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE_NEW);
+            Files.writeString(sessionDir.resolve("session.json"), sessionJson(),
+                    StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW);
+            System.setProperty("starsector.prepatcher.directMarketObservationDir",
+                    sessionDir.toAbsolutePath().toString());
+            PrepatcherLog.info("Direct Market.advance observation session: "
+                    + sessionDir.toAbsolutePath());
+        }
+
+        void start() {
+            Thread reporter = new Thread(this::reportLoop,
+                    "StarsectorPrepatcher-DirectMarketObserver");
+            reporter.setDaemon(true);
+            reporter.setPriority(Thread.MIN_PRIORITY);
+            reporter.start();
+        }
+
+        DirectMarketCallToken beginDirectCall(MarketAdvanceObservationContext context,
+                                              MarketAPI market, float amount,
+                                              long siteId, String metadata,
+                                              boolean recursive) {
+            DirectMarketSiteStats stats = site(context, siteId, metadata);
+            long callNumber = stats.totalCalls.incrementAndGet();
+            stats.intervalCalls.increment();
+            directWrapperCalls.increment();
+            if (Float.isFinite(amount)) {
+                stats.finiteAmounts.increment();
+                stats.amountSum.add(amount);
+            } else if (Float.isNaN(amount)) {
+                stats.nanAmounts.increment();
+            }
+            if (amount < 0f) stats.negativeAmounts.increment();
+            else if (amount == 0f) stats.zeroAmounts.increment();
+            if (market == null) stats.nullMarkets.increment();
+            if (recursive) stats.recursiveCalls.increment();
+            if (market != null && (callNumber == 1L || (callNumber & 7L) == 0L)) {
+                stats.observeMarketIdentity(System.identityHashCode(market));
+            }
+
+            boolean stackSample = maxStacksPerSite > 0
+                    && (callNumber == 1L
+                    || (stackSampleEvery > 0 && callNumber % stackSampleEvery == 0L));
+            if (stackSample) stats.recordStack(captureDirectStack(), maxStacksPerSite);
+
+            boolean timed = timingSampleEvery > 0
+                    && Math.floorMod(callNumber + stats.samplePhase, timingSampleEvery) == 0L;
+            return new DirectMarketCallToken(stats, timed,
+                    timed ? System.nanoTime() : 0L);
+        }
+
+        void endDirectCall(DirectMarketCallToken token, boolean success) {
+            if (token == null || token.stats == null) return;
+            if (!success) token.stats.exceptions.increment();
+            if (token.timed) {
+                long elapsed = System.nanoTime() - token.startNanos;
+                if (elapsed < 0L) elapsed = 0L;
+                token.stats.sampledCalls.increment();
+                token.stats.sampledInclusiveNanos.add(elapsed);
+            }
+        }
+
+        void observeMarketEntry(int origin, long siteId, MarketAPI market, float amount) {
+            switch (origin) {
+                case MARKET_ORIGIN_SCHEDULED -> scheduledEntries.increment();
+                case MARKET_ORIGIN_SCHEDULER_FALLBACK -> schedulerFallbackEntries.increment();
+                case MARKET_ORIGIN_SAVE_FLUSH -> saveFlushEntries.increment();
+                case MARKET_ORIGIN_DIRECT_CALL_SITE -> directCallsiteEntries.increment();
+                default -> {
+                    unknownEntries.increment();
+                    int sample = unknownStackSamples.getAndIncrement();
+                    if (sample < unknownStackSampleLimit) {
+                        String stack = captureDirectStack();
+                        unknownStacks.computeIfAbsent(stack, ignored -> new LongAdder()).increment();
+                    }
+                }
+            }
+        }
+
+        private DirectMarketSiteStats site(MarketAdvanceObservationContext context,
+                                             long siteId, String metadata) {
+            int slot = (int) (siteId ^ (siteId >>> 32)) & 7;
+            DirectMarketSiteStats cached = context.observerStats[slot];
+            String cachedMetadata = context.observerMetadata[slot];
+            if (cached != null && context.observerSiteIds[slot] == siteId
+                    && (cachedMetadata == metadata
+                    || Objects.equals(cachedMetadata, metadata))) {
+                return cached;
+            }
+
+            DirectMarketSiteStats existing = sites.get(siteId);
+            if (existing == null) {
+                if (sites.size() >= maxSites) {
+                    siteOverflowCalls.increment();
+                    return overflowSite;
+                }
+                DirectMarketSiteStats candidate = new DirectMarketSiteStats(
+                        DirectMarketMetadata.parse(siteId, metadata));
+                DirectMarketSiteStats raced = sites.putIfAbsent(siteId, candidate);
+                existing = raced == null ? candidate : raced;
+            }
+            if (!existing.metadata.raw.equals(metadata)) metadataCollisions.increment();
+            context.observerSiteIds[slot] = siteId;
+            context.observerMetadata[slot] = metadata;
+            context.observerStats[slot] = existing;
+            return existing;
+        }
+
+        private void reportLoop() {
+            while (true) {
+                try {
+                    Thread.sleep(reportIntervalSeconds * 1000L);
+                    report();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    try { report(); } catch (Throwable ignored) {}
+                    return;
+                } catch (Throwable failure) {
+                    PrepatcherLog.error("Direct Market.advance observation report failed", failure);
+                }
+            }
+        }
+
+        private void report() throws IOException {
+            long nowNanos = System.nanoTime();
+            double elapsedSeconds = Math.max(0.001,
+                    (nowNanos - lastReportNanos) / 1_000_000_000.0);
+            lastReportNanos = nowNanos;
+            String timestamp = Instant.now().toString();
+
+            ArrayList<DirectMarketIntervalSnapshot> snapshots = new ArrayList<>();
+            for (DirectMarketSiteStats stats : sites.values()) {
+                DirectMarketIntervalSnapshot snapshot = stats.snapshot();
+                if (snapshot.calls > 0L || !stats.metadataWritten) snapshots.add(snapshot);
+            }
+            DirectMarketIntervalSnapshot overflow = overflowSite.snapshot();
+            if (overflow.calls > 0L) snapshots.add(overflow);
+            snapshots.sort((left, right) -> Long.compare(
+                    right.estimatedInclusiveNanos(), left.estimatedInclusiveNanos()));
+
+            StringBuilder siteRows = new StringBuilder();
+            StringBuilder observationRows = new StringBuilder();
+            StringBuilder stackRows = new StringBuilder();
+            for (DirectMarketIntervalSnapshot snapshot : snapshots) {
+                DirectMarketSiteStats stats = snapshot.stats;
+                if (!stats.metadataWritten && stats != overflowSite) {
+                    appendSiteRow(siteRows, stats.metadata);
+                    stats.metadataWritten = true;
+                }
+                if (snapshot.calls > 0L) {
+                    appendObservationRow(observationRows, timestamp, elapsedSeconds, snapshot);
+                }
+                stats.appendStackRows(stackRows, timestamp);
+            }
+            if (siteRows.length() > 0) append(sitesFile, siteRows);
+            if (observationRows.length() > 0) append(observationsFile, observationRows);
+            if (stackRows.length() > 0) append(stacksFile, stackRows);
+
+            StringBuilder unknownRows = new StringBuilder();
+            for (Map.Entry<String, LongAdder> entry : unknownStacks.entrySet()) {
+                long samples = entry.getValue().sumThenReset();
+                if (samples <= 0L) continue;
+                unknownRows.append(csv(timestamp)).append(',')
+                        .append(samples).append(',')
+                        .append(csv(entry.getKey())).append('\n');
+            }
+            if (unknownRows.length() > 0) append(unknownFile, unknownRows);
+
+            long scheduled = scheduledEntries.sumThenReset();
+            long fallback = schedulerFallbackEntries.sumThenReset();
+            long save = saveFlushEntries.sumThenReset();
+            long direct = directCallsiteEntries.sumThenReset();
+            long unknown = unknownEntries.sumThenReset();
+            long wrappers = directWrapperCalls.sumThenReset();
+            long overflowCalls = siteOverflowCalls.sumThenReset();
+            long collisions = metadataCollisions.sumThenReset();
+            String summary = csv(timestamp) + ',' + decimal(elapsedSeconds) + ','
+                    + scheduled + ',' + fallback + ',' + save + ',' + direct + ','
+                    + unknown + ',' + wrappers + ',' + sites.size() + ','
+                    + overflowCalls + ',' + collisions + '\n';
+            append(summaryFile, new StringBuilder(summary));
+
+            if (wrappers > 0L || unknown > 0L || overflowCalls > 0L || collisions > 0L) {
+                PrepatcherLog.info("direct-market-observe: calls=" + wrappers
+                        + ", sites=" + sites.size()
+                        + ", scheduledEntries=" + scheduled
+                        + ", directEntries=" + direct
+                        + ", unknownEntries=" + unknown
+                        + ", overflowCalls=" + overflowCalls
+                        + ", output=" + sessionDir.toAbsolutePath());
+            }
+        }
+
+        private String sessionJson() {
+            String version = System.getProperty("starsector.prepatcher.version", "unknown");
+            return "{\n"
+                    + "  \"schema\": 1,\n"
+                    + "  \"mode\": \"observe\",\n"
+                    + "  \"createdUtc\": " + json(Instant.now().toString()) + ",\n"
+                    + "  \"prepatcherVersion\": " + json(version) + ",\n"
+                    + "  \"timingSampleEvery\": " + timingSampleEvery + ",\n"
+                    + "  \"stackSampleEvery\": " + stackSampleEvery + ",\n"
+                    + "  \"maxStacksPerSite\": " + maxStacksPerSite + ",\n"
+                    + "  \"reportIntervalSeconds\": " + reportIntervalSeconds + ",\n"
+                    + "  \"maxSites\": " + maxSites + ",\n"
+                    + "  \"unknownStackSamples\": " + unknownStackSampleLimit + ",\n"
+                    + "  \"behavior\": \"All observed direct calls remain synchronous and immediate.\"\n"
+                    + "}\n";
+        }
+
+        private static void appendSiteRow(StringBuilder output, DirectMarketMetadata metadata) {
+            output.append(csv(unsignedHex(metadata.siteId))).append(',')
+                    .append(csv(metadata.source)).append(',')
+                    .append(csv(metadata.className)).append(',')
+                    .append(csv(metadata.method)).append(',')
+                    .append(csv(metadata.descriptor)).append(',')
+                    .append(metadata.line).append(',')
+                    .append(metadata.ordinal).append(',')
+                    .append(csv(metadata.amountSource)).append(',')
+                    .append(csv(metadata.callOwner)).append(',')
+                    .append(metadata.opcode).append('\n');
+        }
+
+        private static void appendObservationRow(StringBuilder output, String timestamp,
+                                                 double elapsedSeconds,
+                                                 DirectMarketIntervalSnapshot snapshot) {
+            DirectMarketMetadata metadata = snapshot.stats.metadata;
+            long estimated = snapshot.estimatedInclusiveNanos();
+            double average = snapshot.sampledCalls == 0L ? 0.0
+                    : (double) snapshot.sampledNanos / snapshot.sampledCalls;
+            output.append(csv(timestamp)).append(',')
+                    .append(decimal(elapsedSeconds)).append(',')
+                    .append(csv(unsignedHex(metadata.siteId))).append(',')
+                    .append(csv(metadata.source)).append(',')
+                    .append(csv(metadata.className)).append(',')
+                    .append(csv(metadata.method)).append(',')
+                    .append(csv(metadata.descriptor)).append(',')
+                    .append(metadata.line).append(',')
+                    .append(metadata.ordinal).append(',')
+                    .append(csv(metadata.amountSource)).append(',')
+                    .append(csv(metadata.callOwner)).append(',')
+                    .append(metadata.opcode).append(',')
+                    .append(snapshot.calls).append(',')
+                    .append(snapshot.cumulativeCalls).append(',')
+                    .append(decimal(snapshot.calls / elapsedSeconds)).append(',')
+                    .append(snapshot.sampledCalls).append(',')
+                    .append(snapshot.sampledNanos).append(',')
+                    .append(estimated).append(',')
+                    .append(decimal(average)).append(',')
+                    .append(snapshot.exceptions).append(',')
+                    .append(snapshot.recursiveCalls).append(',')
+                    .append(snapshot.finiteAmounts).append(',')
+                    .append(decimal(snapshot.amountSum)).append(',')
+                    .append(decimal(snapshot.finiteAmounts == 0L ? 0.0
+                            : snapshot.amountSum / snapshot.finiteAmounts)).append(',')
+                    .append(snapshot.zeroAmounts).append(',')
+                    .append(snapshot.negativeAmounts).append(',')
+                    .append(snapshot.nanAmounts).append(',')
+                    .append(snapshot.nullMarkets).append(',')
+                    .append(snapshot.approxUniqueMarkets).append('\n');
+        }
+
+        private static void append(Path file, StringBuilder content) throws IOException {
+            Files.writeString(file, content, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        }
+
+        private static String captureDirectStack() {
+            try {
+                return StackWalker.getInstance().walk(stream -> stream
+                        .filter(frame -> !isObserverFrame(frame.getClassName()))
+                        .limit(16)
+                        .map(frame -> frame.getClassName() + "#" + frame.getMethodName()
+                                + ':' + frame.getLineNumber())
+                        .collect(Collectors.joining(" <- ")));
+            } catch (Throwable failure) {
+                return "<stack unavailable: " + failure.getClass().getName() + ">";
+            }
+        }
+
+        private static boolean isObserverFrame(String className) {
+            return className.equals(StarsectorPrepatcherHooks.class.getName())
+                    || className.startsWith(StarsectorPrepatcherHooks.class.getName() + '$')
+                    || className.equals("com.fs.starfarer.campaign.econ.Market")
+                    || className.startsWith("java.lang.reflect.")
+                    || className.startsWith("jdk.internal.reflect.");
+        }
+
+        private static String csv(String value) {
+            if (value == null) return "";
+            boolean quote = false;
+            for (int i = 0; i < value.length(); i++) {
+                char c = value.charAt(i);
+                if (c == ',' || c == '"' || c == '\r' || c == '\n') {
+                    quote = true;
+                    break;
+                }
+            }
+            if (!quote) return value;
+            return '"' + value.replace("\"", "\"\"") + '"';
+        }
+
+        private static String json(String value) {
+            if (value == null) return "null";
+            StringBuilder out = new StringBuilder(value.length() + 16).append('"');
+            for (int i = 0; i < value.length(); i++) {
+                char c = value.charAt(i);
+                switch (c) {
+                    case '"' -> out.append("\\\"");
+                    case '\\' -> out.append("\\\\");
+                    case '\n' -> out.append("\\n");
+                    case '\r' -> out.append("\\r");
+                    case '\t' -> out.append("\\t");
+                    default -> {
+                        if (c < 0x20) out.append(String.format("\\u%04x", (int) c));
+                        else out.append(c);
+                    }
+                }
+            }
+            return out.append('"').toString();
+        }
+
+        private static String decimal(double value) {
+            if (!Double.isFinite(value)) return "0";
+            return String.format(java.util.Locale.ROOT, "%.3f", value);
+        }
+
+        private static String unsignedHex(long value) {
+            return "0x" + Long.toUnsignedString(value, 16);
+        }
+    }
+
+    private static final class DirectMarketSiteStats {
+        final DirectMarketMetadata metadata;
+        final long samplePhase;
+        final AtomicLong totalCalls = new AtomicLong();
+        final LongAdder intervalCalls = new LongAdder();
+        final LongAdder finiteAmounts = new LongAdder();
+        final DoubleAdder amountSum = new DoubleAdder();
+        final LongAdder sampledCalls = new LongAdder();
+        final LongAdder sampledInclusiveNanos = new LongAdder();
+        final LongAdder exceptions = new LongAdder();
+        final LongAdder recursiveCalls = new LongAdder();
+        final LongAdder zeroAmounts = new LongAdder();
+        final LongAdder negativeAmounts = new LongAdder();
+        final LongAdder nanAmounts = new LongAdder();
+        final LongAdder nullMarkets = new LongAdder();
+        final AtomicLong[] uniqueWords = {
+                new AtomicLong(), new AtomicLong(), new AtomicLong(), new AtomicLong()
+        };
+        final ConcurrentHashMap<String, LongAdder> stackSamples = new ConcurrentHashMap<>();
+        final LongAdder overflowStackSamples = new LongAdder();
+        volatile boolean metadataWritten;
+
+        DirectMarketSiteStats(DirectMarketMetadata metadata) {
+            this.metadata = metadata;
+            this.samplePhase = metadata.siteId ^ (metadata.siteId >>> 32);
+        }
+
+        static DirectMarketSiteStats overflow() {
+            DirectMarketSiteStats result = new DirectMarketSiteStats(
+                    new DirectMarketMetadata(0L, "<site-overflow>", "<site-overflow>",
+                            "<site-overflow>", "", -1, -1, "UNKNOWN", "", -1,
+                            "<site-overflow>"));
+            result.metadataWritten = true;
+            return result;
+        }
+
+        void observeMarketIdentity(int identityHash) {
+            int mixed = identityHash;
+            mixed ^= mixed >>> 16;
+            mixed *= 0x7feb352d;
+            mixed ^= mixed >>> 15;
+            int bucket = mixed & 255;
+            AtomicLong word = uniqueWords[bucket >>> 6];
+            long bit = 1L << (bucket & 63);
+            long current;
+            do {
+                current = word.get();
+                if ((current & bit) != 0L) return;
+            } while (!word.compareAndSet(current, current | bit));
+        }
+
+        void recordStack(String stack, int maxStacks) {
+            LongAdder existing = stackSamples.get(stack);
+            if (existing != null) {
+                existing.increment();
+                return;
+            }
+            if (stackSamples.size() >= maxStacks) {
+                overflowStackSamples.increment();
+                return;
+            }
+            LongAdder candidate = new LongAdder();
+            LongAdder raced = stackSamples.putIfAbsent(stack, candidate);
+            (raced == null ? candidate : raced).increment();
+        }
+
+        DirectMarketIntervalSnapshot snapshot() {
+            long calls = intervalCalls.sumThenReset();
+            long sampled = sampledCalls.sumThenReset();
+            long sampledNanos = sampledInclusiveNanos.sumThenReset();
+            long errors = exceptions.sumThenReset();
+            long recursive = recursiveCalls.sumThenReset();
+            long finite = finiteAmounts.sumThenReset();
+            double amountTotal = amountSum.sumThenReset();
+            if (finite == 0L) amountTotal = 0.0;
+            long zero = zeroAmounts.sumThenReset();
+            long negative = negativeAmounts.sumThenReset();
+            long nan = nanAmounts.sumThenReset();
+            long nulls = nullMarkets.sumThenReset();
+            return new DirectMarketIntervalSnapshot(this, calls, totalCalls.get(), sampled,
+                    sampledNanos, errors, recursive, finite, amountTotal,
+                    zero, negative, nan, nulls, approximateUniqueMarkets());
+        }
+
+        int approximateUniqueMarkets() {
+            int bits = 0;
+            for (AtomicLong word : uniqueWords) bits += Long.bitCount(word.get());
+            if (bits <= 0) return 0;
+            if (bits >= 256) return 256;
+            return (int) Math.round(-256.0 * Math.log((256.0 - bits) / 256.0));
+        }
+
+        void appendStackRows(StringBuilder output, String timestamp) {
+            for (Map.Entry<String, LongAdder> entry : stackSamples.entrySet()) {
+                long samples = entry.getValue().sumThenReset();
+                if (samples <= 0L) continue;
+                output.append(DirectMarketObserver.csv(timestamp)).append(',')
+                        .append(DirectMarketObserver.csv(
+                                DirectMarketObserver.unsignedHex(metadata.siteId))).append(',')
+                        .append(samples).append(',')
+                        .append(DirectMarketObserver.csv(entry.getKey())).append('\n');
+            }
+            long overflow = overflowStackSamples.sumThenReset();
+            if (overflow > 0L) {
+                output.append(DirectMarketObserver.csv(timestamp)).append(',')
+                        .append(DirectMarketObserver.csv(
+                                DirectMarketObserver.unsignedHex(metadata.siteId))).append(',')
+                        .append(overflow).append(',')
+                        .append(DirectMarketObserver.csv("<additional stack signatures>"))
+                        .append('\n');
+            }
+        }
+    }
+
+    private static final class DirectMarketMetadata {
+        final long siteId;
+        final String source;
+        final String className;
+        final String method;
+        final String descriptor;
+        final int line;
+        final int ordinal;
+        final String amountSource;
+        final String callOwner;
+        final int opcode;
+        final String raw;
+
+        DirectMarketMetadata(long siteId, String source, String className, String method,
+                             String descriptor, int line, int ordinal, String amountSource,
+                             String callOwner, int opcode, String raw) {
+            this.siteId = siteId;
+            this.source = source;
+            this.className = className;
+            this.method = method;
+            this.descriptor = descriptor;
+            this.line = line;
+            this.ordinal = ordinal;
+            this.amountSource = amountSource;
+            this.callOwner = callOwner;
+            this.opcode = opcode;
+            this.raw = raw;
+        }
+
+        static DirectMarketMetadata parse(long siteId, String metadata) {
+            String raw = metadata == null ? "" : metadata;
+            String[] fields = raw.split("\u001f", -1);
+            if (fields.length != 10 || !"1".equals(fields[0])) {
+                return new DirectMarketMetadata(siteId, "<malformed>", "<malformed>",
+                        "<malformed>", "", -1, -1, "UNKNOWN", "", -1, raw);
+            }
+            return new DirectMarketMetadata(siteId, fields[1], fields[2], fields[3], fields[4],
+                    parseInt(fields[5], -1), parseInt(fields[6], -1), fields[7], fields[8],
+                    parseInt(fields[9], -1), raw);
+        }
+
+        private static int parseInt(String value, int fallback) {
+            try { return Integer.parseInt(value); }
+            catch (RuntimeException ignored) { return fallback; }
+        }
+    }
+
+    private static final class DirectMarketIntervalSnapshot {
+        final DirectMarketSiteStats stats;
+        final long calls;
+        final long cumulativeCalls;
+        final long sampledCalls;
+        final long sampledNanos;
+        final long exceptions;
+        final long recursiveCalls;
+        final long finiteAmounts;
+        final double amountSum;
+        final long zeroAmounts;
+        final long negativeAmounts;
+        final long nanAmounts;
+        final long nullMarkets;
+        final int approxUniqueMarkets;
+
+        DirectMarketIntervalSnapshot(DirectMarketSiteStats stats, long calls,
+                                     long cumulativeCalls, long sampledCalls,
+                                     long sampledNanos, long exceptions,
+                                     long recursiveCalls, long finiteAmounts,
+                                     double amountSum, long zeroAmounts,
+                                     long negativeAmounts, long nanAmounts,
+                                     long nullMarkets, int approxUniqueMarkets) {
+            this.stats = stats;
+            this.calls = calls;
+            this.cumulativeCalls = cumulativeCalls;
+            this.sampledCalls = sampledCalls;
+            this.sampledNanos = sampledNanos;
+            this.exceptions = exceptions;
+            this.recursiveCalls = recursiveCalls;
+            this.finiteAmounts = finiteAmounts;
+            this.amountSum = amountSum;
+            this.zeroAmounts = zeroAmounts;
+            this.negativeAmounts = negativeAmounts;
+            this.nanAmounts = nanAmounts;
+            this.nullMarkets = nullMarkets;
+            this.approxUniqueMarkets = approxUniqueMarkets;
+        }
+
+        long estimatedInclusiveNanos() {
+            if (sampledCalls <= 0L || calls <= 0L || sampledNanos <= 0L) return 0L;
+            double estimate = ((double) sampledNanos * calls) / sampledCalls;
+            if (estimate >= Long.MAX_VALUE) return Long.MAX_VALUE;
+            return Math.max(0L, Math.round(estimate));
+        }
+    }
+
 
     private static final class TextReadScratch {
         private static final int BUFFER_SIZE = 64 * 1024;

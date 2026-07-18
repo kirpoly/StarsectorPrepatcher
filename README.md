@@ -88,9 +88,10 @@ The prepatcher does not modify save data, and its runtime caches are never seria
 
 - sector, system, and Intel maps: reconciliation, spatial candidates, callbacks, hover checks,
   entity indexes, nebula metadata, scratch collections, and grid LOD;
-- campaign and economy: lifecycle-bound caches, listener refresh, reusable snapshots, repeated
-  absent commodity event-mod removal suppression, empty-script and empty-memory fast paths, and
-  comm-relay candidates;
+- campaign and economy: lifecycle-bound caches, listener refresh, reusable snapshots, an aggressive
+  staggered scheduler for remote markets, observation of direct mod `Market.advance()` calls,
+  repeated absent commodity event-mod removal suppression, empty-script and empty-memory fast paths,
+  and comm-relay candidates;
 - routing: ordered jump-point and system indexes with vanilla selection and fallback semantics;
 - combat and particles: internal scratch collections and stable deferred cleanup;
 - loading and save paths: literal parsing, progress redraw, and output-path fixes;
@@ -112,6 +113,17 @@ enabled=false
 because they participated in confirmed mission-startup failures. They will not be re-enabled until
 their fixes pass an isolated startup and mission suite.
 
+`patch.remoteMarketScheduler` is enabled in the default/aggressive profile and intentionally changes
+`MarketAPI.advance()` cadence for remote markets. The current location, interaction market, and
+player-owned markets remain full-rate; an individual market can opt out through the memory key
+`$starsectorPrepatcher_fullRateMarket=true`. Use `profiles/safe.properties` or disable the switch for
+fully conservative callback cadence.
+
+`patch.directMarketObservation` is also enabled in the default/aggressive profile during the 0.9.2
+development cycle. It does not throttle direct mod calls: each call remains synchronous and
+immediate. It writes per-run CSV/stacks under `logs/direct-market-observe/session-*/`. Disable it
+after collecting data to remove the sampling overhead.
+
 Run `uninstall-agent.bat` for vanilla, `uninstall-agent.bat -Target FasterRendering` for FR, or
 `uninstall-agent.bat -Target Both` to remove both managed entries. Each changed file is backed up.
 
@@ -121,6 +133,7 @@ Runtime logs:
 
 ```text
 mods\StarsectorPrepatcher\logs\prepatcher.log
+mods\StarsectorPrepatcher\logs\direct-market-observe\session-*\
 ```
 
 The agent records `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, `SKIPPED_LOADER`, or

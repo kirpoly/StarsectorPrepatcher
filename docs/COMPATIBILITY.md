@@ -146,6 +146,59 @@ known-disabled независимо от этого loader-исключения.
   переносит реализацию в private synthetic method и при повторной трансформации заново
   проверяет semantic contract оригинала и точную последовательность wrapper-инструкций.
 
+## Observation transformer для mod bytecode
+
+`patch.directMarketObservation` регистрирует отдельный observation-only transformer после
+основного engine transformer. Он не меняет публичные interfaces и не определяет runtime types в
+mod loader: typed hook уже находится в game/system loader, а изменённый mod bytecode только
+вызывает этот hook.
+
+Класс рассматривается только если:
+
+- его loader совпадает с game runtime loader или является его потомком;
+- system-loader class имеет `CodeSource` внутри `mods/`;
+- источник не является core/API/common/sound JAR или самим Prepatcher;
+- bytecode содержит точный direct call `MarketAPI.advance(F)V` либо concrete
+  `Market.advance(F)V`.
+
+Каждый call site заменяется синхронным wrapper-вызовом с тем же receiver и `float amount` на
+operand stack. Wrapper всегда вызывает original market до возврата. Поэтому не меняются:
+
+- число и порядок direct calls;
+- thread и синхронный post-call contract;
+- exception propagation;
+- callback cadence;
+- save state.
+
+Изменения, которые мод теоретически может наблюдать: дополнительный wrapper frame в stack,
+изменённые class bytes до JVM definition и небольшой sampling overhead. Self-integrity моды могут
+отказаться принимать transformed bytes; structural/loader ошибка в таком классе даёт fail-open и
+оставляет его bytecode vanilla. Reflection/MethodHandle calls не требуют переписывания call site:
+entry probe concrete `Market.advance` классифицирует их как bounded `UNKNOWN_DIRECT` samples.
+
+## Контракт staggered remote-market scheduler
+
+`patch.remoteMarketScheduler` — намеренно performance-first и является исключением из общего
+правила неизменной callback frequency. Structural matcher принимает только единственный
+`MarketAPI.advance(F)V` call site центрального market-loop `Economy.advance(F)V`, добавляет один
+frame hook и обязательный reentrant scratch scope. Save flush сопоставляется отдельно в точном
+save-manager method; отсутствие любой границы отключает только соответствующий patch target.
+
+Runtime state keyed по identity `MarketAPI`, потому что vanilla `Market` уже переопределяет
+`equals/hashCode`. State process-local, очищается на two-phase CampaignEngine generation boundary и
+не входит в XStream graph. Stable phase зависит от market id и process identity, поэтому phase может
+измениться после reload, но суммарное elapsed time и hot-policy semantics сохраняются.
+
+Совместимость модов ограничена сознательно:
+
+- scheduler не откладывает и не объединяет direct `MarketAPI.advance()` calls; включённый
+  observer может обернуть их только синхронной observation-инструментацией;
+- current-location, interaction и player-owned policies проверяются до deferral;
+- memory opt-out имеет bounded audit delay;
+- nested `Economy.advance()` и повторный/reentrant market call fail-open выполняются немедленно;
+- callback count и RNG sequence удалённых market plugins не считаются совместимым контрактом;
+- save boundary сначала применяет pending debt и только затем продолжает vanilla serialization.
+
 ## Ограничения
 
 Статический анализ не может доказать намерение произвольного стороннего патча. Если target

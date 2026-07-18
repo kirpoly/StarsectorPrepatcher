@@ -89,9 +89,10 @@ Prepatcher не изменяет формат сохранений, а его ru
 
 - sector, system и Intel map: reconciliation, spatial candidates, callbacks, hover, entity indexes,
   nebula metadata, scratch collections и grid LOD;
-- campaign и economy: lifecycle-bound кэши, listener refresh, reusable snapshots, подавление
-  повторного удаления уже отсутствующего commodity event mod, fast paths для пустых scripts/Memory
-  и comm-relay candidates;
+- campaign и economy: lifecycle-bound кэши, listener refresh, reusable snapshots, агрессивный
+  staggered scheduler удалённых рынков, observation прямых mod-вызовов `Market.advance()`,
+  подавление повторного удаления уже отсутствующего commodity event mod, fast paths для пустых
+  scripts/Memory и comm-relay candidates;
 - routing: упорядоченные jump-point/system indexes с vanilla selection/fallback;
 - combat и particles: внутренние scratch collections и стабильная deferred cleanup;
 - loading/save: literal parsing, progress redraw и исправления output path;
@@ -114,6 +115,17 @@ enabled=false
 профилях после подтверждённых ошибок запуска миссий. Они не будут включены снова до отдельного
 исправления и изолированного startup/mission-прогона.
 
+`patch.remoteMarketScheduler` включён в default/aggressive profile и намеренно меняет cadence
+`MarketAPI.advance()` для удалённых рынков. Текущая location, interaction market и player-owned
+рынки остаются full-rate; отдельный рынок можно исключить через memory key
+`$starsectorPrepatcher_fullRateMarket=true`. Для максимально консервативного поведения используйте
+`profiles/safe.properties` или выключите этот переключатель.
+
+`patch.directMarketObservation` также включён в default/aggressive profile на время цикла разработки
+`0.9.2`. Он не throttling-ует прямые вызовы модов: каждый вызов остаётся синхронным и немедленным.
+Результаты записываются в `logs/direct-market-observe/session-*/`. После сбора данных переключатель
+стоит выключить, чтобы убрать sampling overhead.
+
 Для удаления записи vanilla запустите `uninstall-agent.bat`, для FR —
 `uninstall-agent.bat -Target FasterRendering`, для обоих файлов —
 `uninstall-agent.bat -Target Both`. Каждый изменяемый файл предварительно сохраняется в backup.
@@ -124,6 +136,7 @@ Runtime-логи:
 
 ```text
 mods\StarsectorPrepatcher\logs\prepatcher.log
+mods\StarsectorPrepatcher\logs\direct-market-observe\session-*\
 ```
 
 Agent пишет `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, `SKIPPED_LOADER` или

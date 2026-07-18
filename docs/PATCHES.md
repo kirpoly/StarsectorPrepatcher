@@ -37,6 +37,8 @@ Hyperspace-патчи проходят тот же независимый struct
 | `patch.routeJumpPointIndex` | route widget | ordered jump/system candidates | original filter/distance/tie loop |
 | `patch.economyLocationCache` | `Economy.advance` | omit only redundant automatic dirty write | explicit mod dirty state authoritative |
 | `patch.economySnapshotReuse` | Economy/Market | reusable market/condition/industry snapshots | callback cadence/order unchanged |
+| `patch.remoteMarketScheduler` | `Economy.advance` + pre-save boundary | stable-phase full-market scheduling with exact accumulated amount | direct mod calls immediate; hot markets full-rate; callback cadence of remote markets intentionally changes |
+| `patch.directMarketObservation` | mod call sites + concrete `Market.advance` entry | observation-only synchronous wrappers, sampled inclusive timing and stack attribution | no delay/merge/suppression; original amount, multiplicity, thread and exceptions preserved |
 | `patch.commodityEventModDirtyCache` | `CommodityOnMarket.reapplyEventMod` | skip repeated removal after zero quantity proved private `eMod` absent | first zero call/load and the complete nonzero remove/calculate/add path stay vanilla; direct external mutation of the private key is unsupported |
 | `patch.commRelaySystemIndex` | `IntelManager` | conservative spatial system candidates + TTL position audit | original order/live relay checks; bounded coordinate staleness |
 | `patch.shipAdvanceScratch` | `Ship.advance` | reuse 3 lists + command snapshot + 2 sets | fresh listener snapshot, no API objects pooled |
@@ -50,6 +52,102 @@ Hyperspace-патчи проходят тот же независимый struct
 Оба startup-патча остаются в коде и structural/runtime suites, но все поставляемые профили держат
 их выключенными. Они не возвращаются в default/safe/aggressive до изолированного исправления и
 успешного startup/mission прогона каждого переключателя по отдельности.
+
+### Агрессивный remote-market scheduler
+
+`patch.remoteMarketScheduler` меняет только один engine call site — интерфейсный вызов
+`MarketAPI.advance(amount)` внутри ordered snapshot-loop `Economy.advance()`. Прямые вызовы
+`MarketAPI.advance()` из модов и других engine paths остаются vanilla-immediate.
+
+Настройки default/aggressive profile:
+
+```properties
+patch.remoteMarketScheduler=true
+market.remote.frames=4
+market.remote.hiddenFrames=8
+market.remote.maxDeferredFrames=8
+market.remote.maxDeferredGameDays=0.02
+market.hot.currentLocation=true
+market.hot.playerOwned=true
+market.hot.interaction=true
+market.remote.policyAuditFrames=60
+market.remote.fullRateMemoryKey=$starsectorPrepatcher_fullRateMarket
+```
+
+Для skipped frame исходный `amount` суммируется. При stable phase, safety cap, переходе в hot state
+или pre-save flush рынок получает полный накопленный interval одним вызовом. Новый рынок всегда
+получает первый вызов немедленно. Due markets по-прежнему вызываются в исходном порядке market
+snapshot; scheduler не запускает background threads и не сериализует state.
+
+Performance-first компромиссы:
+
+- frame-count callback cadence удалённых conditions/industries/submarkets уменьшается;
+- RNG sequence plugin'ов, вызывающих random один раз на callback, может измениться;
+- точное состояние, наблюдаемое одним рынком у другого между staggered phases, может отставать на
+  ограниченное окно;
+- direct mutation memory opt-out может стать видимой не позднее `policyAuditFrames`;
+- накопленный elapsed time сохраняется, но plugin, игнорирующий `amount` и считающий callbacks,
+  поведёт себя иначе.
+
+Full-rate остаются текущая location, interaction market, player-owned markets и рынки с:
+
+```java
+market.getMemoryWithoutUpdate().set(
+        "$starsectorPrepatcher_fullRateMarket", true);
+```
+
+`profiles/safe.properties` отключает scheduler. Nested/reentrant `Economy.advance()` определяется
+через reentrant scope и полностью уходит в immediate fallback, не меняя frame context внешнего
+прохода.
+
+### Level 1: observation прямых mod-вызовов Market.advance
+
+`patch.directMarketObservation` не является scheduler-патчем. Он предназначен для диагностического
+прогона перед проектированием robust direct-call policy и **не меняет cadence или результат**
+прямых вызовов.
+
+Отдельный transformer рассматривает mod bytecode и заменяет только прямые вызовы:
+
+```text
+invokeinterface MarketAPI.advance(F)V
+invokevirtual   Market.advance(F)V
+```
+
+на typed wrapper, который:
+
+1. записывает site ID и дешёвые counters;
+2. при выбранном sampling измеряет inclusive время и снимает stack;
+3. синхронно вызывает исходный `market.advance(amount)` в том же потоке;
+4. сохраняет multiplicity, float `amount`, порядок и exception propagation.
+
+Concrete vanilla `Market.advance(float)` дополнительно имеет дешёвый entry probe. Calls от
+central scheduler, его fail-open пути, pre-save flush и instrumented mod sites помечаются через
+`ThreadLocal` origin. Непомеченный вход классифицируется как `UNKNOWN_DIRECT` и получает только
+ограниченное число stack samples; это позволяет обнаруживать reflection/MethodHandle и
+нестандартные loaders.
+
+Настройки default/aggressive profile:
+
+```properties
+patch.directMarketObservation=true
+directMarket.timingSampleEvery=128
+directMarket.stackSampleEvery=2048
+directMarket.maxStacksPerSite=8
+directMarket.reportIntervalSeconds=15
+directMarket.maxSites=4096
+directMarket.unknownStackSamples=32
+```
+
+Каждый запуск создаёт отдельную session-директорию:
+
+```text
+logs/direct-market-observe/session-<UTC>-pid<PID>/
+```
+
+Для анализа нужны все файлы session вместе с `logs/prepatcher.log`. Observer не удерживает
+`MarketAPI` references, не пишет данные в save, работает только на daemon reporter thread и
+fail-open при любой telemetry/file ошибке. Ненулевой диагностический overhead принят по дизайну;
+`profiles/safe.properties` держит этот переключатель выключенным.
 
 ## Hyperspace
 
@@ -67,7 +165,7 @@ Hyperspace-патчи проходят тот же независимый struct
 
 - storm/automaton update throttling;
 - dropped simulation debt;
-- callback-frequency changes;
+- неявные callback-frequency changes вне явно документированного `patch.remoteMarketScheduler`;
 - public combat-grid reuse;
 - generic particle object pooling;
 - fleet-pair broadphase без runtime parity harness;

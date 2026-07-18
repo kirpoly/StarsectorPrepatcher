@@ -66,6 +66,10 @@ public final class StructuralCompatibilityTest {
                 "patch.startupLogAggregation must remain disabled when configuration is missing");
         require(!defaults.commodityEventModDirtyCache,
                 "behavior-changing commodity cache must remain disabled when configuration is missing");
+        require(!defaults.remoteMarketScheduler,
+                "remote-market scheduler must remain disabled when configuration is missing");
+        require(!defaults.directMarketObservation,
+                "direct-market observation must remain disabled when configuration is missing");
         PrepatcherConfig config = PrepatcherConfig.load(configPath);
 
         int jars = 0;
@@ -804,8 +808,13 @@ public final class StructuralCompatibilityTest {
                 expected.put("updateEconomyLocationMapIfNeeded", 1);
                 expected.put("borrowEconomyMarketsSnapshot", 2);
                 expected.put("borrowEconomyCollectionSnapshot", 1);
+                expected.put("beginRemoteMarketFrame", 1);
+                expected.put("advanceMarketScheduled", 1);
             }
-            case PrepatcherTransformer.MARKET -> expected.put("borrowEconomyCollectionSnapshot", 2);
+            case PrepatcherTransformer.MARKET -> {
+                expected.put("borrowEconomyCollectionSnapshot", 2);
+                expected.put("observeMarketAdvanceEntry", 1);
+            }
             case PrepatcherTransformer.COMMODITY_ON_MARKET -> {
                 // Inline dirty cache; no cross-loader hook is required.
             }
@@ -851,7 +860,7 @@ public final class StructuralCompatibilityTest {
             case PrepatcherTransformer.PROGRESS_INPUT, PrepatcherTransformer.PROGRESS_OUTPUT ->
                     expected.put("saveLoadProgressMinIntervalSeconds", 1);
             case PrepatcherTransformer.CAMPAIGN_GAME_MANAGER -> {
-                // This patch removes a redundant constructor chain and therefore has no runtime hook.
+                expected.put("flushRemoteMarketsBeforeSave", 1);
             }
             case HyperspacePatches.BASE_TILED ->
                     assertHookCount(bytes, HYPERSPACE_HOOKS, "seededRandom", 3);

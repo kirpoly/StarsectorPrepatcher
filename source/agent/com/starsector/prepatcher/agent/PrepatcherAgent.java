@@ -67,6 +67,15 @@ public final class PrepatcherAgent {
             exportInternalAsm(instrumentation);
             ClassFileTransformer transformer = new PrepatcherTransformer(config, runtimeLoader);
             instrumentation.addTransformer(transformer, false);
+            if (config.directMarketObservation) {
+                instrumentation.addTransformer(
+                        new DirectMarketObserveTransformer(config, runtimeLoader, modRoot), false);
+                System.setProperty("starsector.prepatcher.directMarketObservation", "enabled");
+                PrepatcherLog.info("Direct Market.advance observation transformer installed; "
+                        + "mod call sites remain synchronous and are only measured.");
+            } else {
+                System.setProperty("starsector.prepatcher.directMarketObservation", "disabled");
+            }
             System.setProperty("starsector.prepatcher.status", "transformer-installed");
             PrepatcherLog.info("Unified transformer installed. Each patch will be matched, applied,"
                     + " and verified independently as its target class loads.");

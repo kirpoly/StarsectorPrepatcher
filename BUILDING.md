@@ -35,7 +35,7 @@ agent JAR как обычные entries `com/fs/starfarer/api/StarsectorPrepatch
 не должен иметь на них статических ссылок: `RuntimeInstaller` читает эти entries как bytes и через
 `MethodHandles.Lookup.defineClass()` определяет их в system/game loader. Build завершается ошибкой,
 если в JAR нет обязательных top-level entries или exact inventory текущего payload отличается от
-48 top-level/nested class entries:
+55 top-level/nested class entries:
 
 ```text
 com/fs/starfarer/api/StarsectorPrepatcherHooks.class
@@ -80,7 +80,8 @@ Linux/macOS:
 4. трансформирует `starfarer_obf.jar`, `fs.common_obf.jar`, `fs.sound_obf.jar` в памяти;
 5. выполняет ASM `Analyzer + BasicVerifier` для concrete methods;
 6. проверяет idempotency/ownership/negative structural cases;
-7. запускает lifecycle, exp6, exp8 и loading/save runtime suites;
+7. запускает lifecycle, exp6, exp8, remote-market scheduler, direct-market observation и
+   loading/save runtime suites;
 8. проверяет локальные structural contracts hyperspace targets из `starfarer.api.jar` и
    `starfarer_obf.jar` той установки, где находится мод — оригинальной либо переводной;
 9. проверяет target-loader runtime: состав payload, порядок определения nest members, vanilla
@@ -94,7 +95,8 @@ profile и только там включает known-disabled loading/startup p
 поставляемых профилях оба проблемных переключателя остаются `false`.
 
 Сырые отчёты `documentation-consistency.txt`, `structural-verification.txt`,
-`runtime-regression.txt`, `hyperspace-verification.txt`, `startup-smoke.txt` и
+`direct-market-transformer.txt`, `runtime-regression.txt`, `hyperspace-verification.txt`,
+`startup-smoke.txt` и
 `faster-rendering-loader-smoke.txt` создаются в `.build/reports/` и намеренно не входят в
 документацию или дистрибутив. Если `fr.jar` отсутствует, FR smoke явно получает `SKIPPED`; такой
 результат допустим для обычной разработки, но не для выпуска с заявленной FR-совместимостью.

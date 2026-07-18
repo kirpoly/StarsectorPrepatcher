@@ -31,6 +31,8 @@ public final class PrepatcherConfig {
     public final boolean economyLocationCache;
     public final boolean economySnapshotReuse;
     public final boolean commodityEventModDirtyCache;
+    public final boolean remoteMarketScheduler;
+    public final boolean directMarketObservation;
     public final boolean commRelaySystemIndex;
     public final boolean shipAdvanceScratch;
     public final boolean particleCleanup;
@@ -61,6 +63,21 @@ public final class PrepatcherConfig {
     public final int campaignListenerAuditMs;
     public final int routeIndexTtlMs;
     public final int commRelayIndexTtlMs;
+    public final int remoteMarketFrames;
+    public final int remoteMarketHiddenFrames;
+    public final int remoteMarketMaxDeferredFrames;
+    public final float remoteMarketMaxDeferredGameDays;
+    public final boolean remoteMarketHotCurrentLocation;
+    public final boolean remoteMarketHotPlayerOwned;
+    public final boolean remoteMarketHotInteraction;
+    public final int remoteMarketPolicyAuditFrames;
+    public final String remoteMarketFullRateMemoryKey;
+    public final int directMarketTimingSampleEvery;
+    public final int directMarketStackSampleEvery;
+    public final int directMarketMaxStacksPerSite;
+    public final int directMarketReportIntervalSeconds;
+    public final int directMarketMaxSites;
+    public final int directMarketUnknownStackSamples;
     public final int statsLogIntervalSeconds;
     public final int saveLoadProgressHz;
     public final int starfieldRemoveAllThreshold;
@@ -88,6 +105,8 @@ public final class PrepatcherConfig {
         economyLocationCache = bool("patch.economyLocationCache", true);
         economySnapshotReuse = bool("patch.economySnapshotReuse", true);
         commodityEventModDirtyCache = bool("patch.commodityEventModDirtyCache", false);
+        remoteMarketScheduler = bool("patch.remoteMarketScheduler", false);
+        directMarketObservation = bool("patch.directMarketObservation", false);
         commRelaySystemIndex = bool("patch.commRelaySystemIndex", true);
         shipAdvanceScratch = bool("patch.shipAdvanceScratch", true);
         particleCleanup = bool("patch.particleCleanup", true);
@@ -118,6 +137,30 @@ public final class PrepatcherConfig {
         campaignListenerAuditMs = integer("campaign.listenerAuditMs", 1000, 0, 60_000);
         routeIndexTtlMs = integer("route.indexTtlMs", 250, 0, 60_000);
         commRelayIndexTtlMs = integer("commRelay.indexTtlMs", 250, 0, 60_000);
+        remoteMarketFrames = integer("market.remote.frames", 4, 1, 120);
+        remoteMarketHiddenFrames = integer("market.remote.hiddenFrames", 8, 1, 240);
+        remoteMarketMaxDeferredFrames = integer("market.remote.maxDeferredFrames", 8, 1, 240);
+        remoteMarketMaxDeferredGameDays = decimal(
+                "market.remote.maxDeferredGameDays", 0.02f, 0f, 30f);
+        remoteMarketHotCurrentLocation = bool("market.hot.currentLocation", true);
+        remoteMarketHotPlayerOwned = bool("market.hot.playerOwned", true);
+        remoteMarketHotInteraction = bool("market.hot.interaction", true);
+        remoteMarketPolicyAuditFrames = integer(
+                "market.remote.policyAuditFrames", 60, 1, 36_000);
+        remoteMarketFullRateMemoryKey = string(
+                "market.remote.fullRateMemoryKey", "$starsectorPrepatcher_fullRateMarket");
+        directMarketTimingSampleEvery = integer(
+                "directMarket.timingSampleEvery", 128, 0, 1_000_000);
+        directMarketStackSampleEvery = integer(
+                "directMarket.stackSampleEvery", 2048, 0, 10_000_000);
+        directMarketMaxStacksPerSite = integer(
+                "directMarket.maxStacksPerSite", 8, 0, 128);
+        directMarketReportIntervalSeconds = integer(
+                "directMarket.reportIntervalSeconds", 15, 1, 3600);
+        directMarketMaxSites = integer(
+                "directMarket.maxSites", 4096, 16, 65_536);
+        directMarketUnknownStackSamples = integer(
+                "directMarket.unknownStackSamples", 32, 0, 4096);
         statsLogIntervalSeconds = integer("logging.statsIntervalSeconds", 30, 0, 3600);
         saveLoadProgressHz = integer("saveLoad.progressHz", 15, 0, 240);
         starfieldRemoveAllThreshold = integer("starfield.removeAllThreshold", 8, 1, 4096);
@@ -173,5 +216,11 @@ public final class PrepatcherConfig {
             PrepatcherLog.warn("Invalid float for " + key + ": " + value + "; using " + fallback);
             return fallback;
         }
+    }
+
+    private String string(String key, String fallback) {
+        String value = properties.getProperty(key);
+        if (value == null) return fallback;
+        return value.trim();
     }
 }

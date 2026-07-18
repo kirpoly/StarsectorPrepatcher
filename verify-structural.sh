@@ -58,6 +58,10 @@ java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
   "$VERIFICATION_CONFIG" "${CORE_JARS[@]}" \
   2>&1 | tee "$REPORT_DIR/structural-verification.txt"
 
+java "${EXPORTS[@]}" -cp "$TEST_CLASSES:$TEST_CP" \
+  com.starsector.prepatcher.agent.DirectMarketObserveTransformerTest \
+  2>&1 | tee "$REPORT_DIR/direct-market-transformer.txt"
+
 RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/starfarer.api.jar:$CORE/starfarer_obf.jar:$CORE/fs.common_obf.jar:$CORE/fs.sound_obf.jar:$CORE/lwjgl.jar:$CORE/lwjgl_util.jar"
 {
   echo '== LifecycleGcRegressionTest =='
@@ -66,6 +70,10 @@ RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/st
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.Exp6RuntimeRegressionTest
   echo '== Exp8RuntimeRegressionTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.Exp8RuntimeRegressionTest
+  echo '== RemoteMarketSchedulerRuntimeTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.RemoteMarketSchedulerRuntimeTest
+  echo '== DirectMarketObservationRuntimeTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.DirectMarketObservationRuntimeTest
   echo '== LoadingSaveRuntimeRegressionTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.LoadingSaveRuntimeRegressionTest
 } 2>&1 | tee "$REPORT_DIR/runtime-regression.txt"

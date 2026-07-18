@@ -16,7 +16,64 @@
 
 ## [Unreleased]
 
-Пока нет пользовательских изменений после `0.9.1`.
+Изменения этой секции предназначены для `0.9.2`; публичная версия пока остаётся `0.9.1`.
+
+### Добавлено
+
+- `patch.remoteMarketScheduler` перенаправляет только центральный market-loop
+  `Economy.advance()` в staggered scheduler. Удалённые рынки получают накопленный исходный
+  `amount` на стабильных фазах; скрытые рынки имеют отдельный более редкий cadence.
+- Перед сохранением pending market time принудительно применяется, а transient scheduler state
+  остаётся вне save graph.
+- Добавлены full-rate политики для текущей location, interaction market, player-owned markets и
+  per-market memory opt-out `$starsectorPrepatcher_fullRateMarket`.
+- Добавлены runtime counters и differential regression suite для cadence, amount conservation,
+  hidden markets, hot policies, save flush, identity-keyed state и reentrancy fallback.
+- `patch.directMarketObservation` инструментирует прямые вызовы
+  `MarketAPI.advance(float)` в загружаемом bytecode модов, не откладывая, не объединяя и не
+  подавляя исходный синхронный вызов.
+- Для каждого call site записываются JAR/source, class, method, descriptor, line, ordinal и
+  best-effort классификация источника `amount`.
+- Добавлены выборочное измерение inclusive времени, sampled stack signatures, приблизительное
+  число затронутых рынков, recursive/error/amount counters и отдельный учёт неизвестных
+  reflective/неинструментированных входов в vanilla `Market.advance()`.
+- Каждая игровая сессия получает отдельный каталог
+  `logs/direct-market-observe/session-*` с `call-sites.csv`, `observations.csv`, `stacks.csv`,
+  `unknown-stacks.csv`, `summary.csv` и `session.json`.
+- Добавлены structural и runtime regression tests, подтверждающие исходную multiplicity,
+  delivered amount, exception propagation, mod-loader transformation и CSV output.
+
+### Изменено
+
+- Default/aggressive profile теперь сознательно выбирает performance-first cadence для удалённых
+  рынков: обычные рынки обновляются примерно раз в 4 кадра, скрытые — раз в 8 кадров, с
+  ограничением накопленного времени и числа отложенных вызовов.
+- Scheduler state переведён на campaign-lifetime identity map: vanilla `Market` переопределяет
+  `equals/hashCode`, поэтому equality-keyed map не подходит для независимого состояния рынков.
+- `Economy.advance()` всегда получает reentrant scratch scope; nested вызов экономики полностью
+  уходит в immediate vanilla path и не перезаписывает контекст внешнего прохода.
+
+### Поведение
+
+- Частота `MarketAPI.advance()` для удалённых рынков намеренно уменьшается. Суммарное игровое время
+  сохраняется, но RNG sequence, точный межрыночный порядок наблюдений и frame-count callbacks
+  модовых conditions/industries/submarkets могут измениться.
+- Observation mode не является scheduler: инструментированные прямые вызовы модов выполняются
+  немедленно в текущем потоке, а код после `advance()` видит уже обновлённый рынок как прежде.
+- Измерение времени выполняется выборочно (`1/128` по умолчанию), stack capture — на первом и затем
+  редких вызовах (`1/2048`), чтобы наблюдатель не стал новым market bottleneck.
+- `profiles/safe.properties` оставляет scheduler и observation выключенными; default/aggressive
+  включает их для performance-first cadence и временного сбора данных.
+
+### Исправлено
+
+- Pending time не теряется на обычной границе save: save manager вызывает flush до сериализации.
+- Custom/vanilla market equality больше не объединяет scheduler state разных экземпляров.
+
+### Документация
+
+- Описаны настройки агрессивного scheduler, opt-out memory key, ожидаемые изменения поведения
+  модов и обязательные validation-сценарии.
 
 ## [0.9.1] - 2026-07-18
 
