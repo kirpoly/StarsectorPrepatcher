@@ -32,10 +32,12 @@ The distribution contains a sandbox-safe mod bootstrap and one startup agent:
 agent/StarsectorPrepatcherAgent.jar
 ```
 
-The agent matches and verifies every patch independently, including the hyperspace patches. It does
-not use whole-class hashes. It checks whichever game files are installed, original or localized,
-and accepts them when the local bytecode contract still matches. Unknown, ambiguous, or partially
-changed sites remain vanilla and the reason is written to the diagnostic log.
+The agent matches and verifies every patch independently, including the hyperspace patches. Most
+patches use local structural contracts, so compatible original or localized game files are accepted.
+The integrated FastForward Presentation Patch `1.1.0` is the deliberate exception: its call-site
+replacements require exact whole-class hashes and support only the current `starfarer_obf.jar` and
+`starfarer.api.jar` hashes listed in [`docs/PATCHES.md`](docs/PATCHES.md). Unknown, ambiguous, or
+changed targets remain vanilla and the reason is written to the diagnostic log.
 
 The agent control code and the typed runtime are deliberately separated. At startup the agent reads
 the `com.fs.starfarer.api.StarsectorPrepatcher*` runtime classfiles from its own JAR and defines them
@@ -43,6 +45,10 @@ in the classloader that owns Starsector's API. This keeps hook arguments loader-
 the vanilla launcher and Faster Rendering's custom system classloader. The transformer is registered
 only after that runtime is installed successfully, and it skips a target whose loader differs from
 the runtime loader.
+
+Fast-forward presentation coalescing is registered inside this same startup agent and its hooks are
+part of the same game-loader runtime payload. It does not install or require a second javaagent; do
+not install the original standalone FastForward Presentation Patch agent alongside Prepatcher.
 
 The bootstrap plugin does not perform bytecode work. It exposes agent status through the normal game
 log and warns when the mod is enabled without the startup agent.
@@ -98,6 +104,8 @@ The prepatcher does not modify save data, and its runtime caches are never seria
   fast paths, and comm-relay candidates;
 - routing: ordered jump-point and system indexes with vanilla selection and fallback semantics;
 - combat and particles: internal scratch collections and stable deferred cleanup;
+- fast-forward presentation: final-substep coalescing for guarded campaign visuals and continuous
+  audio, with broader animation/fader/particle groups available only in the aggressive profile;
 - loading and save paths: literal parsing, progress redraw, and output-path fixes;
 - hyperspace: terrain culling, layer selection, seeded random reuse, owner-local automaton buffers,
   and moving-starfield cleanup.
@@ -116,6 +124,13 @@ enabled=false
 `patch.loadingTextReader` and `patch.startupLogAggregation` remain disabled in all supplied profiles
 because they participated in confirmed mission-startup failures. They will not be re-enabled until
 their fixes pass an isolated startup and mission suite.
+
+The default and safe profiles enable the exact-hash fast-forward presentation master, frame marker,
+and narrower visual/audio groups. Global animations, sensor faders, slipstream particles, and
+particle emitters remain opt-in because they can change callback, lifetime, RNG, or emission cadence;
+the aggressive profile enables them. `fastForward.visualTime=realtime` keeps presentation at one
+ordinary update per outer frame, while `simulation` accumulates substep time and may produce visible
+jumps. Simulation itself still runs on every substep.
 
 `patch.remoteMarketScheduler` is enabled in the default/aggressive profile and intentionally changes
 `MarketAPI.advance()` cadence for markets reached through the central economy loop. The current
@@ -149,9 +164,10 @@ mods\StarsectorPrepatcher\logs\direct-market-observe\session-*\
 ```
 
 The agent records `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, `SKIPPED_LOADER`, or
-`SKIPPED_ERROR` for every patch. Hyperspace targets use the same structural, per-patch status model
-as all other targets. `SKIPPED_LOADER` is a fail-open classloader guard and must be investigated
-before calling that launch path compatible.
+`SKIPPED_ERROR` for structural patches. Exact-build presentation targets additionally report
+`SKIPPED_CLASS_HASH` or `SKIPPED_CONTAINER_HASH`. Hyperspace targets use the same structural,
+per-patch status model as the other structural targets. Every skip is fail-open; `SKIPPED_LOADER`
+must be investigated before calling that launch path compatible.
 
 Run `verify-structural.bat` on Windows or `./verify-structural.sh` on Linux/macOS for the complete
 documentation, structural, negative/idempotency, lifecycle/GC, runtime, hyperspace, and agent

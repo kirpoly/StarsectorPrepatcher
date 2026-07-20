@@ -58,6 +58,11 @@ java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
   "$VERIFICATION_CONFIG" "${CORE_JARS[@]}" \
   2>&1 | tee "$REPORT_DIR/structural-verification.txt"
 
+java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
+  com.starsector.prepatcher.agent.FastForwardPresentationCompatibilityTest \
+  "$CORE/starfarer_obf.jar" "$CORE/starfarer.api.jar" \
+  2>&1 | tee "$REPORT_DIR/fast-forward-presentation-compatibility.txt"
+
 java "${EXPORTS[@]}" -cp "$TEST_CLASSES:$TEST_CP" \
   com.starsector.prepatcher.agent.DirectMarketObserveTransformerTest \
   2>&1 | tee "$REPORT_DIR/direct-market-transformer.txt"
@@ -83,6 +88,21 @@ RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/st
   echo '== LoadingSaveRuntimeRegressionTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.LoadingSaveRuntimeRegressionTest
 } 2>&1 | tee "$REPORT_DIR/runtime-regression.txt"
+
+{
+  echo '== FastForwardPresentationRuntimeTest =='
+  java -noverify -cp "$RUNTIME_CP" \
+    com.fs.starfarer.api.FastForwardPresentationRuntimeTest
+  echo '== FastForwardPresentationLoadedTargetPolicyTest =='
+  java -noverify -cp "$RUNTIME_CP" \
+    com.starsector.prepatcher.agent.FastForwardPresentationLoadedTargetPolicyTest
+} 2>&1 | tee "$REPORT_DIR/fast-forward-presentation-runtime.txt"
+
+java -noverify \
+  "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar=config=$MOD_ROOT/profiles/aggressive.properties" \
+  -cp "$RUNTIME_CP" \
+  com.starsector.prepatcher.runtime.FastForwardPresentationActualAgentSmokeTest \
+  2>&1 | tee "$REPORT_DIR/fast-forward-presentation-actual-agent.txt"
 
 java \
   -Dstarsector.prepatcher.sessionOrigin=temp-mod-smoke \

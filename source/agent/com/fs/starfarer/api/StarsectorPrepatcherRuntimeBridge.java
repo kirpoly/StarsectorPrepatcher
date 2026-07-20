@@ -21,6 +21,7 @@ public final class StarsectorPrepatcherRuntimeBridge {
         }
         StarsectorPrepatcherHooks.configure(config, modRoot);
         StarsectorPrepatcherHyperspaceHooks.configure(config);
+        StarsectorPrepatcherPresentationHooks.configure(config);
     }
 
     /** Loader-neutral registration endpoint used by the mod call-site transformer. */

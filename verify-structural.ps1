@@ -106,6 +106,26 @@ $structuralLines
 [IO.File]::WriteAllLines($structuralReport, [string[]] $structuralLines, $utf8)
 if ($structuralExitCode -ne 0) { throw 'Structural compatibility verification failed.' }
 
+$presentationCompatibilityReport = Join-Path $reportDir 'fast-forward-presentation-compatibility.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $presentationCompatibilityOutput = @(& java @exports -cp $classPath `
+        com.starsector.prepatcher.agent.FastForwardPresentationCompatibilityTest `
+        (Join-Path $core 'starfarer_obf.jar') `
+        (Join-Path $core 'starfarer.api.jar') 2>&1)
+    $presentationCompatibilityExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$presentationCompatibilityLines = @(
+    $presentationCompatibilityOutput | ForEach-Object { $_.ToString() })
+$presentationCompatibilityLines
+[IO.File]::WriteAllLines(
+    $presentationCompatibilityReport, [string[]] $presentationCompatibilityLines, $utf8)
+if ($presentationCompatibilityExitCode -ne 0) {
+    throw 'Fast-forward presentation compatibility verification failed.'
+}
+
 $directMarketTransformerReport = Join-Path $reportDir 'direct-market-transformer.txt'
 $ErrorActionPreference = 'Continue'
 try {
@@ -167,7 +187,52 @@ foreach ($test in @(
 $runtimeLines
 [IO.File]::WriteAllLines($runtimeReport, $runtimeLines, $utf8)
 
+$presentationRuntimeReport = Join-Path $reportDir 'fast-forward-presentation-runtime.txt'
+$presentationRuntimeLines = [System.Collections.Generic.List[string]]::new()
+foreach ($test in @(
+    'com.fs.starfarer.api.FastForwardPresentationRuntimeTest',
+    'com.starsector.prepatcher.agent.FastForwardPresentationLoadedTargetPolicyTest'
+)) {
+    $presentationRuntimeLines.Add("== $test ==")
+    $ErrorActionPreference = 'Continue'
+    try {
+        $presentationRuntimeOutput = @(& java -noverify -cp $runtimeCp $test 2>&1)
+        $presentationRuntimeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
+    $presentationRuntimeLines.AddRange([string[]] @(
+        $presentationRuntimeOutput | ForEach-Object { $_.ToString() }))
+    if ($presentationRuntimeExitCode -ne 0) {
+        [IO.File]::WriteAllLines(
+            $presentationRuntimeReport, $presentationRuntimeLines, $utf8)
+        throw "Fast-forward presentation runtime test failed: $test"
+    }
+}
+$presentationRuntimeLines
+[IO.File]::WriteAllLines(
+    $presentationRuntimeReport, $presentationRuntimeLines, $utf8)
+
 $mainAgentJar = Join-Path $modRoot 'agent\StarsectorPrepatcherAgent.jar'
+$presentationAgentReport = Join-Path $reportDir 'fast-forward-presentation-actual-agent.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $presentationAgentOutput = @(& java -noverify `
+        "-javaagent:$mainAgentJar=config=$(Join-Path $modRoot 'profiles\aggressive.properties')" `
+        -cp $runtimeCp `
+        com.starsector.prepatcher.runtime.FastForwardPresentationActualAgentSmokeTest 2>&1)
+    $presentationAgentExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$presentationAgentLines = @($presentationAgentOutput | ForEach-Object { $_.ToString() })
+$presentationAgentLines
+[IO.File]::WriteAllLines(
+    $presentationAgentReport, [string[]] $presentationAgentLines, $utf8)
+if ($presentationAgentExitCode -ne 0) {
+    throw 'Fast-forward presentation actual-agent smoke failed.'
+}
+
 $tempModAgentReport = Join-Path $reportDir 'temp-mod-actual-agent-smoke.txt'
 $ErrorActionPreference = 'Continue'
 try {

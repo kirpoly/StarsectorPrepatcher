@@ -84,6 +84,14 @@ public final class StructuralCompatibilityTest {
                 "behavior-changing temp-mod scheduler must remain disabled when configuration is missing");
         require(!defaults.economyPersistentSnapshots,
                 "behavior-changing persistent economy snapshots must remain disabled when configuration is missing");
+        require(!defaults.fastForwardGlobalAnimations,
+                "fast-forward global animation callbacks must remain disabled when configuration is missing");
+        require(!defaults.fastForwardSensorFaders,
+                "fast-forward sensor faders must remain disabled when configuration is missing");
+        require(!defaults.fastForwardSlipstreamParticles,
+                "fast-forward slipstream particles must remain disabled when configuration is missing");
+        require(!defaults.fastForwardParticleEmitters,
+                "fast-forward particle emitters must remain disabled when configuration is missing");
         PrepatcherConfig config = PrepatcherConfig.load(configPath);
 
         int jars = 0;

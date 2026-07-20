@@ -53,6 +53,26 @@ public final class PrepatcherConfig {
     public final boolean automatonBufferReuse;
     public final boolean starfieldCleanupBuffers;
     public final boolean starfieldLinearRemoval;
+    public final boolean fastForwardEnabled;
+    public final boolean fastForwardFrameMarker;
+    public final boolean fastForwardActionIndicators;
+    public final boolean fastForwardLocationVisuals;
+    public final boolean fastForwardFloatingText;
+    public final boolean fastForwardFleetView;
+    public final boolean fastForwardFleetPresentation;
+    public final boolean fastForwardSensorIndicators;
+    public final boolean fastForwardCelestialVisuals;
+    public final boolean fastForwardAuroraAnimation;
+    public final boolean fastForwardContinuousSound;
+    public final boolean fastForwardGateJitter;
+    public final boolean fastForwardGlobalAnimations;
+    public final boolean fastForwardSensorFaders;
+    public final boolean fastForwardSlipstreamParticles;
+    public final boolean fastForwardParticleEmitters;
+    public final boolean fastForwardGuardJar;
+    public final boolean fastForwardVerbose;
+    public final boolean fastForwardMetrics;
+    public final boolean fastForwardVisualTimeSimulation;
     public final int intelMapLocationCacheMs;
     public final int intelArrowDataCacheMs;
     public final int intelEntityIndexTtlMs;
@@ -142,6 +162,34 @@ public final class PrepatcherConfig {
         automatonBufferReuse = bool("patch.automatonBufferReuse", true);
         starfieldCleanupBuffers = bool("patch.starfieldCleanupBuffers", true);
         starfieldLinearRemoval = bool("patch.starfieldLinearRemoval", true);
+        fastForwardEnabled = bool("patch.fastForwardPresentation", true);
+        fastForwardFrameMarker = bool("patch.fastForwardFrameMarker", true);
+        fastForwardActionIndicators = bool("patch.fastForwardActionIndicators", true);
+        fastForwardLocationVisuals = bool("patch.fastForwardLocationVisuals", true);
+        fastForwardFloatingText = bool("patch.fastForwardFloatingText", true);
+        fastForwardFleetView = bool("patch.fastForwardFleetView", true);
+        fastForwardFleetPresentation = bool("patch.fastForwardFleetPresentation", true);
+        fastForwardSensorIndicators = bool("patch.fastForwardSensorIndicators", true);
+        fastForwardCelestialVisuals = bool("patch.fastForwardCelestialVisuals", true);
+        fastForwardAuroraAnimation = bool("patch.fastForwardAuroraAnimation", true);
+        fastForwardContinuousSound = bool("patch.fastForwardContinuousSound", true);
+        fastForwardGateJitter = bool("patch.fastForwardGateJitter", true);
+        fastForwardGlobalAnimations = bool("patch.fastForwardGlobalAnimations", false);
+        fastForwardSensorFaders = bool("patch.fastForwardSensorFaders", false);
+        fastForwardSlipstreamParticles = bool("patch.fastForwardSlipstreamParticles", false);
+        fastForwardParticleEmitters = bool("patch.fastForwardParticleEmitters", false);
+        fastForwardGuardJar = bool("fastForward.guardJar", true);
+        fastForwardVerbose = bool("fastForward.verbose", true);
+        fastForwardMetrics = bool("fastForward.metrics", false);
+        String fastForwardVisualTime = string("fastForward.visualTime", "realtime")
+                .toLowerCase(Locale.ROOT);
+        if (!fastForwardVisualTime.equals("realtime")
+                && !fastForwardVisualTime.equals("simulation")) {
+            PrepatcherLog.warn("Invalid fastForward.visualTime: " + fastForwardVisualTime
+                    + "; using realtime");
+            fastForwardVisualTime = "realtime";
+        }
+        fastForwardVisualTimeSimulation = fastForwardVisualTime.equals("simulation");
         intelMapLocationCacheMs = integer("intel.mapLocationCacheMs", 120, 0, 10_000);
         intelArrowDataCacheMs = integer("intel.arrowDataCacheMs", 120, 0, 10_000);
         intelEntityIndexTtlMs = integer("intel.entityIndexTtlMs", 500, 0, 60_000);

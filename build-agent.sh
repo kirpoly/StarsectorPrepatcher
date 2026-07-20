@@ -39,6 +39,7 @@ REQUIRED_RUNTIME_PAYLOAD=(
   'com/fs/starfarer/api/StarsectorPrepatcherHyperspaceHooks.class'
   'com/fs/starfarer/api/StarsectorPrepatcherRuntimeBridge.class'
   'com/fs/starfarer/api/StarsectorPrepatcherTempModHooks.class'
+  'com/fs/starfarer/api/StarsectorPrepatcherPresentationHooks.class'
 )
 for payload_entry in "${REQUIRED_RUNTIME_PAYLOAD[@]}"; do
   if ! grep -Fqx "$payload_entry" "$AGENT_ENTRIES"; then
@@ -46,7 +47,7 @@ for payload_entry in "${REQUIRED_RUNTIME_PAYLOAD[@]}"; do
     exit 1
   fi
 done
-EXPECTED_RUNTIME_PAYLOAD_COUNT=64
+EXPECTED_RUNTIME_PAYLOAD_COUNT=67
 runtime_payload_count="$(grep -Ec '^com/fs/starfarer/api/StarsectorPrepatcher[^/]*\.class$' "$AGENT_ENTRIES" || true)"
 if [[ "$runtime_payload_count" -ne "$EXPECTED_RUNTIME_PAYLOAD_COUNT" ]]; then
   echo "Target-loader runtime payload inventory changed: expected $EXPECTED_RUNTIME_PAYLOAD_COUNT class entries, found $runtime_payload_count." >&2

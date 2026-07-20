@@ -16,6 +16,45 @@
 
 ## [Unreleased]
 
+### Объединено
+
+- FastForward Presentation Patch `1.1.0` интегрирован как exact-build transformer внутри единого
+  `StarsectorPrepatcherAgent.jar`. Его hooks входят в общий target/game-loader runtime payload;
+  отдельный FFP-agent, вторая `-javaagent` запись и дублирующая startup-инфраструктура не нужны.
+- Presentation transformer регистрируется перед structural transformer Prepatcher, чтобы проверять
+  исходные bytes каждого target, сохраняя общий classloader guard для vanilla и Faster Rendering.
+
+### Добавлено
+
+- Master/frame marker и отдельные переключатели fast-forward coalescing для action/location/floating
+  text, fleet, sensor, celestial/aurora, continuous sound и gate presentation. Simulation продолжает
+  выполняться на каждом substep; подтверждённые presentation calls выполняются один раз на финальном
+  substep outer frame.
+- Опции `fastForward.visualTime`, `fastForward.guardJar`, `fastForward.verbose` и
+  `fastForward.metrics`. Режим `realtime` оставляет один обычный visual-time шаг, а opt-in
+  `simulation` накапливает время substeps и может давать заметные нелинейные скачки.
+- Global animations, sensor faders, slipstream particles и particle emitters выделены в aggressive
+  opt-in groups из-за возможных изменений callback/lifetime, RNG и emission cadence. Default/safe
+  profiles оставляют эти четыре группы выключенными.
+
+### Совместимость
+
+- Presentation targets поддерживаются только для текущих exact SHA-256 containers:
+  `starfarer_obf.jar` — `5dd222b9e266d2ac2d63b3dad4983eb05caaf5a247d7dfb82aaeba47ea774cc8`,
+  `starfarer.api.jar` — `a7ba18f3476ffe704729bd0a7a47443f035fea98a32ac2930eae8b391d013c2a`,
+  и зафиксированных whole-class hashes. Переводные, перепакованные и другие game builds этим
+  exact-hash блоком не объявляются совместимыми.
+- Несовпадение target/container hash оставляет original bytes со статусом
+  `SKIPPED_CLASS_HASH`/`SKIPPED_CONTAINER_HASH`. Отключение `fastForward.guardJar` снимает только
+  container guard; обязательный exact class hash сохраняется.
+- Уже загруженный presentation-only target получает локальный `SKIPPED_ALREADY_LOADED` и больше не
+  отменяет установку прежних structural patches. Если до premain уже загружен обязательный
+  `CampaignState` frame marker, выключается только presentation transformer.
+- Faster Rendering с пустым `CodeSource` проверяется через exact defining-loader JAR resource.
+  Классы, которые сам FR изменил до Instrumentation (в текущем `fr.jar` это, в частности,
+  `HyperspaceTerrainPlugin`), по-прежнему безопасно получают `SKIPPED_CLASS_HASH`; их независимые
+  structural patches продолжают применяться.
+
 ## [0.9.5] - 2026-07-18
 
 ### Объединено

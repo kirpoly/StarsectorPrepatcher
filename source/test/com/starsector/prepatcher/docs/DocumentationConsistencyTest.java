@@ -408,6 +408,9 @@ public final class DocumentationConsistencyTest {
         List<String> reports = List.of(
                 "documentation-consistency.txt",
                 "structural-verification.txt",
+                "fast-forward-presentation-compatibility.txt",
+                "fast-forward-presentation-runtime.txt",
+                "fast-forward-presentation-actual-agent.txt",
                 "direct-market-transformer.txt",
                 "runtime-regression.txt",
                 "temp-mod-actual-agent-smoke.txt",

@@ -13,6 +13,11 @@ Hyperspace-патчи проходят тот же независимый struct
 неизвестном или неоднозначном участке только соответствующий патч остаётся vanilla со статусом
 `SKIPPED_STRUCTURAL`, а остальные патчи рассматриваются независимо.
 
+Единственное намеренное исключение — интегрированный FastForward Presentation Patch `1.1.0`.
+Его call-site replacements используют whole-class SHA-256 и, по умолчанию, SHA-256 содержащего JAR.
+Этот блок поддерживает только exact game files, перечисленные ниже; structural-совместимость
+переводных или перепакованных JAR для него не заявляется.
+
 ## Main agent
 
 | Config | Target/область | Изменение | Основной compatibility-инвариант |
@@ -331,6 +336,77 @@ location path не выполняет synchronized lookup глобальной w
 `ReachEconomy.updateLocationMap()` всё равно вызывается каждый frame: explicit dirty flag мода
 остаётся authoritative. Unchanged periodic audit лишь переносит deadline и не создаёт новый
 fingerprint.
+
+## Fast-forward presentation coalescing
+
+| Config | Target/область | Изменение | Профиль и основной риск |
+|---|---|---|---|
+| `patch.fastForwardPresentation` | весь presentation-блок | master switch exact-hash transformer/runtime | safe/default/aggressive; выключение оставляет весь блок vanilla |
+| `patch.fastForwardFrameMarker` | `CampaignState.advance` | отмечает outer frame, номер и число simulation substeps | обязателен для всех групп; mismatch fast-forward flag немедленно прекращает дальнейшее coalescing в этом frame |
+| `patch.fastForwardActionIndicators` | `CampaignEngine` action indicators | один visual `advance` на последнем substep | safe/default; меняется только presentation cadence |
+| `patch.fastForwardLocationVisuals` | `BaseLocation` light fader, background/stars, particle group | visual refresh один раз за outer frame | safe/default; визуальные lifetime/скорость следуют выбранному visual time |
+| `patch.fastForwardFloatingText` | entity floating text, включая paused path | один visual `advance` на последнем substep | safe/default; текст не ускоряется вместе с simulation при `realtime` |
+| `patch.fastForwardFleetView` | `CampaignFleetView.advance` | один view refresh за outer frame | safe/default; промежуточные substep states не рисуются |
+| `patch.fastForwardFleetPresentation` | fleet layers/view clear/sensor range/pulse fader | объединяет fleet-only presentation work | safe/default; видимым остаётся финальное состояние outer frame |
+| `patch.fastForwardSensorIndicators` | selection/contact indicators | один indicator refresh на последнем substep | safe/default; selection bridge fail-open при marker mismatch |
+| `patch.fastForwardCelestialVisuals` | planets, jump-point rings/corona | объединяет графические animation calls | safe/default; nonlinear animation может отличаться при `simulation` visual time |
+| `patch.fastForwardAuroraAnimation` | terrain `AuroraRenderer` | один aurora refresh за outer frame | safe/default; промежуточная визуальная анимация пропускается |
+| `patch.fastForwardContinuousSound` | terrain, abilities, slipstream и gate loops/filters/music suppression | повторные audio refresh calls выполняются на финальном substep | safe/default; transient промежуточные audio parameters не подаются mixer'у |
+| `patch.fastForwardGateJitter` | gate faders/warp/jitter seed | объединяет gate-only visual updates | safe/default; jitter RNG обновляется один раз за outer frame |
+| `patch.fastForwardGlobalAnimations` | global `AnimationManager.advanceAll` | объединяет все global animation callbacks | **aggressive opt-in:** широкая callback/lifetime-семантика, возможны скачки и изменённая cadence |
+| `patch.fastForwardSensorFaders` | entity sensor faders | один fader update за outer frame | **aggressive opt-in:** может менять visibility/despawn timing |
+| `patch.fastForwardSlipstreamParticles` | slipstream particle add/advance | emission и particle advance только на финальном substep | **aggressive opt-in:** меняются density, lifetime, RNG и emission cadence |
+| `patch.fastForwardParticleEmitters` | gate/mote/coronal/Zig emitter intervals | interval advances только на финальном substep | **aggressive opt-in:** меняются spawn count/timing и RNG sequence |
+
+Simulation logic по-прежнему выполняется на каждом substep. Runtime coalescing действует только
+внутри подтверждённого multi-step outer frame и выполняет целевой presentation-call на последнем
+substep. Если frame marker, число шагов или `CampaignEngine.isFastForwardIteration()` расходятся с
+ожидаемой формой, runtime фиксирует mismatch до конца frame и с момента обнаружения выполняет
+последующие wrappers с vanilla cadence. Уже пропущенные calls ранних substeps намеренно не
+проигрываются задним числом; следующий `beginOuterFrame` полностью сбрасывает это состояние.
+
+Exact-build allowlist в этой интеграции ограничен следующими container SHA-256:
+
+```text
+starfarer_obf.jar  5dd222b9e266d2ac2d63b3dad4983eb05caaf5a247d7dfb82aaeba47ea774cc8
+starfarer.api.jar  a7ba18f3476ffe704729bd0a7a47443f035fea98a32ac2930eae8b391d013c2a
+```
+
+Каждый target дополнительно требует exact whole-class hash. При несовпадении class/JAR bytes патч
+этого target получает `SKIPPED_CLASS_HASH` или `SKIPPED_CONTAINER_HASH` и оставляет original bytes.
+`fastForward.guardJar=true` сохраняет обе проверки. Значение `false` отключает только container
+guard: exact class hash остаётся обязательным и поддержка другого build этим не заявляется.
+
+`fastForward.visualTime=realtime` передаёт финальному call обычный `amount`: визуальная/audio
+presentation идёт в реальном frame cadence, пока simulation ускорена. Значение `simulation`
+умножает `amount` на число substeps; оно сохраняет суммарное visual time, но может давать заметные
+скачки и нелинейные отличия. `fastForward.verbose` управляет подробными сообщениями об успешном
+применении; hash/loader/error skips всегда остаются видимыми. `fastForward.metrics` включает
+накопительные frame/substep/skip counters и потому по умолчанию
+выключен.
+
+Default и safe profiles включают master/frame marker и консервативные группы до gate jitter
+включительно; четыре bold-marked группы остаются `false`. Aggressive profile включает все группы,
+но не меняет `visualTime=realtime`. Название safe означает более узкую область риска, а не
+byte-for-byte visual parity: сама цель блока — намеренно убрать повторные presentation callbacks.
+
+Интеграция не устанавливает второй agent. Exact-hash transformer регистрируется внутри того же
+`StarsectorPrepatcherAgent.jar` перед structural transformer, а
+`StarsectorPrepatcherPresentationHooks` входит в общий target/game-loader runtime payload. Поэтому
+для vanilla и Faster Rendering сохраняется одно loader-identity правило и одна `-javaagent` запись;
+исходный отдельный FastForward Presentation Patch agent одновременно устанавливать не нужно.
+
+Ранняя загрузка presentation-only target не является причиной отменять прежний structural-блок:
+этот target получает `SKIPPED_ALREADY_LOADED` и остаётся vanilla, а остальные targets продолжают
+загружаться через оба transformer'а. Если уже загружен обязательный `CampaignState` frame marker,
+отключается только presentation transformer; structural patches всё равно устанавливаются.
+
+У Faster Rendering `ProtectionDomain.CodeSource` для `com.fs.*` пуст, поэтому container guard берёт
+точный `jar:` resource у defining loader и всё равно проверяет имя entry, bytes entry, имя JAR и
+SHA-256 всего JAR. Это не разрешает upstream-modified class bytes: если FR изменил target до вызова
+Instrumentation, exact whole-class hash даёт `SKIPPED_CLASS_HASH`. В текущем `fr.jar` так происходит
+с `HyperspaceTerrainPlugin`; его presentation-call остаётся vanilla, а независимые structural
+patches применяются своим transformer'ом.
 
 ## Hyperspace
 
