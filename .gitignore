@@ -1,4 +1,5 @@
 # Runtime output
 logs/*.log
 logs/direct-market-observe/
+logs/market-construction-diagnostics/
 .build/

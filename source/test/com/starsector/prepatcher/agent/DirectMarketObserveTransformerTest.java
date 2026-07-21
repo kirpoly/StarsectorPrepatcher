@@ -50,7 +50,7 @@ public final class DirectMarketObserveTransformerTest {
     }
 
     private static void run(Path root) throws Exception {
-        Path gameRoot = root.resolve("Starsector");
+        Path gameRoot = root.resolve("Starsector 0.98 Test");
         Path modsRoot = gameRoot.resolve("mods");
         Path prepatcherRoot = modsRoot.resolve("StarsectorPrepatcher");
         Path testModRoot = modsRoot.resolve("TestMod");
@@ -71,8 +71,13 @@ public final class DirectMarketObserveTransformerTest {
         StarsectorPrepatcherRuntimeBridge.configure(config, prepatcherRoot);
         ClassLoader parent = ClassLoader.getSystemClassLoader();
         ChildLoader loader = new ChildLoader(parent);
+        URL testModCodeSource = archiveCodeSource(testModJar);
+        require(testModCodeSource.toExternalForm().contains("Starsector 0.98 Test")
+                        && testModCodeSource.toExternalForm().endsWith("test.jar!/"),
+                "regression code source does not contain raw spaces and !/: "
+                        + testModCodeSource);
         ProtectionDomain domain = new ProtectionDomain(
-                new CodeSource(testModJar.toUri().toURL(),
+                new CodeSource(testModCodeSource,
                         (Certificate[]) null), null, loader, null);
         byte[] original = generateClass();
         DirectMarketObserveTransformer transformer =
@@ -106,7 +111,7 @@ public final class DirectMarketObserveTransformerTest {
                 "observer-only negative test no longer contains a direct Market.advance call");
 
         ProtectionDomain otherDomain = new ProtectionDomain(
-                new CodeSource(otherModJar.toUri().toURL(),
+                new CodeSource(archiveCodeSource(otherModJar),
                         (Certificate[]) null), null, loader, null);
         riskTransformer.transform(loader,
                 "test/mod/RiskyIndustry", null, otherDomain, generateRiskClass());
@@ -191,6 +196,15 @@ public final class DirectMarketObserveTransformerTest {
                 "float argument source was not classified");
         require(metadata.stream().anyMatch(value -> value.contains("CONST:1.0")),
                 "constant amount source was not classified");
+        for (String value : metadata) {
+            String[] fields = value.split(String.valueOf('\u001f'), -1);
+            require(fields.length >= 6
+                            && fields[2].equals("test_mod")
+                            && fields[3].equals("Test Mod Display")
+                            && fields[4].equals("TestMod")
+                            && fields[5].equals("test.jar"),
+                    "explicit mod identity was not resolved from raw file URL: " + value);
+        }
 
         Class<?> callerClass = loader.define(CLASS_NAME.replace('/', '.'), transformed);
         Object caller = callerClass.getConstructor().newInstance();
@@ -227,6 +241,11 @@ public final class DirectMarketObserveTransformerTest {
         System.out.println("OK direct-market-transformer callSites=" + hooks
                 + " calls=" + counter.calls
                 + " eager-manifest scheduler-sync-only semantic-risk-report");
+    }
+
+    private static URL archiveCodeSource(Path jar) throws Exception {
+        String encoded = jar.toUri().toURL().toExternalForm();
+        return new URL(encoded.replace("%20", " ") + "!/");
     }
 
     private static PrepatcherConfig config(boolean observation, boolean scheduler) throws Exception {

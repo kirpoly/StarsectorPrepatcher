@@ -27,6 +27,7 @@ import java.lang.instrument.ClassFileTransformer;
 import java.lang.reflect.Method;
 import java.net.URI;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -559,10 +560,9 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
     }
 
     private String sourceLabel(ProtectionDomain protectionDomain, ClassLoader loader) {
-        String raw = sourceLocation(protectionDomain);
-        if (!raw.isEmpty()) {
+        Path path = sourcePath(protectionDomain);
+        if (path != null) {
             try {
-                Path path = Path.of(new URI(raw)).toAbsolutePath().normalize();
                 if (modRoot != null) {
                     Path gameRoot = modRoot.getParent() == null ? null : modRoot.getParent().getParent();
                     if (gameRoot != null && path.startsWith(gameRoot)) {
@@ -571,9 +571,11 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
                 }
                 return sanitize(path.toString().replace('\\', '/'));
             } catch (Throwable ignored) {
-                return sanitize(raw);
+                // Fall through to the cleaned external URL below.
             }
         }
+        String raw = cleanSourceLocation(sourceLocation(protectionDomain));
+        if (!raw.isEmpty()) return sanitize(raw);
         return "loader:" + loaderName(loader);
     }
 
@@ -604,12 +606,48 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
     }
 
     private static Path sourcePath(ProtectionDomain protectionDomain) {
-        String raw = sourceLocation(protectionDomain);
+        String raw = cleanSourceLocation(sourceLocation(protectionDomain));
         if (raw.isEmpty()) return null;
         try {
+            URL url = new URL(raw);
+            if ("file".equalsIgnoreCase(url.getProtocol())) {
+                String decoded = decodeFileUrlPath(url.getPath());
+                if (java.io.File.separatorChar == '\\'
+                        && decoded.length() >= 3 && decoded.charAt(0) == '/'
+                        && Character.isLetter(decoded.charAt(1)) && decoded.charAt(2) == ':') {
+                    decoded = decoded.substring(1);
+                }
+                String authority = url.getAuthority();
+                if (authority != null && !authority.isBlank()
+                        && !"localhost".equalsIgnoreCase(authority)) {
+                    decoded = "//" + authority + (decoded.startsWith("/") ? decoded : "/" + decoded);
+                }
+                return Path.of(decoded).toAbsolutePath().normalize();
+            }
             return Path.of(new URI(raw)).toAbsolutePath().normalize();
         } catch (Throwable ignored) {
             return null;
+        }
+    }
+
+    private static String cleanSourceLocation(String raw) {
+        if (raw == null || raw.isEmpty()) return "";
+        String cleaned = raw;
+        int archiveSuffix = cleaned.lastIndexOf("!/");
+        if (archiveSuffix >= 0) cleaned = cleaned.substring(0, archiveSuffix);
+        else if (cleaned.endsWith("!")) cleaned = cleaned.substring(0, cleaned.length() - 1);
+        if (cleaned.regionMatches(true, 0, "jar:", 0, 4)) cleaned = cleaned.substring(4);
+        return cleaned;
+    }
+
+    private static String decodeFileUrlPath(String path) {
+        if (path == null || path.isEmpty()) return "";
+        try {
+            // URLDecoder has the desired UTF-8 percent decoding but treats '+'
+            // as form-space; quote literal plus signs before using it for a path.
+            return URLDecoder.decode(path.replace("+", "%2B"), StandardCharsets.UTF_8);
+        } catch (Throwable ignored) {
+            return path;
         }
     }
 
@@ -637,7 +675,7 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
         String name = sourcePath == null || sourcePath.getFileName() == null
                 ? "" : sourcePath.getFileName().toString();
         if (!name.toLowerCase(Locale.ROOT).endsWith(".jar")) {
-            String normalized = source == null ? "" : source.replace('\\', '/');
+            String normalized = cleanSourceLocation(source).replace('\\', '/');
             int slash = normalized.lastIndexOf('/');
             String tail = slash < 0 ? normalized : normalized.substring(slash + 1);
             name = tail.toLowerCase(Locale.ROOT).endsWith(".jar") ? tail : "";
