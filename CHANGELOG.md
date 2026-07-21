@@ -39,6 +39,10 @@
 
 ### Изменено
 
+- Во всех поставляемых профилях увеличены bounded safety-audit интервалы: economy structure до
+  `5000` ms, market structure/no-op industry до `600` frames, commodity temporal до `300` frames и
+  construction до `180` batches. Scheduler-enabled профили используют policy audit `300` batches;
+  safe не задаёт этот неиспользуемый при выключенном scheduler параметр.
 - Дорогие direct-market/construction/semantic-risk observers, CSV/stack sampling, verbose
   presentation logging, presentation metrics и периодический stats worker вынесены из default,
   safe и aggressive в отдельный `profiles/debug.properties`. Debug-профиль наследует все значения

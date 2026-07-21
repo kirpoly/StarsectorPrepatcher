@@ -83,6 +83,7 @@ public final class DocumentationConsistencyTest {
         checkChangelog(changelog, currentVersion);
         checkVersionConsumers(root, currentVersion);
         checkKnownDisabledStartupPatches(root);
+        checkAuditCadenceProfiles(root);
         checkDiagnosticProfileIsolation(root);
         checkReportLayout(root);
         checkChecksums(root);
@@ -360,11 +361,13 @@ public final class DocumentationConsistencyTest {
         String englishReadme = readUtf8(requiredFile(root.resolve("README.md")));
         String russianReadme = readUtf8(requiredFile(root.resolve("README_RU.md")));
         String languageHeader = "[English](README.md) | [Русский](README_RU.md)";
-        require(englishReadme.startsWith("# StarsectorPrepatcher\n")
+        require((englishReadme.startsWith("# StarsectorPrepatcher\n")
+                        || englishReadme.startsWith("# StarsectorPrepatcher\r\n"))
                         && englishReadme.contains(languageHeader)
                         && englishReadme.contains("Current version: **" + expected + "**"),
                 "README.md current version does not match mod_info.json " + expected);
-        require(russianReadme.startsWith("# StarsectorPrepatcher\n")
+        require((russianReadme.startsWith("# StarsectorPrepatcher\n")
+                        || russianReadme.startsWith("# StarsectorPrepatcher\r\n"))
                         && russianReadme.contains(languageHeader)
                         && russianReadme.contains("Текущая версия: **" + expected + "**"),
                 "README_RU.md identity/version does not match mod_info.json " + expected);
@@ -388,6 +391,37 @@ public final class DocumentationConsistencyTest {
             requirePropertyValue(relative, properties, "patch.loadingTextReader", "false");
             requirePropertyValue(relative, properties, "patch.startupLogAggregation", "false");
         }
+    }
+
+    private static void checkAuditCadenceProfiles(Path root) throws IOException {
+        Map<String, String> shared = Map.of(
+                "economy.structureAuditMs", "5000",
+                "market.structureAuditFrames", "600",
+                "commodity.temporalAuditFrames", "300",
+                "market.noOpIndustryAuditFrames", "600",
+                "market.remote.constructionAuditBatches", "180");
+        for (String relative : List.of(
+                "prepatcher.properties",
+                "profiles/safe.properties",
+                "profiles/aggressive.properties",
+                "profiles/debug.properties")) {
+            String properties = readUtf8(requiredFile(root.resolve(relative)));
+            for (Map.Entry<String, String> entry : shared.entrySet()) {
+                requirePropertyValue(relative, properties, entry.getKey(), entry.getValue());
+            }
+        }
+
+        for (String relative : List.of(
+                "prepatcher.properties",
+                "profiles/aggressive.properties",
+                "profiles/debug.properties")) {
+            String properties = readUtf8(requiredFile(root.resolve(relative)));
+            requirePropertyValue(relative, properties,
+                    "market.scheduler.policyAuditBatches", "300");
+        }
+        requireNoProperty("profiles/safe.properties",
+                readUtf8(requiredFile(root.resolve("profiles/safe.properties"))),
+                "market.scheduler.policyAuditBatches");
     }
 
     private static void checkDiagnosticProfileIsolation(Path root) throws IOException {

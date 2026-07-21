@@ -228,7 +228,7 @@ industry недостаточно. Полный scan проверяет:
 состояние перепроверяется только через safety interval:
 
 ```properties
-market.remote.constructionAuditBatches=60
+market.remote.constructionAuditBatches=180
 observer.marketConstructionDiagnostics=false
 observer.marketConstructionDiagnosticsMaxSamplesPerReason=32
 ```
@@ -391,8 +391,8 @@ market.scheduler.hiddenBatches=8
 market.scheduler.hot.currentLocation=true
 market.scheduler.hot.playerOwned=true
 market.scheduler.hot.interaction=true
-market.scheduler.policyAuditBatches=60
-market.remote.constructionAuditBatches=60
+market.scheduler.policyAuditBatches=300
+market.remote.constructionAuditBatches=180
 market.scheduler.perSimulationTickMemoryKey=$starsectorPrepatcher_perSimulationTickMarket
 market.remote.maxPendingRuns=32
 market.remote.exactReplayBeforeSave=false
