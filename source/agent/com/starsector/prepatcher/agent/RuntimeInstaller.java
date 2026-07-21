@@ -27,10 +27,15 @@ final class RuntimeInstaller {
             "com.fs.starfarer.api.StarsectorPrepatcherHyperspaceHooks";
     private static final String BRIDGE_CLASS =
             "com.fs.starfarer.api.StarsectorPrepatcherRuntimeBridge";
+    private static final String CORE_WORLDS_RUNTIME_CLASS =
+            "com.fs.starfarer.api.StarsectorPrepatcherCoreWorldsRuntime";
     private static final String TEMP_MOD_HOOKS_CLASS =
             "com.fs.starfarer.api.StarsectorPrepatcherTempModHooks";
+    private static final String PRESENTATION_HOOKS_CLASS =
+            "com.fs.starfarer.api.StarsectorPrepatcherPresentationHooks";
     private static final Set<String> REQUIRED_CLASSES = Set.of(
-            HOOKS_CLASS, HYPERSPACE_HOOKS_CLASS, BRIDGE_CLASS, TEMP_MOD_HOOKS_CLASS);
+            HOOKS_CLASS, HYPERSPACE_HOOKS_CLASS, BRIDGE_CLASS,
+            CORE_WORLDS_RUNTIME_CLASS, TEMP_MOD_HOOKS_CLASS, PRESENTATION_HOOKS_CLASS);
 
     private RuntimeInstaller() {}
 

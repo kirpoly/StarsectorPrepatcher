@@ -2,17 +2,20 @@ package com.starsector.prepatcher.agent;
 
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
+import java.lang.management.ManagementFactory;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 public final class PrepatcherAgent {
-    public static final String VERSION = "0.9.5";
+    public static final String VERSION = "0.10.0";
     private PrepatcherAgent() {}
 
     public static void premain(String agentArgs, Instrumentation instrumentation) {
@@ -23,6 +26,7 @@ public final class PrepatcherAgent {
         PrepatcherLog.info("StarsectorPrepatcher " + VERSION + " javaagent starting");
         PrepatcherLog.info("Agent JAR: " + agentJar);
         PrepatcherLog.info("Mod root: " + modRoot);
+        warnIfStandalonePresentationAgentPresent();
 
         try {
             Path configPath = resolveConfigPath(agentArgs, modRoot);
@@ -39,8 +43,10 @@ public final class PrepatcherAgent {
             }
 
             PrepatcherTransformer transformPlan = new PrepatcherTransformer(config);
-            Class<?> loadedTarget = findLoadedTarget(instrumentation, transformPlan,
-                    ClassLoader.getSystemClassLoader());
+            FastForwardPresentationTransformer presentationPlan =
+                    new FastForwardPresentationTransformer(config);
+            Class<?> loadedTarget = findLoadedTarget(
+                    instrumentation, transformPlan, ClassLoader.getSystemClassLoader());
             if (loadedTarget != null) {
                 failForLoadedTarget("before runtime installation", loadedTarget,
                         "target-loaded-before-runtime");
@@ -64,21 +70,47 @@ public final class PrepatcherAgent {
                 return;
             }
 
+            boolean presentationMarkerLoaded = recordLoadedPresentationTargets(
+                    instrumentation, presentationPlan, runtimeLoader);
             exportInternalAsm(instrumentation);
+            if (!presentationMarkerLoaded) {
+                instrumentation.addTransformer(
+                        new FastForwardPresentationTransformer(config, runtimeLoader), false);
+                System.setProperty(
+                        "starsector.prepatcher.presentationStatus", "transformer-installed");
+            } else {
+                System.setProperty("starsector.prepatcher.presentationStatus",
+                        "disabled-frame-marker-already-loaded");
+            }
             ClassFileTransformer transformer = new PrepatcherTransformer(config, runtimeLoader);
             instrumentation.addTransformer(transformer, false);
-            if (config.directMarketObservation) {
+            System.setProperty("starsector.prepatcher.presentationStructuralOrder",
+                    presentationMarkerLoaded ? "structural-only" : "presentation->structural");
+            if (config.directMarketObservation || config.marketScheduler
+                    || config.marketAdvanceSemanticRiskObserver) {
                 instrumentation.addTransformer(
                         new DirectMarketObserveTransformer(config, runtimeLoader, modRoot), false);
-                System.setProperty("starsector.prepatcher.directMarketObservation", "enabled");
-                PrepatcherLog.info("Direct Market.advance observation transformer installed; "
-                        + "mod call sites remain synchronous and are only measured.");
+                System.setProperty("starsector.prepatcher.directMarketObservation",
+                        config.directMarketObservation ? "enabled"
+                                : (config.marketScheduler ? "scheduler-sync-only" : "risk-observer-only"));
+                PrepatcherLog.info(config.directMarketObservation
+                        ? "Direct Market.advance transformer installed for telemetry and scheduler debt synchronization."
+                        : (config.marketScheduler
+                                ? "Direct Market.advance transformer installed to synchronize scheduler debt before mod-owned calls."
+                                : "Static Market.advance semantic-risk observer installed."));
             } else {
                 System.setProperty("starsector.prepatcher.directMarketObservation", "disabled");
             }
             System.setProperty("starsector.prepatcher.status", "transformer-installed");
-            PrepatcherLog.info("Unified transformer installed. Each patch will be matched, applied,"
-                    + " and verified independently as its target class loads.");
+            if (presentationMarkerLoaded) {
+                PrepatcherLog.info("Structural transformer installed; presentation transformer"
+                        + " stayed disabled because its frame marker was already loaded.");
+            } else {
+                PrepatcherLog.info("Presentation and structural transformers installed in explicit"
+                        + " presentation->structural order. Overlapping targets publish a"
+                        + " presentation ownership/mask contract that the structural transformer"
+                        + " revalidates after every commit and at final composition.");
+            }
         } catch (Throwable ex) {
             System.setProperty("starsector.prepatcher.status", "agent-error");
             PrepatcherLog.error("Fatal agent initialization error; prepatcher has failed open and the game will continue unpatched.", ex);
@@ -109,6 +141,40 @@ public final class PrepatcherAgent {
         return null;
     }
 
+    private static boolean recordLoadedPresentationTargets(
+            Instrumentation instrumentation,
+            FastForwardPresentationTransformer presentationPlan,
+            ClassLoader runtimeLoader) {
+        final String frameMarker = "com/fs/starfarer/campaign/CampaignState";
+        List<String> loadedTargets = new ArrayList<>();
+        boolean markerLoaded = false;
+        for (Class<?> loaded : instrumentation.getAllLoadedClasses()) {
+            String internalName = loaded.getName().replace('.', '/');
+            if (loaded.getClassLoader() != runtimeLoader
+                    || !FastForwardPresentationTransformer.TARGET_CLASSES.contains(internalName)
+                    || !presentationPlan.isTargetEnabled(internalName)) {
+                continue;
+            }
+            loadedTargets.add(loaded.getName());
+            System.setProperty("starsector.prepatcher.patchStatus." + loaded.getName()
+                    + ".fastForwardPresentation", "SKIPPED_ALREADY_LOADED");
+            markerLoaded |= frameMarker.equals(internalName);
+        }
+        if (loadedTargets.isEmpty()) return false;
+
+        Collections.sort(loadedTargets);
+        if (markerLoaded) {
+            PrepatcherLog.warn("Fast-forward presentation frame marker was already loaded;"
+                    + " only the presentation transformer is disabled and structural patches"
+                    + " will continue. Loaded presentation targets=" + loadedTargets);
+        } else {
+            PrepatcherLog.warn("Some fast-forward presentation targets were already loaded and"
+                    + " will remain vanilla; other presentation and structural targets will"
+                    + " continue. Loaded targets=" + loadedTargets);
+        }
+        return markerLoaded;
+    }
+
     private static void failForLoadedTarget(String phase, Class<?> target, String status) {
         System.setProperty("starsector.prepatcher.status", status);
         ClassLoader loader = target.getClassLoader();
@@ -118,6 +184,26 @@ public final class PrepatcherAgent {
         PrepatcherLog.warn("Target class was already loaded " + phase
                 + "; no bytecode patches registered: " + target.getName()
                 + " (loader=" + loaderName + ")");
+    }
+
+    private static void warnIfStandalonePresentationAgentPresent() {
+        try {
+            for (String argument : ManagementFactory.getRuntimeMXBean().getInputArguments()) {
+                String normalized = argument.toLowerCase(java.util.Locale.ROOT);
+                if (!normalized.startsWith("-javaagent:")
+                        || !normalized.contains("fastforwardpresentationpatch")) {
+                    continue;
+                }
+                System.setProperty("starsector.prepatcher.presentationStandaloneAgent", "detected");
+                PrepatcherLog.warn("A standalone FastForward Presentation Patch javaagent is also"
+                        + " configured. Remove that entry: its patches are integrated into"
+                        + " StarsectorPrepatcher and running both agents is unsupported.");
+                return;
+            }
+        } catch (Throwable failure) {
+            PrepatcherLog.warn("Could not inspect JVM arguments for a duplicate standalone"
+                    + " FastForward Presentation Patch agent: " + failure);
+        }
     }
 
     private static void exportInternalAsm(Instrumentation instrumentation) {

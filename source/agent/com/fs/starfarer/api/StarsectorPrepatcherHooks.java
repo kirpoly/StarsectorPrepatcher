@@ -9,8 +9,11 @@ import com.fs.starfarer.api.campaign.SectorEntityToken;
 import com.fs.starfarer.api.campaign.StarSystemAPI;
 import com.fs.starfarer.api.campaign.comm.IntelInfoPlugin;
 import com.fs.starfarer.api.campaign.econ.MarketAPI;
+import com.fs.starfarer.api.campaign.econ.Industry;
 import com.fs.starfarer.api.campaign.rules.MemoryAPI;
+import com.fs.starfarer.api.impl.campaign.econ.impl.ConstructionQueue;
 import com.fs.starfarer.api.impl.campaign.econ.impl.BaseIndustry;
+import com.fs.starfarer.api.impl.campaign.ids.Conditions;
 import com.fs.starfarer.api.combat.MutableStatWithTempMods;
 import com.fs.starfarer.campaign.CampaignEngine;
 import com.fs.starfarer.campaign.econ.CommodityOnMarket;
@@ -26,6 +29,7 @@ import com.starsector.prepatcher.agent.PrepatcherConfig;
 import com.starsector.prepatcher.agent.PrepatcherLog;
 import org.lwjgl.util.vector.Vector2f;
 
+import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
@@ -46,6 +50,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.AbstractList;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -72,6 +77,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.DoubleAdder;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
+import java.util.function.LongSupplier;
 
 /** Runtime entry points called by transformed Starsector classes. */
 public final class StarsectorPrepatcherHooks {
@@ -85,13 +91,13 @@ public final class StarsectorPrepatcherHooks {
     private static final int MARKET_ORIGIN_DIRECT_CALL_SITE = 4;
     private static final int MARKET_ORIGIN_PLANET_CONDITION_SCHEDULED = 5;
     private static final int MARKET_ORIGIN_PLANET_CONDITION_FALLBACK = 6;
-    private static final int MARKET_ORIGIN_PLANET_CONDITION_SAVE_FLUSH = 7;
-    private static final int MARKET_ORIGIN_PLANET_CONDITION_IMMEDIATE = 8;
     private static final ThreadLocal<MarketAdvanceObservationContext> MARKET_ADVANCE_CONTEXT =
             ThreadLocal.withInitial(MarketAdvanceObservationContext::new);
     private static volatile DirectMarketObserver DIRECT_MARKET_OBSERVER;
 
     private static final ThreadLocal<Scratch> SCRATCH = ThreadLocal.withInitial(Scratch::new);
+    private static final int SCRATCH_RETAINED_FRAME_FLOOR = 4;
+    private static volatile LongSupplier NANO_CLOCK = System::nanoTime;
     private static final ThreadLocal<TextReadScratch> TEXT_READ_SCRATCH =
             ThreadLocal.withInitial(TextReadScratch::new);
     private static volatile Map<IntelInfoPlugin, IntelCache> INTEL_CACHE =
@@ -110,14 +116,90 @@ public final class StarsectorPrepatcherHooks {
             Collections.synchronizedMap(new WeakHashMap<>());
     private static volatile Map<ReachEconomy, EconomyLocationState> ECONOMY_LOCATION_STATES =
             Collections.synchronizedMap(new WeakHashMap<>());
-    private static volatile Map<MarketAPI, RemoteMarketScheduleState> REMOTE_MARKET_STATES =
-            Collections.synchronizedMap(new IdentityHashMap<>());
-    private static volatile Map<MarketAPI, RemoteMarketScheduleState>
-            PLANET_CONDITION_MARKET_STATES =
-            Collections.synchronizedMap(new IdentityHashMap<>());
+    private static final int MARKET_SCHEDULER_COMPONENT_ENGINE = 1;
+    private static final int MARKET_SCHEDULER_COMPONENT_ECONOMY = 2;
+    private static final int MARKET_SCHEDULER_COMPONENT_ENTITY = 4;
+    private static final int MARKET_SCHEDULER_COMPONENT_SAVE = 8;
+    private static final int MARKET_SCHEDULER_COMPONENT_BATCH_PROTOCOL = 16;
+    private static final int MARKET_SCHEDULER_COMPONENT_MARKET_SEMANTICS = 32;
+    private static final int MARKET_SCHEDULER_COMPONENT_MILITARY_BASE = 64;
+    private static final int MARKET_SCHEDULER_COMPONENT_LIONS_GUARD = 128;
+    private static final int MARKET_SCHEDULER_COMPONENT_RECENT_UNREST = 256;
+    private static final int MARKET_SCHEDULER_COMPONENT_BASE_INDUSTRY = 512;
+    private static final int MARKET_SCHEDULER_COMPONENT_CONSTRUCTION_QUEUE = 1024;
+    private static final int CONSTRUCTION_REASON_QUEUE_NON_EMPTY = 1;
+    private static final int CONSTRUCTION_REASON_INDUSTRY_BUILDING = 2;
+    private static final int CONSTRUCTION_REASON_INDUSTRY_UPGRADING = 4;
+    private static final int CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN = 8;
+    private static final int CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN = 16;
+    private static final int CONSTRUCTION_REASON_PROBE_FAILURE = 32;
+    private static final int CONSTRUCTION_REASON_MUTATION_RACE = 64;
+    /**
+     * A virtual Industry.isBuilding() signal from BaseIndustry while the actual
+     * BaseIndustry.building field is false. PopulationAndInfrastructure uses
+     * this pattern for market-size growth, so it is telemetry-only.
+     */
+    private static final int CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW = 128;
+    /** Reasons observed by the construction probe, including diagnostic-only signals. */
+    private static final int CONSTRUCTION_REASON_OBSERVED_MASK =
+            CONSTRUCTION_REASON_QUEUE_NON_EMPTY
+                    | CONSTRUCTION_REASON_INDUSTRY_BUILDING
+                    | CONSTRUCTION_REASON_INDUSTRY_UPGRADING
+                    | CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN
+                    | CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN
+                    | CONSTRUCTION_REASON_PROBE_FAILURE
+                    | CONSTRUCTION_REASON_MUTATION_RACE
+                    | CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW;
+    /**
+     * Reasons that require exact full-rate market advancement. isUpgrading() and
+     * a BaseIndustry virtual-building signal without its raw building field are
+     * intentionally diagnostic-only. Vanilla PopulationAndInfrastructure uses
+     * both signals for market-size growth, not Industry construction.
+     */
+    private static final int CONSTRUCTION_REASON_ACTIVE_MASK =
+            CONSTRUCTION_REASON_QUEUE_NON_EMPTY
+                    | CONSTRUCTION_REASON_INDUSTRY_BUILDING
+                    | CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN
+                    | CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN
+                    | CONSTRUCTION_REASON_PROBE_FAILURE
+                    | CONSTRUCTION_REASON_MUTATION_RACE;
+    private static final int MARKET_SCHEDULER_COMPONENT_ALL =
+            MARKET_SCHEDULER_COMPONENT_ENGINE
+                    | MARKET_SCHEDULER_COMPONENT_ECONOMY
+                    | MARKET_SCHEDULER_COMPONENT_ENTITY
+                    | MARKET_SCHEDULER_COMPONENT_SAVE
+                    | MARKET_SCHEDULER_COMPONENT_BATCH_PROTOCOL
+                    | MARKET_SCHEDULER_COMPONENT_MARKET_SEMANTICS
+                    | MARKET_SCHEDULER_COMPONENT_MILITARY_BASE
+                    | MARKET_SCHEDULER_COMPONENT_LIONS_GUARD
+                    | MARKET_SCHEDULER_COMPONENT_RECENT_UNREST
+                    | MARKET_SCHEDULER_COMPONENT_BASE_INDUSTRY
+                    | MARKET_SCHEDULER_COMPONENT_CONSTRUCTION_QUEUE;
+    private static final AtomicInteger MARKET_SCHEDULER_COMPONENTS = new AtomicInteger();
+    private static volatile boolean marketSchedulerReady;
+    private static final ThreadLocal<MarketSchedulerTick> MARKET_SCHEDULER_TICK =
+            ThreadLocal.withInitial(MarketSchedulerTick::new);
+    private static final ThreadLocal<MarketSchedulerBatch> MARKET_SCHEDULER_BATCH =
+            ThreadLocal.withInitial(MarketSchedulerBatch::new);
+    private static final ThreadLocal<MarketAdvanceBatchStack> MARKET_ADVANCE_BATCH_STACK =
+            ThreadLocal.withInitial(MarketAdvanceBatchStack::new);
+    private static final ThreadLocal<MarketAdvanceInvocationContext> MARKET_ADVANCE_INVOCATION =
+            ThreadLocal.withInitial(MarketAdvanceInvocationContext::new);
+    private static final ThreadLocal<ConstructionProbe> CONSTRUCTION_PROBE =
+            ThreadLocal.withInitial(ConstructionProbe::new);
+    private static volatile VarHandle baseIndustryBuildingHandle;
+    private static volatile boolean baseIndustryBuildingHandleResolved;
+    private static volatile WeakIdentityMap<MarketAPI, MarketScheduleState> MARKET_SCHEDULER_STATES =
+            new WeakIdentityMap<>();
+    private static volatile WeakIdentityMap<ConstructionQueue, WeakReference<MarketAPI>>
+            CONSTRUCTION_QUEUE_OWNERS = new WeakIdentityMap<>();
+    private static volatile ConstructionDiagnostics CONSTRUCTION_DIAGNOSTICS;
     private static volatile Map<Object, CommRelaySystemIndex> COMM_RELAY_SYSTEM_INDEXES =
             Collections.synchronizedMap(new WeakHashMap<>());
     private static final Object CAMPAIGN_CACHE_LIFECYCLE_LOCK = new Object();
+    private static final Object CAMPAIGN_CACHE_MAINTENANCE_LOCK = new Object();
+    private static volatile long cacheMaintenanceGeneration = -1L;
+    private static volatile long nextCacheMaintenanceNanos;
 
     /**
      * The engine reference must itself remain weak: lifecycle hooks are a cleanup
@@ -134,11 +216,12 @@ public final class StarsectorPrepatcherHooks {
     private static volatile boolean campaignEngineObserved;
     private static volatile boolean campaignCacheGenerationActive;
     private static volatile long campaignCacheGeneration;
-    private static volatile long remoteMarketFrame;
-    private static volatile long remoteMarketFrameGeneration = -1L;
-    private static volatile LocationAPI remoteMarketCurrentLocation;
-    private static volatile MarketAPI remoteMarketInteractionMarket;
-    private static volatile float remoteMarketSecondsPerDay = Float.NaN;
+    private static volatile long marketSchedulerSimulationTick;
+    private static volatile long marketSchedulerRenderBatch;
+    private static final AtomicLong MARKET_SCHEDULER_DEBT_SEQUENCE = new AtomicLong();
+    // Simulation ticks preserve engine ordering. Render batches, delimited by
+    // CampaignEngine.setFastForwardIteration(false), own cadence so fast-forward
+    // cannot multiply expensive Market.advance callbacks per visual frame.
     private static final long NO_CAMPAIGN_TRANSITION = -1L;
     private static long pendingCampaignTransition = NO_CAMPAIGN_TRANSITION;
     private static WeakReference<Object> pendingCampaignEngine = new WeakReference<>(null);
@@ -170,23 +253,95 @@ public final class StarsectorPrepatcherHooks {
     private static final LongAdder ROUTE_SYSTEM_INDEX_BUILDS = new LongAdder();
     private static final LongAdder ROUTE_SYSTEM_INDEX_FALLBACKS = new LongAdder();
     private static final LongAdder CAMPAIGN_CACHE_RESETS = new LongAdder();
+    private static final LongAdder LABEL_OWNER_IDLE_EVICTIONS = new LongAdder();
+    private static final LongAdder LABEL_OWNER_LIMIT_EVICTIONS = new LongAdder();
+    private static final LongAdder INTEL_ENTITY_OWNER_IDLE_EVICTIONS = new LongAdder();
+    private static final LongAdder INTEL_ENTITY_OWNER_LIMIT_EVICTIONS = new LongAdder();
+    private static final LongAdder HIT_OWNER_IDLE_EVICTIONS = new LongAdder();
+    private static final LongAdder HIT_OWNER_LIMIT_EVICTIONS = new LongAdder();
+    private static final LongAdder HIT_EXPIRED_CELL_EVICTIONS = new LongAdder();
+    private static final LongAdder SCRATCH_LIST_TRIMS = new LongAdder();
+    private static final LongAdder SCRATCH_SET_TRIMS = new LongAdder();
+    private static final LongAdder SCRATCH_IDENTITY_TRIMS = new LongAdder();
+    private static final LongAdder SCRATCH_FRAME_REPLACEMENTS = new LongAdder();
+    private static volatile ScratchGaugeSnapshot SCRATCH_GAUGES = ScratchGaugeSnapshot.EMPTY;
     private static final LongAdder ECONOMY_LOCATION_CHECKS = new LongAdder();
     private static final LongAdder ECONOMY_LOCATION_DIRTY = new LongAdder();
     private static final LongAdder ECONOMY_LOCATION_SKIPS = new LongAdder();
-    private static final LongAdder ECONOMY_SNAPSHOT_ELEMENTS = new LongAdder();
-    private static final LongAdder REMOTE_MARKET_FRAMES = new LongAdder();
-    private static final LongAdder REMOTE_MARKET_FULL_ADVANCES = new LongAdder();
-    private static final LongAdder REMOTE_MARKET_DEFERRED_CALLS = new LongAdder();
-    private static final LongAdder REMOTE_MARKET_HOT_ADVANCES = new LongAdder();
-    private static final LongAdder REMOTE_MARKET_HIDDEN_ADVANCES = new LongAdder();
-    private static final LongAdder REMOTE_MARKET_SAVE_FLUSHES = new LongAdder();
-    private static final LongAdder REMOTE_MARKET_FALLBACKS = new LongAdder();
-    private static final LongAdder PLANET_CONDITION_MARKET_CALLS = new LongAdder();
-    private static final LongAdder PLANET_CONDITION_MARKET_FULL_ADVANCES = new LongAdder();
-    private static final LongAdder PLANET_CONDITION_MARKET_DEFERRED_CALLS = new LongAdder();
-    private static final LongAdder PLANET_CONDITION_MARKET_HOT_ADVANCES = new LongAdder();
-    private static final LongAdder PLANET_CONDITION_MARKET_SAVE_FLUSHES = new LongAdder();
-    private static final LongAdder PLANET_CONDITION_MARKET_FALLBACKS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_SIMULATION_TICKS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_RENDER_BATCHES = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_FAST_FORWARD_TICKS = new LongAdder();
+    private static final AtomicLong MARKET_SCHEDULER_MAX_TICKS_PER_BATCH = new AtomicLong();
+    private static final LongAdder MARKET_SCHEDULER_CALLS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_ECONOMY_CALLS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_PLANET_CONDITION_CALLS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_FULL_ADVANCES = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_ACCUMULATED_CALLS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_HOT_ADVANCES = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_HIDDEN_ADVANCES = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_PER_SIMULATION_TICK_CALLS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_PER_SIMULATION_TICK_FLAG_CHANGES = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_SAVE_FLUSHES = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_NOT_READY_TICKS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_NOT_READY_CALLS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_NESTED_TICKS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_OUTSIDE_TICK_CALLS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_LIFECYCLE_INACTIVE_CALLS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_FRAME_CAPTURE_FAILURES = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_INVALID_SOURCE_CALLS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_INVALID_AMOUNT_CALLS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_AMOUNT_OVERFLOW_SPLITS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_STATE_FAILURES = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_REENTRANT_CALLS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_MULTIPLE_SOURCE_TICK_CALLS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_POLICY_FAILURES = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_ADVANCE_FAILURES = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_DISABLED_MARKET_CALLS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_SYNCHRONIZED_ADVANCES = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_DIRECT_SYNCHRONIZATIONS = new LongAdder();
+    private static final LongAdder MARKET_SCHEDULER_SAVE_FLUSH_FAILURES = new LongAdder();
+    private static final AtomicLong PENDING_MARKET_STEPS_HIGH_WATER = new AtomicLong();
+    private static final AtomicLong PENDING_MARKET_RUNS_HIGH_WATER = new AtomicLong();
+    private static final LongAdder PENDING_RUN_OVERFLOW_FLUSHES = new LongAdder();
+    private static final LongAdder COALESCED_MARKET_FLUSHES = new LongAdder();
+    private static final DoubleAdder COALESCED_MARKET_AMOUNT = new DoubleAdder();
+    private static final LongAdder MARKET_BATCH_CONTEXTS_CREATED = new LongAdder();
+    private static final LongAdder MILITARY_BASE_REPLAYED_STEPS = new LongAdder();
+    private static final LongAdder LIONS_GUARD_REPLAYED_STEPS = new LongAdder();
+    private static final LongAdder RECENT_UNREST_REPLAYED_STEPS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_FULL_RATE_CALLS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_MODE_ENTRIES = new LongAdder();
+    private static final LongAdder CONSTRUCTION_MODE_EXITS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_BOUNDARY_EXACT_REPLAYS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DIRTY_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_SAFETY_AUDIT_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_FORCED_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_CACHED_DECISIONS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DETECTED_QUEUE_NON_EMPTY = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DETECTED_INDUSTRY_BUILDING = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DETECTED_INDUSTRY_UPGRADING = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DETECTED_REPORTED_BUILDING_WITHOUT_RAW =
+            new LongAdder();
+    private static final LongAdder CONSTRUCTION_DETECTED_MULTIPLE_REASONS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DETECTED_PROBE_FAILURE = new LongAdder();
+    private static final LongAdder CONSTRUCTION_QUEUE_NULL_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_QUEUE_ITEMS_NULL_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_INDUSTRIES_NULL_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_QUEUE_ITEMS_OBSERVED = new LongAdder();
+    private static final LongAdder CONSTRUCTION_INDUSTRIES_SCANNED = new LongAdder();
+    private static final AtomicLong CONSTRUCTION_MAX_QUEUE_ITEMS = new AtomicLong();
+    private static final AtomicLong CONSTRUCTION_MAX_INDUSTRIES_SCANNED = new AtomicLong();
+    private static final LongAdder CONSTRUCTION_AUDIT_STATE_CHANGES = new LongAdder();
+    private static final LongAdder CONSTRUCTION_AUDIT_FALSE_TO_TRUE = new LongAdder();
+    private static final LongAdder CONSTRUCTION_AUDIT_TRUE_TO_FALSE = new LongAdder();
+    private static final LongAdder CONSTRUCTION_REASON_CHANGES = new LongAdder();
+    private static final LongAdder CONSTRUCTION_MUTATION_RACES = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DIAGNOSTIC_SAMPLES_DROPPED = new LongAdder();
+    private static final LongAdder SAVE_COALESCED_MARKETS = new LongAdder();
+    private static final LongAdder SAVE_EXACT_REPLAY_MARKETS = new LongAdder();
+    private static final LongAdder SAVE_EXACT_REPLAY_STEPS = new LongAdder();
+    private static final LongAdder SAVE_FLUSH_DURATION_NANOS = new LongAdder();
     // Aggregate persistent-snapshot counters are retained for backward-compatible logs.
     private static final LongAdder ECONOMY_PERSISTENT_SNAPSHOT_REBUILDS = new LongAdder();
     private static final LongAdder ECONOMY_PERSISTENT_SNAPSHOT_AUDITS = new LongAdder();
@@ -264,6 +419,20 @@ public final class StarsectorPrepatcherHooks {
     static void configure(PrepatcherConfig optimizerConfig, Path root) {
         config = optimizerConfig;
         modRoot = root;
+        CONSTRUCTION_DIAGNOSTICS = null;
+        if (optimizerConfig.marketConstructionDiagnostics) {
+            try {
+                ConstructionDiagnostics diagnostics =
+                        new ConstructionDiagnostics(optimizerConfig, root);
+                CONSTRUCTION_DIAGNOSTICS = diagnostics;
+                diagnostics.start();
+            } catch (Throwable failure) {
+                CONSTRUCTION_DIAGNOSTICS = null;
+                PrepatcherLog.error("Market construction diagnostics initialization failed; "
+                        + "scheduler behavior is unchanged and CSV sampling is disabled.",
+                        failure);
+            }
+        }
         if (optimizerConfig.directMarketObservation) {
             try {
                 DirectMarketObserver observer = new DirectMarketObserver(optimizerConfig, root);
@@ -559,15 +728,18 @@ public final class StarsectorPrepatcherHooks {
         ROUTE_JUMP_INDEXES = Collections.synchronizedMap(new WeakHashMap<>());
         ROUTE_SYSTEM_INDEXES = Collections.synchronizedMap(new WeakHashMap<>());
         ECONOMY_LOCATION_STATES = Collections.synchronizedMap(new WeakHashMap<>());
-        REMOTE_MARKET_STATES = Collections.synchronizedMap(new IdentityHashMap<>());
-        PLANET_CONDITION_MARKET_STATES =
-                Collections.synchronizedMap(new IdentityHashMap<>());
+        MARKET_SCHEDULER_STATES = new WeakIdentityMap<>();
+        CONSTRUCTION_QUEUE_OWNERS = new WeakIdentityMap<>();
         COMM_RELAY_SYSTEM_INDEXES = Collections.synchronizedMap(new WeakHashMap<>());
-        remoteMarketFrame = 0L;
-        remoteMarketFrameGeneration = -1L;
-        remoteMarketCurrentLocation = null;
-        remoteMarketInteractionMarket = null;
-        remoteMarketSecondsPerDay = Float.NaN;
+        marketSchedulerSimulationTick = 0L;
+        marketSchedulerRenderBatch = 0L;
+        cacheMaintenanceGeneration = -1L;
+        nextCacheMaintenanceNanos = 0L;
+        MARKET_SCHEDULER_DEBT_SEQUENCE.set(0L);
+        MARKET_SCHEDULER_TICK.remove();
+        MARKET_SCHEDULER_BATCH.remove();
+        MARKET_ADVANCE_BATCH_STACK.remove();
+        MARKET_ADVANCE_INVOCATION.remove();
         nebulaCacheSlot = new NebulaCacheSlot();
         // A lifecycle callback may be re-entrant inside a transformed scratch
         // scope. Detach the old Scratch without clearing collections that the
@@ -575,6 +747,7 @@ public final class StarsectorPrepatcherHooks {
         // depth into a fresh container. Subsequent hooks cannot append campaign
         // objects to the detached container, and the replacement removes itself
         // when the interrupted scope's generated finally hook completes.
+        SCRATCH_GAUGES = ScratchGaugeSnapshot.EMPTY;
         Scratch previous = SCRATCH.get();
         int openLeases = previous.scopeDepth;
         SCRATCH.remove();
@@ -615,6 +788,254 @@ public final class StarsectorPrepatcherHooks {
     }
 
     // ---------------------------------------------------------------------
+    // Campaign-thread cache maintenance and delayed scratch trimming
+    // ---------------------------------------------------------------------
+
+    /** Throttled campaign-thread maintenance entry installed in CampaignEngine.advance(). */
+    public static void campaignCacheMaintenanceTick() {
+        runCacheMaintenance(false);
+    }
+
+    /** Forced pre-save entry. Idle TTLs and scratch grace periods still apply. */
+    public static void runCacheMaintenance(boolean forced) {
+        PrepatcherConfig c = config;
+        long generation = campaignCacheGeneration;
+        if (c == null || !campaignCachesReady(generation)) return;
+        long now;
+        try {
+            now = nanoTime();
+        } catch (Throwable ignored) {
+            return;
+        }
+
+        synchronized (CAMPAIGN_CACHE_MAINTENANCE_LOCK) {
+            if (!campaignCachesReady(generation)) return;
+            if (cacheMaintenanceGeneration != generation) {
+                cacheMaintenanceGeneration = generation;
+                nextCacheMaintenanceNanos = 0L;
+            }
+            if (!forced && c.cacheMaintenanceIntervalMs > 0
+                    && now < nextCacheMaintenanceNanos) {
+                return;
+            }
+            nextCacheMaintenanceNanos = saturatedAdd(now,
+                    millisToNanos(c.cacheMaintenanceIntervalMs));
+        }
+
+        maintainLabelIndexes(c, generation, now);
+        maintainIntelEntityIndexes(c, generation, now);
+        maintainHitCaches(c, generation, now);
+        trimCurrentScratch(c, now);
+        try {
+            StarsectorPrepatcherHyperspaceHooks.runPoolMaintenance(now, forced);
+        } catch (Throwable ignored) {
+            // Hyperspace pooling is independent and optional.
+        }
+    }
+
+    private static long nanoTime() {
+        LongSupplier clock = NANO_CLOCK;
+        return clock == null ? System.nanoTime() : clock.getAsLong();
+    }
+
+    private static long millisToNanos(int millis) {
+        if (millis <= 0) return 0L;
+        long value = (long) millis * 1_000_000L;
+        return value < 0L ? Long.MAX_VALUE : value;
+    }
+
+    private static long saturatedAdd(long value, long increment) {
+        if (increment <= 0L) return value;
+        long result = value + increment;
+        if (((value ^ result) & (increment ^ result)) < 0L) return Long.MAX_VALUE;
+        return result;
+    }
+
+    private static boolean hoverCellFresh(long now, long atNanos, int ttlMs) {
+        return ttlMs > 0 && now - atNanos < millisToNanos(ttlMs);
+    }
+
+    private static boolean idleExpired(long now, long lastAccess, int ttlMs) {
+        if (ttlMs <= 0) return false;
+        return now - lastAccess >= millisToNanos(ttlMs);
+    }
+
+    private static void maintainLabelIndexes(PrepatcherConfig c, long generation, long now) {
+        IdentityHashMap<LinkedHashMap<?, ?>, LabelIndex> indexes = LABEL_INDEXES;
+        synchronized (indexes) {
+            if (indexes != LABEL_INDEXES || !campaignCachesReady(generation)) return;
+            Iterator<Map.Entry<LinkedHashMap<?, ?>, LabelIndex>> iterator =
+                    indexes.entrySet().iterator();
+            while (iterator.hasNext()) {
+                LabelIndex index = iterator.next().getValue();
+                if (index.activeUsers == 0
+                        && idleExpired(now, index.lastAccessNanos, c.labelOwnerIdleTtlMs)) {
+                    iterator.remove();
+                    LABEL_OWNER_IDLE_EVICTIONS.increment();
+                }
+            }
+        }
+    }
+
+    private static void maintainIntelEntityIndexes(PrepatcherConfig c, long generation, long now) {
+        IdentityHashMap<List<?>, IntelEntityIndex> indexes = INTEL_ENTITY_INDEXES;
+        synchronized (indexes) {
+            if (indexes != INTEL_ENTITY_INDEXES || !campaignCachesReady(generation)) return;
+            Iterator<Map.Entry<List<?>, IntelEntityIndex>> iterator = indexes.entrySet().iterator();
+            while (iterator.hasNext()) {
+                IntelEntityIndex index = iterator.next().getValue();
+                if (index.activeUsers == 0
+                        && idleExpired(now, index.lastAccessNanos,
+                        c.intelEntityIndexOwnerIdleTtlMs)) {
+                    iterator.remove();
+                    INTEL_ENTITY_OWNER_IDLE_EVICTIONS.increment();
+                }
+            }
+        }
+    }
+
+    private static void maintainHitCaches(PrepatcherConfig c, long generation, long now) {
+        IdentityHashMap<Object, HitCache> caches = HIT_CACHES;
+        synchronized (caches) {
+            if (caches != HIT_CACHES || !campaignCachesReady(generation)) return;
+            Iterator<Map.Entry<Object, HitCache>> iterator = caches.entrySet().iterator();
+            while (iterator.hasNext()) {
+                HitCache cache = iterator.next().getValue();
+                if (cache.activeUsers == 0
+                        && idleExpired(now, cache.lastAccessNanos, c.hoverOwnerIdleTtlMs)) {
+                    iterator.remove();
+                    HIT_OWNER_IDLE_EVICTIONS.increment();
+                    continue;
+                }
+                synchronized (cache) {
+                    if (c.hoverCellPruneIntervalMs > 0
+                            && now - cache.lastCellPruneNanos
+                            >= millisToNanos(c.hoverCellPruneIntervalMs)) {
+                        cache.lastCellPruneNanos = now;
+                        long cellTtl = millisToNanos(c.hoverCellTtlMs);
+                        if (cellTtl > 0L && !cache.cells.isEmpty()) {
+                            Iterator<CellHit> cells = cache.cells.values().iterator();
+                            while (cells.hasNext()) {
+                                if (!hoverCellFresh(now, cells.next().atNanos, c.hoverCellTtlMs)) {
+                                    cells.remove();
+                                    HIT_EXPIRED_CELL_EVICTIONS.increment();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static void trimCurrentScratch(PrepatcherConfig c, long now) {
+        if (!c.scratchTrimEnabled) {
+            publishScratchGauges(SCRATCH.get());
+            return;
+        }
+        Scratch scratch = SCRATCH.get();
+        for (int i = scratch.scopeDepth; i < scratch.frames.size(); i++) {
+            ScratchFrame frame = scratch.frames.get(i);
+            if (frame.shouldTrim(c, now)) {
+                countScratchTrimKinds(frame, c);
+                scratch.frames.set(i, new ScratchFrame());
+                SCRATCH_FRAME_REPLACEMENTS.increment();
+            }
+        }
+        if (scratch.scopeDepth == 0
+                && scratch.frames.size() > SCRATCH_RETAINED_FRAME_FLOOR
+                && scratch.trailingFramesLastUseNanos != Long.MIN_VALUE
+                && now - scratch.trailingFramesLastUseNanos
+                >= millisToNanos(c.scratchTrimGraceMs)) {
+            int removed = scratch.frames.size() - SCRATCH_RETAINED_FRAME_FLOOR;
+            scratch.frames.subList(SCRATCH_RETAINED_FRAME_FLOOR,
+                    scratch.frames.size()).clear();
+            scratch.trailingFramesLastUseNanos = Long.MIN_VALUE;
+            SCRATCH_FRAME_REPLACEMENTS.add(removed);
+        }
+        publishScratchGauges(scratch);
+    }
+
+    private static void countScratchTrimKinds(ScratchFrame frame, PrepatcherConfig c) {
+        frame.refreshHighWater();
+        if (frame.listHighWater > c.scratchTrimMaxListCapacity) {
+            SCRATCH_LIST_TRIMS.increment();
+        }
+        if (frame.setHighWater > c.scratchTrimMaxSetEntries) {
+            SCRATCH_SET_TRIMS.increment();
+        }
+        if (frame.identityHighWater > c.scratchTrimMaxIdentityEntries) {
+            SCRATCH_IDENTITY_TRIMS.increment();
+        }
+    }
+
+    private static void publishScratchGauges(Scratch scratch) {
+        long listCapacity = 0L;
+        long setCapacity = 0L;
+        long identityCapacity = 0L;
+        int pooledLists = 0;
+        int pooledSets = 0;
+        for (ScratchFrame frame : scratch.frames) {
+            listCapacity += frame.retainedListCapacityEstimate();
+            setCapacity += frame.retainedSetCapacityEstimate();
+            identityCapacity += frame.identityHighWater;
+            pooledLists += frame.pooledLists.size();
+            pooledSets += frame.pooledSets.size();
+        }
+        SCRATCH_GAUGES = new ScratchGaugeSnapshot(scratch.frames.size(), pooledLists,
+                pooledSets, listCapacity, setCapacity, identityCapacity);
+    }
+
+    private static <K, V> boolean evictIdleAndLruForInsert(
+            IdentityHashMap<K, V> map, K protectedOwner, long now, int idleTtlMs,
+            int limit, LongAdder idleCounter, LongAdder limitCounter) {
+        Iterator<Map.Entry<K, V>> iterator = map.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<K, V> entry = iterator.next();
+            if (entry.getKey() != protectedOwner
+                    && ownerActiveUsers(entry.getValue()) == 0
+                    && idleExpired(now, ownerLastAccessNanos(entry.getValue()), idleTtlMs)) {
+                iterator.remove();
+                idleCounter.increment();
+            }
+        }
+        if (map.containsKey(protectedOwner) || map.size() < limit) return true;
+        K oldestKey = null;
+        long oldestAccess = Long.MAX_VALUE;
+        for (Map.Entry<K, V> entry : map.entrySet()) {
+            if (entry.getKey() == protectedOwner
+                    || ownerActiveUsers(entry.getValue()) > 0) continue;
+            long access = ownerLastAccessNanos(entry.getValue());
+            if (oldestKey == null || access < oldestAccess) {
+                oldestKey = entry.getKey();
+                oldestAccess = access;
+            }
+        }
+        if (oldestKey != null) {
+            map.remove(oldestKey);
+            limitCounter.increment();
+            return true;
+        }
+        return false;
+    }
+
+    private static long ownerLastAccessNanos(Object value) {
+        if (value instanceof LabelIndex index) return index.lastAccessNanos;
+        if (value instanceof IntelEntityIndex index) return index.lastAccessNanos;
+        if (value instanceof HitCache cache) return cache.lastAccessNanos;
+        throw new IllegalArgumentException("Unsupported owner-cache value: "
+                + (value == null ? "null" : value.getClass().getName()));
+    }
+
+    private static int ownerActiveUsers(Object value) {
+        if (value instanceof LabelIndex index) return index.activeUsers;
+        if (value instanceof IntelEntityIndex index) return index.activeUsers;
+        if (value instanceof HitCache cache) return cache.activeUsers;
+        throw new IllegalArgumentException("Unsupported owner-cache value: "
+                + (value == null ? "null" : value.getClass().getName()));
+    }
+
+    // ---------------------------------------------------------------------
     // Map reconciliation and scratch collection reuse
     // ---------------------------------------------------------------------
 
@@ -624,6 +1045,9 @@ public final class StarsectorPrepatcherHooks {
         int next = scratch.scopeDepth;
         scratch.frameAt(next);
         scratch.scopeDepth = next + 1;
+        if (scratch.scopeDepth > scratch.maxDepthSinceIdle) {
+            scratch.maxDepthSinceIdle = scratch.scopeDepth;
+        }
     }
 
     /**
@@ -635,9 +1059,22 @@ public final class StarsectorPrepatcherHooks {
             Scratch scratch = SCRATCH.get();
             if (scratch.scopeDepth <= 0) return;
             int index = --scratch.scopeDepth;
-            scratch.frameAt(index).clear();
-            if (scratch.scopeDepth == 0 && scratch.removeWhenIdle) {
-                SCRATCH.remove();
+            ScratchFrame frame = scratch.frameAt(index);
+            PrepatcherConfig c = config;
+            long now = c != null && c.scratchTrimEnabled ? nanoTime() : 0L;
+            frame.clear(c, now);
+            if (c != null && c.scratchTrimEnabled && frame.shouldTrim(c, now)) {
+                countScratchTrimKinds(frame, c);
+                scratch.frames.set(index, new ScratchFrame());
+                SCRATCH_FRAME_REPLACEMENTS.increment();
+            }
+            if (scratch.scopeDepth == 0) {
+                if (c != null && c.scratchTrimEnabled
+                        && scratch.maxDepthSinceIdle > SCRATCH_RETAINED_FRAME_FLOOR) {
+                    scratch.trailingFramesLastUseNanos = now;
+                }
+                scratch.maxDepthSinceIdle = 0;
+                if (scratch.removeWhenIdle) SCRATCH.remove();
             }
         } catch (Throwable ignored) {
             // Never mask an original return value or exception.
@@ -660,7 +1097,7 @@ public final class StarsectorPrepatcherHooks {
     @SuppressWarnings({"rawtypes", "unchecked"})
     public static boolean retainAllFast(Set target, Collection keep, Object mapOwner) {
         PrepatcherConfig c = config;
-        if (c == null || !c.retainAll) {
+        if (c == null || !c.mapRenderStuff) {
             return target.retainAll(keep);
         }
 
@@ -681,6 +1118,8 @@ public final class StarsectorPrepatcherHooks {
             }
         }
 
+        scratch.observeIdentitySize(membership.size());
+
         if (!customEquality) {
             for (Object entity : target) {
                 if (entity != null && CUSTOM_EQUALITY.get(entity.getClass())) {
@@ -699,6 +1138,7 @@ public final class StarsectorPrepatcherHooks {
             equalityMembership = scratch.equalityMembership;
             equalityMembership.clear();
             equalityMembership.addAll(keep);
+            scratch.observeRetainedSet(equalityMembership);
             RETAIN_EQUALITY_FALLBACKS.increment();
         }
 
@@ -788,10 +1228,11 @@ public final class StarsectorPrepatcherHooks {
     @SuppressWarnings({"rawtypes", "unchecked"})
     public static ArrayList borrowEntityList(Collection source) {
         PrepatcherConfig c = config;
-        if (c == null || !c.scratchCollections) return new ArrayList(source);
+        if (c == null || !c.mapRenderStuff) return new ArrayList(source);
         ArrayList list = SCRATCH.get().scopeFrame().entityList;
         list.clear();
         list.addAll(source);
+        SCRATCH.get().scopeFrame().observeRetainedList(list);
         return list;
     }
 
@@ -822,6 +1263,7 @@ public final class StarsectorPrepatcherHooks {
         ScratchFrame frame = SCRATCH.get().scopeFrame();
         SnapshotList snapshot = frame.campaignSnapshotAt(frame.campaignSnapshotIndex++);
         snapshot.copyFrom(source);
+        frame.observeListSize(snapshot.size());
         return snapshot;
     }
 
@@ -1024,27 +1466,151 @@ public final class StarsectorPrepatcherHooks {
         return next < now ? Long.MAX_VALUE : next;
     }
 
-    /** Point-in-time market snapshot for Economy.advance()/paused advance only. */
-    @SuppressWarnings({"rawtypes", "unchecked"})
-    public static List borrowEconomyMarketsSnapshot(Economy economy) {
-        PrepatcherConfig c = config;
-        if (c == null || !c.economySnapshotReuse || economy == null) {
-            return economy == null ? Collections.emptyList() : economy.getMarketsCopy();
+    // ---------------------------------------------------------------------
+    // Exact Market.advance batch history
+    // ---------------------------------------------------------------------
+
+    /** Binds the top deferred-history frame to one concrete Market.advance invocation. */
+    public static void beginMarketAdvanceInvocation(MarketAPI market) {
+        MarketAdvanceInvocationContext invocation = MARKET_ADVANCE_INVOCATION.get();
+        invocation.depth++;
+        MarketAdvanceBatchFrame frame = MARKET_ADVANCE_BATCH_STACK.get().current();
+        if (frame != null && frame.visible && frame.market == market
+                && frame.boundInvocationDepth == 0) {
+            frame.boundInvocationDepth = invocation.depth;
         }
-        List source = economy.getMarkets();
-        ECONOMY_SNAPSHOT_ELEMENTS.add(source.size());
-        return borrowCampaignSnapshot(source);
     }
 
-    /** Concrete ArrayList snapshot for sites whose bytecode calls ArrayList.iterator(). */
-    @SuppressWarnings({"rawtypes", "unchecked"})
-    public static ArrayList borrowEconomyCollectionSnapshot(Collection source) {
+    /** Completes the concrete Market.advance invocation opened above. */
+    public static void endMarketAdvanceInvocation() {
+        MarketAdvanceInvocationContext invocation = MARKET_ADVANCE_INVOCATION.get();
+        if (invocation.depth <= 0) {
+            MARKET_ADVANCE_INVOCATION.remove();
+            return;
+        }
+        invocation.depth--;
+        if (invocation.depth == 0) MARKET_ADVANCE_INVOCATION.remove();
+    }
+
+    public static boolean hasCurrentMarketAdvanceBatch(MarketAPI market) {
+        if (market == null) return false;
+        MarketAdvanceBatchFrame frame = MARKET_ADVANCE_BATCH_STACK.get().current();
+        if (frame == null || !frame.visible || frame.market != market) return false;
+        int invocationDepth = MARKET_ADVANCE_INVOCATION.get().depth;
+        return invocationDepth > 0 && frame.boundInvocationDepth == invocationDepth;
+    }
+
+    public static int currentMarketAdvanceBatchRunCount(MarketAPI market) {
+        MarketAdvanceBatchFrame frame = requireCurrentMarketAdvanceBatch(market);
+        return frame.runCount;
+    }
+
+    public static float currentMarketAdvanceBatchRunAmount(MarketAPI market, int runIndex) {
+        MarketAdvanceBatchFrame frame = requireCurrentMarketAdvanceBatch(market);
+        if (runIndex < 0 || runIndex >= frame.runCount) {
+            throw new IndexOutOfBoundsException("runIndex=" + runIndex
+                    + ", runCount=" + frame.runCount);
+        }
+        return frame.runAmounts[runIndex];
+    }
+
+    public static int currentMarketAdvanceBatchRunRepeats(MarketAPI market, int runIndex) {
+        MarketAdvanceBatchFrame frame = requireCurrentMarketAdvanceBatch(market);
+        if (runIndex < 0 || runIndex >= frame.runCount) {
+            throw new IndexOutOfBoundsException("runIndex=" + runIndex
+                    + ", runCount=" + frame.runCount);
+        }
+        return frame.runRepeats[runIndex];
+    }
+
+    private static MarketAdvanceBatchFrame requireCurrentMarketAdvanceBatch(MarketAPI market) {
+        if (!hasCurrentMarketAdvanceBatch(market)) {
+            throw new IllegalStateException("No Market.advance batch for the current invocation");
+        }
+        return MARKET_ADVANCE_BATCH_STACK.get().current();
+    }
+
+    /** Called by the three transformed vanilla component wrappers. */
+    public static void recordMarketComponentReplayedStep(int component) {
+        switch (component) {
+            case 1 -> MILITARY_BASE_REPLAYED_STEPS.increment();
+            case 2 -> LIONS_GUARD_REPLAYED_STEPS.increment();
+            case 3 -> RECENT_UNREST_REPLAYED_STEPS.increment();
+            default -> throw new IllegalArgumentException("Unknown replay component: " + component);
+        }
+    }
+
+    /** RecentUnrest is no longer invoked by vanilla after its condition removes itself. */
+    public static boolean shouldContinueRecentUnrestReplay(MarketAPI market) {
+        if (market == null) return false;
+        try {
+            return market.hasCondition(Conditions.RECENT_UNREST);
+        } catch (Throwable failure) {
+            // Losing the remaining replay silently is less safe than preserving
+            // the original failure semantics and aborting the enclosing advance.
+            throwUnchecked(failure);
+            return false;
+        }
+    }
+
+    /** Associates a ConstructionQueue with its weak Market owner without changing serialization. */
+    public static ConstructionQueue registerConstructionQueueOwner(
+            ConstructionQueue queue, MarketAPI market) {
+        if (queue == null || market == null) return queue;
+        try {
+            WeakReference<MarketAPI> existing = CONSTRUCTION_QUEUE_OWNERS.get(queue);
+            if (existing != null && existing.get() == market) return queue;
+            CONSTRUCTION_QUEUE_OWNERS.put(queue, new WeakReference<>(market));
+        } catch (Throwable ignored) {
+            MARKET_SCHEDULER_STATE_FAILURES.increment();
+        }
+        return queue;
+    }
+
+    /** Exact pending replay barrier inserted at ConstructionQueue mutator entry. */
+    public static void flushPendingConstructionQueueBeforeMutation(ConstructionQueue queue) {
+        if (queue == null) return;
+        try {
+            WeakReference<MarketAPI> reference = CONSTRUCTION_QUEUE_OWNERS.get(queue);
+            MarketAPI market = reference == null ? null : reference.get();
+            if (market != null) flushPendingMarketBeforeMutation(market);
+        } catch (Throwable failure) {
+            throwUnchecked(failure);
+        }
+    }
+
+    /** Exact pending replay barrier inserted before construction-structure mutation. */
+    public static void flushPendingMarketBeforeMutation(MarketAPI market) {
+        if (market == null || !marketSchedulerReady) return;
         PrepatcherConfig c = config;
-        if (c == null || !c.economySnapshotReuse) return new ArrayList(source);
-        ArrayList result = SCRATCH.get().scopeFrame().pooledList();
-        result.addAll(source);
-        ECONOMY_SNAPSHOT_ELEMENTS.add(source.size());
-        return result;
+        if (c == null || !c.marketScheduler) return;
+        MarketScheduleState state;
+        try {
+            state = MARKET_SCHEDULER_STATES.get(market);
+        } catch (Throwable ignored) {
+            MARKET_SCHEDULER_STATE_FAILURES.increment();
+            return;
+        }
+        if (state == null) return;
+        boolean pending;
+        synchronized (state) {
+            if (state.inAdvance || state.disabled) return;
+            pending = state.pendingSteps > 0;
+        }
+        if (pending) {
+            CONSTRUCTION_BOUNDARY_EXACT_REPLAYS.increment();
+            deliverPendingExact(market, state, MARKET_ORIGIN_SCHEDULER_FALLBACK, false);
+        }
+        // The hook runs immediately before the mutation. Leave the state dirty
+        // so the next scheduler input scans the post-mutation structure once.
+        markConstructionStateDirty(state);
+    }
+
+    private static void markConstructionStateDirty(MarketScheduleState state) {
+        synchronized (state) {
+            long next = state.constructionMutationEpoch + 1L;
+            state.constructionMutationEpoch = next <= 0L ? 1L : next;
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -1063,10 +1629,10 @@ public final class StarsectorPrepatcherHooks {
     }
 
     /**
-     * Observation-only replacement for direct mod call sites. The original
-     * MarketAPI.advance call remains synchronous and receives the exact same
-     * receiver and amount. Telemetry failures are deliberately swallowed so the
-     * wrapper can never suppress or replace game/mod behavior.
+     * Synchronous replacement for direct mod call sites. Observation is optional.
+     * With the market scheduler enabled, pending engine debt is delivered before
+     * the direct amount in the same callback so a later direct call cannot overtake
+     * earlier deferred time. Telemetry failures never suppress game/mod behavior.
      */
     public static void observeDirectMarketAdvance(MarketAPI market, float amount,
                                                    long siteId, String metadata) {
@@ -1091,7 +1657,8 @@ public final class StarsectorPrepatcherHooks {
         context.siteId = siteId;
         boolean success = false;
         try {
-            market.advance(amount);
+            advanceMarketImmediatelyWithPending(
+                    market, amount, MARKET_ORIGIN_DIRECT_CALL_SITE);
             success = true;
         } finally {
             context.origin = previousOrigin;
@@ -1131,7 +1698,8 @@ public final class StarsectorPrepatcherHooks {
         long previousSiteId = context.siteId;
         context.origin = origin;
         context.depth = previousDepth + 1;
-        context.siteId = 0L;
+        context.siteId = origin == MARKET_ORIGIN_DIRECT_CALL_SITE
+                ? previousSiteId : 0L;
         try {
             market.advance(amount);
         } finally {
@@ -1141,497 +1709,1058 @@ public final class StarsectorPrepatcherHooks {
         }
     }
 
-    /**
-     * Captures the shared policy inputs for one Economy.advance() pass. The
-     * transformed market loop calls this exactly once before it begins. Remote
-     * markets are then assigned stable phases without repeating Global/UI/clock
-     * lookups for every market.
-     */
-    public static void beginRemoteMarketFrame() {
-        // patchRemoteMarketScheduler guarantees that Economy.advance owns a
-        // scratch scope. A nested Economy.advance therefore has depth > 1; it
-        // must run vanilla-immediate without overwriting the outer pass context.
-        if (SCRATCH.get().scopeDepth != 1) {
-            REMOTE_MARKET_FALLBACKS.increment();
+
+    /** Immediate path shared by scheduler fail-open and transformed core event call sites. */
+    public static void advanceMarketSynchronized(MarketAPI market, float amount, int source) {
+        if (market == null) throw new NullPointerException("market");
+        int origin = source == 1
+                ? MARKET_ORIGIN_PLANET_CONDITION_FALLBACK
+                : MARKET_ORIGIN_SCHEDULER_FALLBACK;
+        advanceMarketImmediatelyWithPending(market, amount, origin);
+    }
+
+    private static void advanceMarketImmediatelyWithPending(
+            MarketAPI market, float amount, int origin) {
+        if (market == null) throw new NullPointerException("market");
+        if (!Float.isFinite(amount) || amount < 0f) {
+            invokeObservedMarketAdvance(market, amount, origin);
             return;
         }
 
-        PrepatcherConfig c = config;
-        long generation = campaignCacheGeneration;
-        if (c == null || (!c.remoteMarketScheduler && !c.planetConditionMarketScheduler)
-                || !campaignCachesReady(generation)) {
-            remoteMarketFrameGeneration = -1L;
-            remoteMarketCurrentLocation = null;
-            remoteMarketInteractionMarket = null;
-            remoteMarketSecondsPerDay = Float.NaN;
+        MarketScheduleState state = null;
+        boolean reentrant = false;
+        boolean hasPending = false;
+        try {
+            state = MARKET_SCHEDULER_STATES.get(market);
+            if (state != null) {
+                synchronized (state) {
+                    reentrant = state.inAdvance;
+                    hasPending = !state.disabled && !state.inAdvance
+                            && state.pendingSteps > 0;
+                }
+            }
+        } catch (Throwable ignored) {
+            MARKET_SCHEDULER_STATE_FAILURES.increment();
+            state = null;
+        }
+
+        if (reentrant) {
+            MARKET_SCHEDULER_REENTRANT_CALLS.increment();
+            invokeObservedMarketAdvance(market, amount, origin);
             return;
+        }
+
+        if (hasPending && state != null) {
+            MARKET_SCHEDULER_SYNCHRONIZED_ADVANCES.increment();
+            if (origin == MARKET_ORIGIN_DIRECT_CALL_SITE) {
+                MARKET_SCHEDULER_DIRECT_SYNCHRONIZATIONS.increment();
+            }
+            boolean construction = updateConstructionMode(market, state);
+            if (construction) {
+                deliverPendingExact(market, state, origin, false);
+            } else {
+                deliverPendingCoalesced(market, state, origin, false, false);
+            }
+        }
+
+        // A direct/fail-open/full-rate call is a distinct vanilla step. It is
+        // deliberately not included in the deferred batch context.
+        invokeObservedMarketAdvance(market, amount, origin);
+    }
+
+    private static boolean updateConstructionMode(
+            MarketAPI market, MarketScheduleState state) {
+        return updateConstructionMode(market, state, false);
+    }
+
+    /**
+     * Construction policy is mutation-driven. Structural barriers increment an
+     * epoch; the expensive queue/industry scan runs only for a new epoch or a
+     * rare safety audit. Save uses forceAudit=true.
+     */
+    private static boolean updateConstructionMode(
+            MarketAPI market, MarketScheduleState state, boolean forceAudit) {
+        PrepatcherConfig c = config;
+        long auditBatch = marketSchedulerRenderBatch;
+        long observedEpoch;
+        boolean dirtyScan;
+        boolean safetyAudit;
+        synchronized (state) {
+            observedEpoch = state.constructionMutationEpoch;
+            long last = state.lastConstructionAuditBatch;
+            boolean auditDue = last == Long.MIN_VALUE || auditBatch < last
+                    || auditBatch - last >= (c == null
+                    ? 60 : c.marketSchedulerConstructionAuditBatches);
+            dirtyScan = state.constructionAuditedEpoch != observedEpoch;
+            safetyAudit = !forceAudit && !dirtyScan && auditDue;
+            if (!(forceAudit || dirtyScan || auditDue)) {
+                CONSTRUCTION_CACHED_DECISIONS.increment();
+                return state.constructionFullRate;
+            }
+            state.lastConstructionAuditBatch = auditBatch;
+        }
+
+        CONSTRUCTION_SCANS.increment();
+        if (forceAudit) CONSTRUCTION_FORCED_SCANS.increment();
+        else if (dirtyScan) CONSTRUCTION_DIRTY_SCANS.increment();
+        else if (safetyAudit) CONSTRUCTION_SAFETY_AUDIT_SCANS.increment();
+
+        ConstructionDiagnostics diagnostics = CONSTRUCTION_DIAGNOSTICS;
+        ConstructionProbe probe = diagnostics == null ? null : CONSTRUCTION_PROBE.get();
+        if (probe != null) probe.reset();
+        int reasonMask;
+        try {
+            reasonMask = scanConstructionState(market, probe);
+        } catch (Throwable failure) {
+            reasonMask = CONSTRUCTION_REASON_PROBE_FAILURE;
+            if (probe != null) probe.failure(failure);
+        }
+        if ((reasonMask & CONSTRUCTION_REASON_PROBE_FAILURE) != 0) {
+            MARKET_SCHEDULER_POLICY_FAILURES.increment();
+        }
+        recordConstructionReasonCounters(reasonMask);
+        boolean active = (reasonMask & CONSTRUCTION_REASON_ACTIVE_MASK) != 0;
+
+        boolean oldActive;
+        int oldReasonMask;
+        int finalReasonMask;
+        boolean mutationRace;
+        long auditedEpoch;
+        long lastAuditBatch;
+        synchronized (state) {
+            oldActive = state.constructionFullRate;
+            oldReasonMask = state.constructionReasonMask;
+            mutationRace = state.constructionMutationEpoch != observedEpoch;
+            if (mutationRace) {
+                CONSTRUCTION_MUTATION_RACES.increment();
+                finalReasonMask = reasonMask | CONSTRUCTION_REASON_MUTATION_RACE;
+                active = true;
+            } else {
+                finalReasonMask = reasonMask;
+                state.constructionAuditedEpoch = observedEpoch;
+            }
+            state.constructionReasonMask = finalReasonMask;
+            if (oldReasonMask != finalReasonMask) CONSTRUCTION_REASON_CHANGES.increment();
+            if (oldActive != active) {
+                state.constructionFullRate = active;
+                CONSTRUCTION_AUDIT_STATE_CHANGES.increment();
+                if (active) {
+                    CONSTRUCTION_MODE_ENTRIES.increment();
+                    CONSTRUCTION_AUDIT_FALSE_TO_TRUE.increment();
+                } else {
+                    CONSTRUCTION_MODE_EXITS.increment();
+                    CONSTRUCTION_AUDIT_TRUE_TO_FALSE.increment();
+                }
+            }
+            auditedEpoch = state.constructionAuditedEpoch;
+            lastAuditBatch = state.lastConstructionAuditBatch;
+        }
+
+        if (diagnostics != null) {
+            diagnostics.observe(market, probe, forceAudit ? "FORCED"
+                            : (dirtyScan ? "DIRTY" : "SAFETY_AUDIT"),
+                    observedEpoch, auditedEpoch, lastAuditBatch,
+                    oldActive, active, oldReasonMask, finalReasonMask);
+        }
+        return active;
+    }
+
+    private static int scanConstructionState(MarketAPI market, ConstructionProbe probe) {
+        int reasonMask = 0;
+        ConstructionQueue queue = null;
+        try {
+            // Market.getConstructionQueue() already performs weak owner registration.
+            // Do not repeat that synchronized weak-map write in the policy scanner.
+            queue = market.getConstructionQueue();
+            if (probe != null) probe.queueClass = queue == null ? "" : queue.getClass().getName();
+            if (queue == null) {
+                CONSTRUCTION_QUEUE_NULL_SCANS.increment();
+            } else {
+                List<?> items = queue.getItems();
+                if (items == null) {
+                    CONSTRUCTION_QUEUE_ITEMS_NULL_SCANS.increment();
+                    reasonMask |= CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN;
+                    if (probe != null) probe.queueSize = -1;
+                } else {
+                    int size = items.size();
+                    CONSTRUCTION_QUEUE_ITEMS_OBSERVED.add(size);
+                    updateMax(CONSTRUCTION_MAX_QUEUE_ITEMS, size);
+                    if (probe != null) probe.queueSize = size;
+                    if (size > 0) reasonMask |= CONSTRUCTION_REASON_QUEUE_NON_EMPTY;
+                }
+            }
+        } catch (Throwable failure) {
+            reasonMask |= CONSTRUCTION_REASON_PROBE_FAILURE;
+            if (probe != null) probe.failure(failure);
         }
 
         try {
+            List<Industry> industries = market.getIndustries();
+            if (industries == null) {
+                CONSTRUCTION_INDUSTRIES_NULL_SCANS.increment();
+                reasonMask |= CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN;
+                if (probe != null) probe.industryCount = -1;
+            } else {
+                int size = industries.size();
+                CONSTRUCTION_INDUSTRIES_SCANNED.add(size);
+                updateMax(CONSTRUCTION_MAX_INDUSTRIES_SCANNED, size);
+                if (probe != null) probe.industryCount = size;
+                for (int i = 0; i < size; i++) {
+                    Industry industry = industries.get(i);
+                    if (industry == null) continue;
+                    boolean reportedBuilding = false;
+                    boolean upgrading = false;
+                    Boolean rawBuilding = null;
+                    try {
+                        reportedBuilding = industry.isBuilding();
+                    } catch (Throwable failure) {
+                        reasonMask |= CONSTRUCTION_REASON_PROBE_FAILURE;
+                        if (probe != null) probe.failure(failure);
+                    }
+                    try {
+                        upgrading = industry.isUpgrading();
+                    } catch (Throwable failure) {
+                        reasonMask |= CONSTRUCTION_REASON_PROBE_FAILURE;
+                        if (probe != null) probe.failure(failure);
+                    }
+                    try {
+                        rawBuilding = rawBaseIndustryBuilding(industry);
+                    } catch (Throwable failure) {
+                        reasonMask |= CONSTRUCTION_REASON_PROBE_FAILURE;
+                        if (probe != null) probe.failure(failure);
+                    }
+                    int buildingReason = constructionBuildingReason(
+                            reportedBuilding, rawBuilding);
+                    boolean effectiveBuilding = (buildingReason
+                            & CONSTRUCTION_REASON_INDUSTRY_BUILDING) != 0;
+                    boolean reportedBuildingWithoutRaw = (buildingReason
+                            & CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW) != 0;
+                    if (effectiveBuilding) {
+                        reasonMask |= CONSTRUCTION_REASON_INDUSTRY_BUILDING;
+                        if (probe != null) {
+                            probe.captureBuildingIndustry(industry, i, rawBuilding);
+                        }
+                    }
+                    if (reportedBuildingWithoutRaw) {
+                        reasonMask |= CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW;
+                        if (probe != null) {
+                            probe.captureReportedBuildingWithoutRawIndustry(
+                                    industry, i, rawBuilding);
+                        }
+                    }
+                    if (upgrading) {
+                        reasonMask |= CONSTRUCTION_REASON_INDUSTRY_UPGRADING;
+                        if (probe != null) {
+                            probe.captureUpgradingIndustry(industry, i, rawBuilding);
+                        }
+                    }
+                    if (probe != null
+                            && (reportedBuilding || effectiveBuilding || upgrading)
+                            && probe.industryIndex < 0) {
+                        probe.captureIndustry(industry, i, reportedBuilding,
+                                effectiveBuilding, upgrading);
+                    }
+                }
+            }
+        } catch (Throwable failure) {
+            reasonMask |= CONSTRUCTION_REASON_PROBE_FAILURE;
+            if (probe != null) probe.failure(failure);
+        }
+        return reasonMask;
+    }
+
+    /**
+     * Classifies the public building signal against the authoritative raw
+     * BaseIndustry field. A null raw value denotes a non-BaseIndustry
+     * implementation, for which the interface signal remains authoritative.
+     */
+    private static int constructionBuildingReason(
+            boolean reportedBuilding, Boolean rawBuilding) {
+        if (rawBuilding == null) {
+            return reportedBuilding ? CONSTRUCTION_REASON_INDUSTRY_BUILDING : 0;
+        }
+        if (rawBuilding.booleanValue()) {
+            return CONSTRUCTION_REASON_INDUSTRY_BUILDING;
+        }
+        return reportedBuilding
+                ? CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW : 0;
+    }
+
+    private static VarHandle baseIndustryBuildingHandle() {
+        if (!baseIndustryBuildingHandleResolved) {
+            synchronized (StarsectorPrepatcherHooks.class) {
+                if (!baseIndustryBuildingHandleResolved) {
+                    try {
+                        baseIndustryBuildingHandle =
+                                privateVarHandle(BaseIndustry.class, "building");
+                    } catch (Throwable ignored) {
+                        baseIndustryBuildingHandle = null;
+                    }
+                    baseIndustryBuildingHandleResolved = true;
+                }
+            }
+        }
+        return baseIndustryBuildingHandle;
+    }
+
+    /**
+     * Returns the authoritative BaseIndustry construction flag. A null result
+     * means the implementation is not a BaseIndustry and the interface method
+     * remains the only available signal. Failure to access the known field is
+     * treated as a probe failure so the scheduler fails open.
+     */
+    private static Boolean rawBaseIndustryBuilding(Industry industry) {
+        if (!(industry instanceof BaseIndustry)) return null;
+        VarHandle handle = baseIndustryBuildingHandle();
+        if (handle == null) {
+            throw new IllegalStateException(
+                    "BaseIndustry.building field is unavailable");
+        }
+        return (boolean) handle.get(industry);
+    }
+
+    private static void recordConstructionReasonCounters(int reasonMask) {
+        int semanticReasons = 0;
+        if ((reasonMask & CONSTRUCTION_REASON_QUEUE_NON_EMPTY) != 0) {
+            CONSTRUCTION_DETECTED_QUEUE_NON_EMPTY.increment();
+            semanticReasons++;
+        }
+        if ((reasonMask & CONSTRUCTION_REASON_INDUSTRY_BUILDING) != 0) {
+            CONSTRUCTION_DETECTED_INDUSTRY_BUILDING.increment();
+            semanticReasons++;
+        }
+        if ((reasonMask & CONSTRUCTION_REASON_INDUSTRY_UPGRADING) != 0) {
+            CONSTRUCTION_DETECTED_INDUSTRY_UPGRADING.increment();
+            semanticReasons++;
+        }
+        if ((reasonMask & CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW) != 0) {
+            CONSTRUCTION_DETECTED_REPORTED_BUILDING_WITHOUT_RAW.increment();
+            semanticReasons++;
+        }
+        if ((reasonMask & CONSTRUCTION_REASON_PROBE_FAILURE) != 0) {
+            CONSTRUCTION_DETECTED_PROBE_FAILURE.increment();
+            semanticReasons++;
+        }
+        if ((reasonMask & CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN) != 0) semanticReasons++;
+        if ((reasonMask & CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN) != 0) semanticReasons++;
+        if (semanticReasons > 1) CONSTRUCTION_DETECTED_MULTIPLE_REASONS.increment();
+    }
+
+    private static void updateMax(AtomicLong target, long value) {
+        long current;
+        while (value > (current = target.get()) && !target.compareAndSet(current, value)) {
+            // Retry only when another observation raised the high-water concurrently.
+        }
+    }
+
+    private static boolean wouldCreateNewPendingRun(
+            MarketScheduleState state, float amount) {
+        PendingStepRun last = state.pendingRuns == null
+                ? null : state.pendingRuns.peekLast();
+        return last == null || Float.floatToRawIntBits(last.amount)
+                != Float.floatToRawIntBits(amount);
+    }
+
+    private static boolean appendPendingStepLocked(
+            MarketScheduleState state, float amount) {
+        float total = state.pendingAmount + amount;
+        if (!Float.isFinite(total) || total < 0f
+                || state.pendingSteps == Integer.MAX_VALUE) {
+            return false;
+        }
+        if (state.pendingRuns == null) state.pendingRuns = new ArrayDeque<>();
+        PendingStepRun last = state.pendingRuns.peekLast();
+        if (last != null && Float.floatToRawIntBits(last.amount)
+                == Float.floatToRawIntBits(amount)) {
+            if (last.count == Integer.MAX_VALUE) return false;
+            last.count++;
+        } else {
+            state.pendingRuns.addLast(new PendingStepRun(amount));
+        }
+        state.pendingAmount = total;
+        state.pendingSteps++;
+        updateMaximum(PENDING_MARKET_STEPS_HIGH_WATER, state.pendingSteps);
+        updateMaximum(PENDING_MARKET_RUNS_HIGH_WATER, state.pendingRuns.size());
+        return true;
+    }
+
+    private static void clearPendingLocked(MarketScheduleState state) {
+        state.pendingAmount = 0f;
+        state.pendingSteps = 0;
+        if (state.pendingRuns != null) state.pendingRuns.clear();
+        state.debtSequence = 0L;
+        state.sourceMask = 0;
+    }
+
+    private static MarketAdvanceBatchFrame detachPendingLocked(
+            MarketAPI market, MarketScheduleState state, boolean visible) {
+        if (state.pendingSteps <= 0) return null;
+        MarketAdvanceBatchStack stack = MARKET_ADVANCE_BATCH_STACK.get();
+        MarketAdvanceBatchFrame frame = stack.push(market, state, visible);
+        clearPendingLocked(state);
+        state.inAdvance = true;
+        if (visible) MARKET_BATCH_CONTEXTS_CREATED.increment();
+        return frame;
+    }
+
+    private static int originForStateLocked(MarketScheduleState state, int fallbackOrigin) {
+        if ((state.sourceMask & (1 << 1)) != 0) {
+            return MARKET_ORIGIN_PLANET_CONDITION_SCHEDULED;
+        }
+        if ((state.sourceMask & 1) != 0) return MARKET_ORIGIN_SCHEDULED;
+        return fallbackOrigin;
+    }
+
+    private static int deliverPendingCoalesced(
+            MarketAPI market, MarketScheduleState state, int fallbackOrigin,
+            boolean countFullAdvance, boolean saveFlush) {
+        MarketAdvanceBatchFrame frame;
+        int origin;
+        synchronized (state) {
+            if (state.disabled || state.inAdvance || state.pendingSteps <= 0) return 0;
+            origin = originForStateLocked(state, fallbackOrigin);
+            frame = detachPendingLocked(market, state, true);
+        }
+        if (frame == null) return 0;
+        boolean success = false;
+        try {
+            invokeObservedMarketAdvance(market, frame.totalAmount, origin);
+            success = true;
+            COALESCED_MARKET_FLUSHES.increment();
+            COALESCED_MARKET_AMOUNT.add(frame.totalAmount);
+            if (countFullAdvance) MARKET_SCHEDULER_FULL_ADVANCES.increment();
+            if (saveFlush) {
+                SAVE_COALESCED_MARKETS.increment();
+                MARKET_SCHEDULER_SAVE_FLUSHES.increment();
+            }
+            return frame.totalSteps;
+        } catch (Throwable failure) {
+            MARKET_SCHEDULER_ADVANCE_FAILURES.increment();
+            synchronized (state) {
+                state.disabled = true;
+                clearPendingLocked(state);
+            }
+            throwUnchecked(failure);
+            return 0;
+        } finally {
+            synchronized (state) {
+                state.inAdvance = false;
+            }
+            MARKET_ADVANCE_BATCH_STACK.get().pop(frame);
+            if (!success && saveFlush) MARKET_SCHEDULER_SAVE_FLUSH_FAILURES.increment();
+        }
+    }
+
+    private static int deliverPendingExact(
+            MarketAPI market, MarketScheduleState state, int fallbackOrigin,
+            boolean saveFlush) {
+        MarketAdvanceBatchFrame frame;
+        int origin;
+        synchronized (state) {
+            if (state.disabled || state.inAdvance || state.pendingSteps <= 0) return 0;
+            origin = originForStateLocked(state, fallbackOrigin);
+            frame = detachPendingLocked(market, state, false);
+        }
+        if (frame == null) return 0;
+        int delivered = 0;
+        boolean success = false;
+        try {
+            for (int run = 0; run < frame.runCount; run++) {
+                float step = frame.runAmounts[run];
+                int repeats = frame.runRepeats[run];
+                for (int i = 0; i < repeats; i++) {
+                    invokeObservedMarketAdvance(market, step, origin);
+                    delivered++;
+                }
+            }
+            success = true;
+            if (saveFlush) {
+                SAVE_EXACT_REPLAY_MARKETS.increment();
+                SAVE_EXACT_REPLAY_STEPS.add(delivered);
+                MARKET_SCHEDULER_SAVE_FLUSHES.increment();
+            }
+            return delivered;
+        } catch (Throwable failure) {
+            MARKET_SCHEDULER_ADVANCE_FAILURES.increment();
+            synchronized (state) {
+                state.disabled = true;
+                clearPendingLocked(state);
+            }
+            throwUnchecked(failure);
+            return delivered;
+        } finally {
+            synchronized (state) {
+                state.inAdvance = false;
+            }
+            MARKET_ADVANCE_BATCH_STACK.get().pop(frame);
+            if (!success && saveFlush) MARKET_SCHEDULER_SAVE_FLUSH_FAILURES.increment();
+        }
+    }
+
+    private static int deliverPendingForSave(
+            MarketAPI market, MarketScheduleState state, boolean exact) {
+        MarketAdvanceBatchFrame frame;
+        int origin;
+        synchronized (state) {
+            if (state.inAdvance) {
+                throw new IllegalStateException("Cannot save while a market callback is active");
+            }
+            if (state.disabled || state.pendingSteps <= 0) return 0;
+            // Save attribution is a serialization barrier regardless of which
+            // periodic source originally accumulated the debt.
+            origin = MARKET_ORIGIN_SAVE_FLUSH;
+            frame = detachPendingLocked(market, state, !exact);
+        }
+        if (frame == null) return 0;
+
+        int delivered = 0;
+        try {
+            if (exact) {
+                for (int run = 0; run < frame.runCount; run++) {
+                    int repeats = frame.runRepeats[run];
+                    for (int repeat = 0; repeat < repeats; repeat++) {
+                        invokeObservedMarketAdvance(
+                                market, frame.runAmounts[run], origin);
+                        delivered++;
+                    }
+                }
+                SAVE_EXACT_REPLAY_MARKETS.increment();
+                SAVE_EXACT_REPLAY_STEPS.add(delivered);
+            } else {
+                invokeObservedMarketAdvance(market, frame.totalAmount, origin);
+                delivered = frame.totalSteps;
+                COALESCED_MARKET_FLUSHES.increment();
+                COALESCED_MARKET_AMOUNT.add(frame.totalAmount);
+                SAVE_COALESCED_MARKETS.increment();
+            }
+            MARKET_SCHEDULER_SAVE_FLUSHES.increment();
+            return delivered;
+        } catch (Throwable failure) {
+            MARKET_SCHEDULER_SAVE_FLUSH_FAILURES.increment();
+            synchronized (state) {
+                // Once a callback has started, its side effects are ambiguous.
+                // Never restore that detached history for an automatic retry:
+                // discard it, disable coalescing for this market, and abort save.
+                state.disabled = true;
+                clearPendingLocked(state);
+            }
+            PrepatcherLog.warn("Market scheduler save callback failed after delivery began; "
+                    + "detached debt was discarded and this market was switched to immediate "
+                    + "execution to prevent duplicate side effects: " + failure);
+            throwUnchecked(failure);
+            return delivered;
+        } finally {
+            synchronized (state) {
+                state.inAdvance = false;
+            }
+            MARKET_ADVANCE_BATCH_STACK.get().pop(frame);
+        }
+    }
+
+    /**
+     * Registers one successfully initialized bytecode component of the unified scheduler.
+     * Scheduling remains disabled until all core cadence/source/save components and every
+     * mandatory semantic boundary, local replay wrapper and construction-mutation barrier have
+     * completed class initialization.
+     */
+    public static void registerMarketSchedulerComponent(int component) {
+        if (component != MARKET_SCHEDULER_COMPONENT_ENGINE
+                && component != MARKET_SCHEDULER_COMPONENT_ECONOMY
+                && component != MARKET_SCHEDULER_COMPONENT_ENTITY
+                && component != MARKET_SCHEDULER_COMPONENT_SAVE
+                && component != MARKET_SCHEDULER_COMPONENT_BATCH_PROTOCOL
+                && component != MARKET_SCHEDULER_COMPONENT_MARKET_SEMANTICS
+                && component != MARKET_SCHEDULER_COMPONENT_MILITARY_BASE
+                && component != MARKET_SCHEDULER_COMPONENT_LIONS_GUARD
+                && component != MARKET_SCHEDULER_COMPONENT_RECENT_UNREST
+                && component != MARKET_SCHEDULER_COMPONENT_BASE_INDUSTRY
+                && component != MARKET_SCHEDULER_COMPONENT_CONSTRUCTION_QUEUE) {
+            throw new IllegalArgumentException("Unknown market scheduler component: " + component);
+        }
+        int current;
+        int updated;
+        do {
+            current = MARKET_SCHEDULER_COMPONENTS.get();
+            updated = current | component;
+            if (current == updated) return;
+        } while (!MARKET_SCHEDULER_COMPONENTS.compareAndSet(current, updated));
+        System.setProperty("starsector.prepatcher.marketSchedulerCapabilityMask",
+                Integer.toString(updated));
+        if (updated == MARKET_SCHEDULER_COMPONENT_ALL && !marketSchedulerReady) {
+            marketSchedulerReady = true;
+            PrepatcherLog.info("market scheduler READY: core cadence/source/save components"
+                    + " + Market invocation context + MilitaryBase/LionsGuardHQ/RecentUnrest"
+                    + " replay wrappers + BaseIndustry/ConstructionQueue mutation barriers");
+        }
+    }
+
+    /** Opens one simulation tick inside the current render batch. */
+    public static void beginMarketSchedulerTick() {
+        MarketSchedulerTick tick = MARKET_SCHEDULER_TICK.get();
+        tick.depth++;
+        if (tick.depth > 1) {
+            MARKET_SCHEDULER_NESTED_TICKS.increment();
+            return;
+        }
+        tick.clearContext();
+
+        if (!marketSchedulerReady) {
+            MARKET_SCHEDULER_NOT_READY_TICKS.increment();
+            return;
+        }
+        PrepatcherConfig c = config;
+        long generation = campaignCacheGeneration;
+        if (c == null || !c.marketScheduler || !campaignCachesReady(generation)) return;
+
+        MarketSchedulerBatch batch = MARKET_SCHEDULER_BATCH.get();
+        if (batch.finishing) {
+            MARKET_SCHEDULER_NESTED_TICKS.increment();
+            return;
+        }
+        try {
             SectorAPI sector = Global.getSector();
             if (sector == null) throw new IllegalStateException("Global sector is unavailable");
-
             LocationAPI currentLocation = sector.getCurrentLocation();
             MarketAPI interactionMarket = null;
-            if (c.remoteMarketHotInteraction) {
+            if (c.marketSchedulerHotInteraction) {
                 CampaignUIAPI ui = sector.getCampaignUI();
                 InteractionDialogAPI dialog = ui == null ? null : ui.getCurrentInteractionDialog();
                 SectorEntityToken target = dialog == null ? null : dialog.getInteractionTarget();
                 interactionMarket = target == null ? null : target.getMarket();
             }
 
-            float secondsPerDay = sector.getClock() == null
-                    ? Float.NaN : sector.getClock().getSecondsPerDay();
-            long next = remoteMarketFrame + 1L;
-            if (next <= 0L) next = 1L;
+            if (!batch.open || batch.generation != generation) {
+                batch.open(generation, nextMarketSchedulerRenderBatch());
+            }
+            batch.simulationTicks++;
+            batch.currentLocation = currentLocation;
+            batch.interactionMarket = interactionMarket;
 
-            // Publish dependent values first and the generation last. A hook
-            // that observes the generation therefore sees a complete context.
-            remoteMarketFrame = next;
-            remoteMarketCurrentLocation = currentLocation;
-            remoteMarketInteractionMarket = interactionMarket;
-            remoteMarketSecondsPerDay = secondsPerDay;
-            remoteMarketFrameGeneration = generation;
-            REMOTE_MARKET_FRAMES.increment();
+            long nextTick = marketSchedulerSimulationTick + 1L;
+            if (nextTick <= 0L) nextTick = 1L;
+            marketSchedulerSimulationTick = nextTick;
+
+            tick.active = true;
+            tick.generation = generation;
+            tick.simulationTick = nextTick;
+            tick.batch = batch.id;
+            tick.currentLocation = currentLocation;
+            tick.interactionMarket = interactionMarket;
+            MARKET_SCHEDULER_SIMULATION_TICKS.increment();
+            if (batch.fastForwardIteration) MARKET_SCHEDULER_FAST_FORWARD_TICKS.increment();
         } catch (Throwable ignored) {
-            remoteMarketFrameGeneration = -1L;
-            remoteMarketCurrentLocation = null;
-            remoteMarketInteractionMarket = null;
-            remoteMarketSecondsPerDay = Float.NaN;
-            REMOTE_MARKET_FALLBACKS.increment();
+            tick.clearContext();
+            MARKET_SCHEDULER_FRAME_CAPTURE_FAILURES.increment();
         }
     }
 
+    /** Closes only the current simulation tick; the render batch remains open. */
+    public static void endMarketSchedulerTick() {
+        MarketSchedulerTick tick = MARKET_SCHEDULER_TICK.get();
+        if (tick.depth <= 0) {
+            MARKET_SCHEDULER_TICK.remove();
+            return;
+        }
+        if (tick.depth == 1) tick.clearContext();
+        tick.depth--;
+        if (tick.depth == 0) MARKET_SCHEDULER_TICK.remove();
+    }
+
     /**
-     * Full staggered scheduler for the Economy.advance() market loop.
-     *
-     * <p>Only the engine's central loop is transformed. Direct calls by mods to
-     * MarketAPI.advance() remain immediate. Remote calls accumulate their exact
-     * original amount and are delivered in original market-list order on the
-     * market's stable phase, or sooner when a frame/day safety cap is reached.
-     * Current-location, interaction and (by default) player-owned markets stay
-     * full-rate.</p>
+     * Called from CampaignEngine.setFastForwardIteration(boolean). Starsector writes false before
+     * the iteration loop, true after every simulation tick, then false once after the loop. The
+     * final false therefore closes exactly one render batch at every campaign speed.
      */
-    public static void advanceMarketScheduled(MarketAPI market, float amount) {
+    public static void marketSchedulerFastForwardIterationChanged(boolean fastForwardIteration) {
+        MarketSchedulerBatch batch = MARKET_SCHEDULER_BATCH.get();
+        batch.fastForwardIteration = fastForwardIteration;
+        if (!fastForwardIteration && batch.open && batch.simulationTicks > 0
+                && MARKET_SCHEDULER_TICK.get().depth == 0) {
+            finishMarketSchedulerBatch(batch);
+        }
+    }
+
+    private static long nextMarketSchedulerRenderBatch() {
+        long next = marketSchedulerRenderBatch + 1L;
+        if (next <= 0L) next = 1L;
+        marketSchedulerRenderBatch = next;
+        return next;
+    }
+
+    /** Common accumulator for every transformed engine-owned MarketAPI.advance call. */
+    public static void advanceMarketScheduled(MarketAPI market, float amount, int source) {
         if (market == null) throw new NullPointerException("market");
+        MARKET_SCHEDULER_CALLS.increment();
+        if (source == 0) MARKET_SCHEDULER_ECONOMY_CALLS.increment();
+        else if (source == 1) MARKET_SCHEDULER_PLANET_CONDITION_CALLS.increment();
+        else {
+            MARKET_SCHEDULER_INVALID_SOURCE_CALLS.increment();
+            advanceMarketImmediatelyWithPending(
+                    market, amount, MARKET_ORIGIN_SCHEDULER_FALLBACK);
+            return;
+        }
+
+        int fallbackOrigin = source == 1
+                ? MARKET_ORIGIN_PLANET_CONDITION_FALLBACK
+                : MARKET_ORIGIN_SCHEDULER_FALLBACK;
+        int scheduledOrigin = source == 1
+                ? MARKET_ORIGIN_PLANET_CONDITION_SCHEDULED
+                : MARKET_ORIGIN_SCHEDULED;
+
+        if (!Float.isFinite(amount) || amount < 0f) {
+            MARKET_SCHEDULER_INVALID_AMOUNT_CALLS.increment();
+            invokeObservedMarketAdvance(market, amount, fallbackOrigin);
+            return;
+        }
+        if (!marketSchedulerReady) {
+            MARKET_SCHEDULER_NOT_READY_CALLS.increment();
+            advanceMarketImmediatelyWithPending(market, amount, fallbackOrigin);
+            return;
+        }
 
         PrepatcherConfig c = config;
         long generation = campaignCacheGeneration;
-        long frame = remoteMarketFrame;
-        if (c == null || !c.remoteMarketScheduler
-                || SCRATCH.get().scopeDepth != 1
-                || !campaignCachesReady(generation)
-                || remoteMarketFrameGeneration != generation
-                || !Float.isFinite(amount) || amount < 0f) {
-            REMOTE_MARKET_FALLBACKS.increment();
-            invokeObservedMarketAdvance(market, amount, MARKET_ORIGIN_SCHEDULER_FALLBACK);
+        MarketSchedulerTick tick = MARKET_SCHEDULER_TICK.get();
+        MarketSchedulerBatch batch = MARKET_SCHEDULER_BATCH.get();
+        if (c == null || !c.marketScheduler) {
+            advanceMarketImmediatelyWithPending(market, amount, fallbackOrigin);
+            return;
+        }
+        if (!campaignCachesReady(generation)) {
+            MARKET_SCHEDULER_LIFECYCLE_INACTIVE_CALLS.increment();
+            advanceMarketImmediatelyWithPending(market, amount, fallbackOrigin);
+            return;
+        }
+        if (tick.depth != 1 || !tick.active || tick.generation != generation
+                || !batch.open || batch.generation != generation || tick.batch != batch.id) {
+            MARKET_SCHEDULER_OUTSIDE_TICK_CALLS.increment();
+            advanceMarketImmediatelyWithPending(market, amount, fallbackOrigin);
             return;
         }
 
-        // Market itself overrides equals/hashCode, and modded MarketAPI
-        // implementations may do the same. Scheduling state is therefore keyed
-        // strictly by object identity. The map is transient and reset on every
-        // campaign lifecycle transition, so it cannot leak into saves or across
-        // games.
-
-        RemoteMarketScheduleState state;
-        boolean created = false;
-        boolean mapFallback = false;
+        MarketScheduleState state;
         try {
-            Map<MarketAPI, RemoteMarketScheduleState> states = REMOTE_MARKET_STATES;
-            synchronized (states) {
-                if (states != REMOTE_MARKET_STATES || !campaignCachesReady(generation)) {
-                    mapFallback = true;
-                    state = null;
-                } else {
-                    state = states.get(market);
-                    if (state == null) {
-                        state = new RemoteMarketScheduleState();
-                        states.put(market, state);
-                        created = true;
-                    }
-                }
+            WeakIdentityMap<MarketAPI, MarketScheduleState> states = MARKET_SCHEDULER_STATES;
+            state = states.get(market);
+            if (state == null) {
+                state = new MarketScheduleState();
+                MarketScheduleState existing = states.putIfAbsent(market, state);
+                if (existing != null) state = existing;
             }
         } catch (Throwable ignored) {
-            REMOTE_MARKET_FALLBACKS.increment();
-            invokeObservedMarketAdvance(market, amount, MARKET_ORIGIN_SCHEDULER_FALLBACK);
-            return;
-        }
-        if (mapFallback || state == null) {
-            REMOTE_MARKET_FALLBACKS.increment();
-            invokeObservedMarketAdvance(market, amount, MARKET_ORIGIN_SCHEDULER_FALLBACK);
+            MARKET_SCHEDULER_STATE_FAILURES.increment();
+            advanceMarketImmediatelyWithPending(market, amount, fallbackOrigin);
             return;
         }
 
+        boolean disabled;
+        boolean reentrant;
         boolean auditMemory;
-        boolean cachedMemoryFullRate;
-        boolean directFallback;
+        boolean perSimulationTick;
         synchronized (state) {
-            directFallback = state.inAdvance || state.lastCallFrame == frame;
-            if (directFallback) {
-                auditMemory = false;
-                cachedMemoryFullRate = false;
-            } else {
-                state.lastCallFrame = frame;
-                auditMemory = !c.remoteMarketFullRateMemoryKey.isEmpty()
-                        && (state.lastPolicyAuditFrame == Long.MIN_VALUE
-                        || frame - state.lastPolicyAuditFrame
-                        >= c.remoteMarketPolicyAuditFrames);
-                if (auditMemory) state.lastPolicyAuditFrame = frame;
-                cachedMemoryFullRate = state.memoryFullRate;
-            }
+            disabled = state.disabled;
+            reentrant = state.inAdvance;
+            auditMemory = !disabled && !reentrant
+                    && !c.marketSchedulerPerSimulationTickMemoryKey.isEmpty()
+                    && (state.lastPolicyAuditBatch == Long.MIN_VALUE
+                    || batch.id - state.lastPolicyAuditBatch
+                    >= c.marketSchedulerPolicyAuditBatches);
+            if (auditMemory) state.lastPolicyAuditBatch = batch.id;
+            perSimulationTick = state.perSimulationTick;
         }
-        if (directFallback) {
-            // Re-entrant Economy.advance() or a duplicate market entry: do not
-            // coalesce a call whose vanilla multiplicity is observable.
-            REMOTE_MARKET_FALLBACKS.increment();
-            invokeObservedMarketAdvance(market, amount, MARKET_ORIGIN_SCHEDULER_FALLBACK);
+        if (disabled) {
+            MARKET_SCHEDULER_DISABLED_MARKET_CALLS.increment();
+            advanceMarketImmediatelyWithPending(market, amount, fallbackOrigin);
             return;
         }
+        if (reentrant) {
+            MARKET_SCHEDULER_REENTRANT_CALLS.increment();
+            invokeObservedMarketAdvance(market, amount, fallbackOrigin);
+            return;
+        }
+
+        if (auditMemory) {
+            try {
+                MemoryAPI memory = market.getMemoryWithoutUpdate();
+                boolean updated = memory != null
+                        && memory.getBoolean(c.marketSchedulerPerSimulationTickMemoryKey);
+                synchronized (state) {
+                    if (state.perSimulationTick != updated) {
+                        state.perSimulationTick = updated;
+                        MARKET_SCHEDULER_PER_SIMULATION_TICK_FLAG_CHANGES.increment();
+                    }
+                    perSimulationTick = state.perSimulationTick;
+                }
+            } catch (Throwable ignored) {
+                MARKET_SCHEDULER_POLICY_FAILURES.increment();
+                synchronized (state) {
+                    state.perSimulationTick = true;
+                    perSimulationTick = true;
+                }
+            }
+        }
+
+        // Construction sequencing spans the entire Market.advance method. Flush
+        // older time exactly, then preserve the current vanilla call boundary.
+        if (updateConstructionMode(market, state)) {
+            deliverPendingExact(market, state, scheduledOrigin, false);
+            CONSTRUCTION_FULL_RATE_CALLS.increment();
+            invokeObservedMarketAdvance(market, amount, scheduledOrigin);
+            return;
+        }
+
+        if (perSimulationTick) {
+            MARKET_SCHEDULER_PER_SIMULATION_TICK_CALLS.increment();
+            advanceMarketImmediatelyWithPending(market, amount, scheduledOrigin);
+            return;
+        }
+
+        boolean overflowRuns;
+        synchronized (state) {
+            overflowRuns = state.pendingSteps > 0
+                    && wouldCreateNewPendingRun(state, amount)
+                    && state.pendingRuns != null
+                    && state.pendingRuns.size() >= c.marketSchedulerMaxPendingRuns;
+        }
+        if (overflowRuns) {
+            PENDING_RUN_OVERFLOW_FLUSHES.increment();
+            deliverPendingCoalesced(market, state, scheduledOrigin, true, false);
+        }
+
+        boolean addTouched = false;
+        boolean invalidTotal = false;
+        synchronized (state) {
+            if (state.lastSourceSimulationTick == tick.simulationTick
+                    && state.lastSource != source) {
+                MARKET_SCHEDULER_MULTIPLE_SOURCE_TICK_CALLS.increment();
+            }
+            state.lastSourceSimulationTick = tick.simulationTick;
+            state.lastSource = source;
+
+            if (state.pendingSteps == 0) {
+                state.debtSequence = MARKET_SCHEDULER_DEBT_SEQUENCE.incrementAndGet();
+            }
+            if (!appendPendingStepLocked(state, amount)) {
+                invalidTotal = true;
+                if (state.pendingSteps == 0) state.debtSequence = 0L;
+            } else {
+                state.sourceMask |= 1 << source;
+                if (state.lastTouchedBatch != batch.id) {
+                    state.lastTouchedBatch = batch.id;
+                    addTouched = true;
+                }
+            }
+        }
+        if (invalidTotal) {
+            MARKET_SCHEDULER_INVALID_AMOUNT_CALLS.increment();
+            MARKET_SCHEDULER_AMOUNT_OVERFLOW_SPLITS.increment();
+            deliverPendingCoalesced(market, state, scheduledOrigin, true, false);
+            invokeObservedMarketAdvance(market, amount, fallbackOrigin);
+            return;
+        }
+        if (addTouched) batch.touched.add(new WeakIdentityEntry<>(market, state));
+        MARKET_SCHEDULER_ACCUMULATED_CALLS.increment();
+    }
+
+    private static void finishMarketSchedulerBatch(MarketSchedulerBatch batch) {
+        if (!batch.open || batch.finishing) return;
+        batch.open = false;
+        batch.finishing = true;
+        MARKET_SCHEDULER_RENDER_BATCHES.increment();
+        updateMaximum(MARKET_SCHEDULER_MAX_TICKS_PER_BATCH, batch.simulationTicks);
+        try {
+            ArrayList<WeakIdentityEntry<MarketAPI, MarketScheduleState>> entries = batch.touched;
+            for (int i = 0; i < entries.size(); i++) {
+                WeakIdentityEntry<MarketAPI, MarketScheduleState> entry = entries.get(i);
+                deliverMarketAtBatchEnd(batch, entry.key, entry.value);
+            }
+        } finally {
+            batch.clearAfterFinish();
+        }
+    }
+
+    private static void deliverMarketAtBatchEnd(
+            MarketSchedulerBatch batch, MarketAPI market, MarketScheduleState state) {
+        if (market == null || state == null) return;
+        PrepatcherConfig c = config;
+        if (c == null || !c.marketScheduler) return;
 
         boolean hot = false;
         boolean hidden = false;
-        boolean memoryFullRate = cachedMemoryFullRate;
-        int interval;
-        int phase;
+        int interval = 1;
+        int phase = 0;
         try {
-            if (c.remoteMarketHotCurrentLocation
-                    && market.getContainingLocation() == remoteMarketCurrentLocation) {
-                hot = true;
-            }
-            if (c.remoteMarketHotPlayerOwned && market.isPlayerOwned()) hot = true;
-            if (c.remoteMarketHotInteraction && market == remoteMarketInteractionMarket) hot = true;
-
-            if (auditMemory) {
-                MemoryAPI memory = market.getMemoryWithoutUpdate();
-                memoryFullRate = memory != null
-                        && memory.getBoolean(c.remoteMarketFullRateMemoryKey);
-            }
-            if (memoryFullRate) hot = true;
-
-            hidden = market.isHidden();
-            interval = hidden ? c.remoteMarketHiddenFrames : c.remoteMarketFrames;
-            phase = stableMarketPhase(market, interval);
-        } catch (Throwable ignored) {
-            hot = true;
-            interval = 1;
-            phase = 0;
-            REMOTE_MARKET_FALLBACKS.increment();
-        }
-
-        float totalAmount;
-        boolean run;
-        synchronized (state) {
-            if (auditMemory) state.memoryFullRate = memoryFullRate;
-
-            totalAmount = state.pendingAmount + amount;
-            boolean finiteTotal = Float.isFinite(totalAmount) && totalAmount >= 0f;
-            boolean dueByPhase = interval <= 1 || Math.floorMod(frame, interval) == phase;
-            boolean dueByFrameCap = state.deferredCalls >= c.remoteMarketMaxDeferredFrames - 1;
-            boolean dueByDayCap = false;
-            float secondsPerDay = remoteMarketSecondsPerDay;
-            if (c.remoteMarketMaxDeferredGameDays > 0f
-                    && Float.isFinite(secondsPerDay) && secondsPerDay > 0f
-                    && finiteTotal) {
-                dueByDayCap = totalAmount / secondsPerDay
-                        >= c.remoteMarketMaxDeferredGameDays;
-            }
-
-            // A newly observed market is always advanced immediately. This
-            // avoids loading/creation with uninitialized plugin state; its next
-            // due call uses the stable global phase and becomes staggered.
-            run = created || hot || dueByPhase || dueByFrameCap || dueByDayCap || !finiteTotal;
-            if (!run) {
-                state.pendingAmount = totalAmount;
-                state.deferredCalls++;
-                REMOTE_MARKET_DEFERRED_CALLS.increment();
-                return;
-            }
-
-            state.pendingAmount = 0f;
-            state.deferredCalls = 0;
-            state.inAdvance = true;
-            state.lastAdvanceFrame = frame;
-        }
-
-        try {
-            invokeObservedMarketAdvance(market, totalAmount, MARKET_ORIGIN_SCHEDULED);
-            REMOTE_MARKET_FULL_ADVANCES.increment();
-            if (hot) REMOTE_MARKET_HOT_ADVANCES.increment();
-            if (hidden) REMOTE_MARKET_HIDDEN_ADVANCES.increment();
-        } finally {
-            synchronized (state) {
-                state.inAdvance = false;
-            }
-        }
-    }
-
-
-    /**
-     * Staggered scheduler for the vanilla BaseCampaignEntity path that advances
-     * planet-condition-only markets outside Economy.advance(). This path is
-     * deliberately tracked separately from ordinary economy markets because the
-     * same MarketAPI object must never accidentally consume both scheduler debts.
-     *
-     * <p>When the scheduler is disabled the method is still used as an observer
-     * bridge: the original MarketAPI.advance() call remains immediate and is
-     * attributed to the known vanilla planet-condition origin instead of the
-     * unknown bucket.</p>
-     */
-    public static void advancePlanetConditionMarketScheduled(MarketAPI market, float amount) {
-        if (market == null) throw new NullPointerException("market");
-        PLANET_CONDITION_MARKET_CALLS.increment();
-
-        PrepatcherConfig c = config;
-        if (c == null || !c.planetConditionMarketScheduler) {
-            invokeObservedMarketAdvance(
-                    market, amount, MARKET_ORIGIN_PLANET_CONDITION_IMMEDIATE);
-            return;
-        }
-
-        long generation = campaignCacheGeneration;
-        long frame = remoteMarketFrame;
-        if (!campaignCachesReady(generation)
-                || remoteMarketFrameGeneration != generation
-                || frame <= 0L
-                || !Float.isFinite(amount) || amount < 0f) {
-            PLANET_CONDITION_MARKET_FALLBACKS.increment();
-            invokeObservedMarketAdvance(
-                    market, amount, MARKET_ORIGIN_PLANET_CONDITION_FALLBACK);
-            return;
-        }
-
-        RemoteMarketScheduleState state;
-        boolean created = false;
-        boolean mapFallback = false;
-        try {
-            Map<MarketAPI, RemoteMarketScheduleState> states =
-                    PLANET_CONDITION_MARKET_STATES;
-            synchronized (states) {
-                if (states != PLANET_CONDITION_MARKET_STATES
-                        || !campaignCachesReady(generation)) {
-                    mapFallback = true;
-                    state = null;
-                } else {
-                    state = states.get(market);
-                    if (state == null) {
-                        state = new RemoteMarketScheduleState();
-                        states.put(market, state);
-                        created = true;
-                    }
-                }
-            }
-        } catch (Throwable ignored) {
-            PLANET_CONDITION_MARKET_FALLBACKS.increment();
-            invokeObservedMarketAdvance(
-                    market, amount, MARKET_ORIGIN_PLANET_CONDITION_FALLBACK);
-            return;
-        }
-        if (mapFallback || state == null) {
-            PLANET_CONDITION_MARKET_FALLBACKS.increment();
-            invokeObservedMarketAdvance(
-                    market, amount, MARKET_ORIGIN_PLANET_CONDITION_FALLBACK);
-            return;
-        }
-
-        boolean auditMemory;
-        boolean cachedMemoryFullRate;
-        boolean directFallback;
-        synchronized (state) {
-            directFallback = state.inAdvance || state.lastCallFrame == frame;
-            if (directFallback) {
-                auditMemory = false;
-                cachedMemoryFullRate = false;
-            } else {
-                state.lastCallFrame = frame;
-                auditMemory = !c.planetConditionMarketFullRateMemoryKey.isEmpty()
-                        && (state.lastPolicyAuditFrame == Long.MIN_VALUE
-                        || frame - state.lastPolicyAuditFrame
-                        >= c.planetConditionMarketPolicyAuditFrames);
-                if (auditMemory) state.lastPolicyAuditFrame = frame;
-                cachedMemoryFullRate = state.memoryFullRate;
-            }
-        }
-        if (directFallback) {
-            // A duplicate entity reference or recursive Market.advance() is an
-            // observable extra vanilla call. Preserve it instead of coalescing.
-            PLANET_CONDITION_MARKET_FALLBACKS.increment();
-            invokeObservedMarketAdvance(
-                    market, amount, MARKET_ORIGIN_PLANET_CONDITION_FALLBACK);
-            return;
-        }
-
-        boolean hot = false;
-        boolean memoryFullRate = cachedMemoryFullRate;
-        boolean policyFallback = false;
-        int interval;
-        int phase;
-        try {
-            LocationAPI containingLocation = market.getContainingLocation();
-            if (containingLocation == null) {
+            LocationAPI location = market.getContainingLocation();
+            if (location == null) {
                 SectorEntityToken primary = market.getPrimaryEntity();
-                if (primary != null) containingLocation = primary.getContainingLocation();
+                if (primary != null) location = primary.getContainingLocation();
             }
-            boolean currentLocation = containingLocation != null
-                    && containingLocation == remoteMarketCurrentLocation;
-
-            if (auditMemory) {
-                MemoryAPI memory = market.getMemoryWithoutUpdate();
-                memoryFullRate = memory != null
-                        && memory.getBoolean(c.planetConditionMarketFullRateMemoryKey);
-            }
-            hot = memoryFullRate;
-            interval = currentLocation
-                    ? c.planetConditionMarketCurrentLocationFrames
-                    : c.planetConditionMarketFrames;
-            if (hot) interval = 1;
+            if (c.marketSchedulerHotCurrentLocation
+                    && location != null && location == batch.currentLocation) hot = true;
+            if (c.marketSchedulerHotPlayerOwned && market.isPlayerOwned()) hot = true;
+            if (c.marketSchedulerHotInteraction && market == batch.interactionMarket) hot = true;
+            hidden = market.isHidden();
+            interval = hot ? 1 : (hidden
+                    ? c.marketSchedulerHiddenBatches : c.marketSchedulerBatches);
             phase = stableMarketPhase(market, interval);
         } catch (Throwable ignored) {
-            // Unknown modded MarketAPI policy state is safer at full cadence.
             hot = true;
             interval = 1;
             phase = 0;
-            policyFallback = true;
-            PLANET_CONDITION_MARKET_FALLBACKS.increment();
+            MARKET_SCHEDULER_POLICY_FAILURES.increment();
         }
 
-        float totalAmount;
-        boolean run;
         synchronized (state) {
-            if (auditMemory) state.memoryFullRate = memoryFullRate;
-
-            totalAmount = state.pendingAmount + amount;
-            boolean finiteTotal = Float.isFinite(totalAmount) && totalAmount >= 0f;
-            boolean dueByPhase = interval <= 1 || Math.floorMod(frame, interval) == phase;
-            boolean dueByFrameCap = state.deferredCalls
-                    >= c.planetConditionMarketMaxDeferredFrames - 1;
-            boolean dueByDayCap = false;
-            float secondsPerDay = remoteMarketSecondsPerDay;
-            if (c.planetConditionMarketMaxDeferredGameDays > 0f
-                    && Float.isFinite(secondsPerDay) && secondsPerDay > 0f
-                    && finiteTotal) {
-                dueByDayCap = totalAmount / secondsPerDay
-                        >= c.planetConditionMarketMaxDeferredGameDays;
-            }
-
-            run = created || hot || dueByPhase || dueByFrameCap
-                    || dueByDayCap || !finiteTotal;
-            if (!run) {
-                state.pendingAmount = totalAmount;
-                state.deferredCalls++;
-                PLANET_CONDITION_MARKET_DEFERRED_CALLS.increment();
-                return;
-            }
-
-            state.pendingAmount = 0f;
-            state.deferredCalls = 0;
-            state.inAdvance = true;
-            state.lastAdvanceFrame = frame;
+            if (state.disabled || state.inAdvance || state.pendingSteps <= 0) return;
+            boolean first = state.nextDueBatch == Long.MIN_VALUE;
+            boolean due = first || interval <= 1 || batch.id >= state.nextDueBatch;
+            if (!due) return;
         }
 
-        try {
-            invokeObservedMarketAdvance(market, totalAmount,
-                    policyFallback
-                            ? MARKET_ORIGIN_PLANET_CONDITION_FALLBACK
-                            : MARKET_ORIGIN_PLANET_CONDITION_SCHEDULED);
-            PLANET_CONDITION_MARKET_FULL_ADVANCES.increment();
-            if (hot) PLANET_CONDITION_MARKET_HOT_ADVANCES.increment();
-        } finally {
-            synchronized (state) {
-                state.inAdvance = false;
-            }
+        int delivered = deliverPendingCoalesced(
+                market, state, MARKET_ORIGIN_SCHEDULED, true, false);
+        if (delivered <= 0) return;
+        if (hot) MARKET_SCHEDULER_HOT_ADVANCES.increment();
+        if (hidden) MARKET_SCHEDULER_HIDDEN_ADVANCES.increment();
+        synchronized (state) {
+            state.nextDueBatch = nextStableDueBatch(batch.id, phase, interval);
         }
     }
 
-    /**
-     * Applies accumulated remote-market time before XStream observes the
-     * campaign. This keeps transient scheduler state out of the save format and
-     * prevents a save/load boundary from discarding up to one scheduling window.
-     * Failures are logged and left pending rather than aborting the save.
-     */
-    public static void flushRemoteMarketsBeforeSave() {
+    private static long nextStableDueBatch(long currentBatch, int phase, int interval) {
+        if (interval <= 1) return currentBatch + 1L;
+        long next = currentBatch + 1L;
+        return next + Math.floorMod((long) phase - next, interval);
+    }
+
+    private static void updateMaximum(AtomicLong maximum, long value) {
+        long current = maximum.get();
+        while (value > current && !maximum.compareAndSet(current, value)) {
+            current = maximum.get();
+        }
+    }
+
+    /** Flushes the one shared scheduler debt map before save serialization. */
+    public static void flushMarketSchedulerBeforeSave() {
+        if (!marketSchedulerReady) return;
         PrepatcherConfig c = config;
         long generation = campaignCacheGeneration;
-        if (c == null || !campaignCachesReady(generation)) return;
+        if (c == null || !c.marketScheduler || !campaignCachesReady(generation)) return;
 
-        if (c.remoteMarketScheduler) {
-            flushScheduledMarketMapBeforeSave(
-                    REMOTE_MARKET_STATES, false, generation,
-                    MARKET_ORIGIN_SAVE_FLUSH,
-                    REMOTE_MARKET_SAVE_FLUSHES,
-                    REMOTE_MARKET_FALLBACKS,
-                    "Remote-market");
-        }
-        if (c.planetConditionMarketScheduler) {
-            flushScheduledMarketMapBeforeSave(
-                    PLANET_CONDITION_MARKET_STATES, true, generation,
-                    MARKET_ORIGIN_PLANET_CONDITION_SAVE_FLUSH,
-                    PLANET_CONDITION_MARKET_SAVE_FLUSHES,
-                    PLANET_CONDITION_MARKET_FALLBACKS,
-                    "Planet-condition market");
+        long started = System.nanoTime();
+        try {
+            List<WeakIdentityEntry<MarketAPI, MarketScheduleState>> entries;
+            try {
+                entries = MARKET_SCHEDULER_STATES.entriesSnapshot();
+                entries.sort((left, right) -> Long.compare(
+                        debtSequence(left.value), debtSequence(right.value)));
+            } catch (Throwable failure) {
+                MARKET_SCHEDULER_SAVE_FLUSH_FAILURES.increment();
+                throw new IllegalStateException(
+                        "Unable to enumerate market scheduler debt before save", failure);
+            }
+
+            for (WeakIdentityEntry<MarketAPI, MarketScheduleState> entry : entries) {
+                MarketAPI market = entry.key;
+                MarketScheduleState state = entry.value;
+                if (market == null || state == null) continue;
+                boolean exact = c.marketSchedulerExactReplayBeforeSave;
+                if (!exact) exact = updateConstructionMode(market, state, true);
+                deliverPendingForSave(market, state, exact);
+            }
+        } finally {
+            long elapsed = System.nanoTime() - started;
+            if (elapsed > 0L) SAVE_FLUSH_DURATION_NANOS.add(elapsed);
         }
     }
 
-    private static void flushScheduledMarketMapBeforeSave(
-            Map<MarketAPI, RemoteMarketScheduleState> states,
-            boolean planetCondition,
-            long generation,
-            int origin,
-            LongAdder flushCounter,
-            LongAdder fallbackCounter,
-            String label) {
-        ArrayList<MarketAPI> markets = new ArrayList<>();
-        ArrayList<RemoteMarketScheduleState> statesToFlush = new ArrayList<>();
-        ArrayList<Float> amounts = new ArrayList<>();
+    private static long debtSequence(MarketScheduleState state) {
+        if (state == null) return Long.MAX_VALUE;
+        synchronized (state) {
+            return state.debtSequence == 0L ? Long.MAX_VALUE : state.debtSequence;
+        }
+    }
+
+
+    private static int countPerSimulationTickMarkets() {
+        int count = 0;
         try {
-            synchronized (states) {
-                Map<MarketAPI, RemoteMarketScheduleState> current = planetCondition
-                        ? PLANET_CONDITION_MARKET_STATES : REMOTE_MARKET_STATES;
-                if (states != current || !campaignCachesReady(generation)) return;
-                for (Map.Entry<MarketAPI, RemoteMarketScheduleState> entry : states.entrySet()) {
-                    MarketAPI market = entry.getKey();
-                    RemoteMarketScheduleState state = entry.getValue();
-                    if (market == null || state == null) continue;
-                    synchronized (state) {
-                        if (state.inAdvance || !(state.pendingAmount > 0f)) continue;
-                        float pending = state.pendingAmount;
-                        state.pendingAmount = 0f;
-                        state.deferredCalls = 0;
-                        state.inAdvance = true;
-                        markets.add(market);
-                        statesToFlush.add(state);
-                        amounts.add(pending);
+            for (WeakIdentityEntry<MarketAPI, MarketScheduleState> entry
+                    : MARKET_SCHEDULER_STATES.entriesSnapshot()) {
+                MarketScheduleState state = entry.value;
+                if (state == null) continue;
+                synchronized (state) {
+                    if (state.perSimulationTick) count++;
+                }
+            }
+        } catch (Throwable ignored) {
+            MARKET_SCHEDULER_STATE_FAILURES.increment();
+        }
+        return count;
+    }
+
+    private static MarketSchedulerGaugeSnapshot marketSchedulerGaugeSnapshot() {
+        long pendingSteps = 0L;
+        long pendingRuns = 0L;
+        int constructionMarkets = 0;
+        int constructionQueueMarkets = 0;
+        int constructionBuildingMarkets = 0;
+        int constructionUpgradingMarkets = 0;
+        int constructionReportedBuildingWithoutRawMarkets = 0;
+        int constructionUncertainMarkets = 0;
+        int constructionMultipleReasonMarkets = 0;
+        try {
+            for (WeakIdentityEntry<MarketAPI, MarketScheduleState> entry
+                    : MARKET_SCHEDULER_STATES.entriesSnapshot()) {
+                MarketScheduleState state = entry.value;
+                if (state == null) continue;
+                synchronized (state) {
+                    pendingSteps += state.pendingSteps;
+                    pendingRuns += state.pendingRuns == null ? 0 : state.pendingRuns.size();
+                    if (state.constructionFullRate) constructionMarkets++;
+                    int reasons = state.constructionReasonMask;
+                    if ((reasons & CONSTRUCTION_REASON_QUEUE_NON_EMPTY) != 0) {
+                        constructionQueueMarkets++;
+                    }
+                    if ((reasons & CONSTRUCTION_REASON_INDUSTRY_BUILDING) != 0) {
+                        constructionBuildingMarkets++;
+                    }
+                    if ((reasons & CONSTRUCTION_REASON_INDUSTRY_UPGRADING) != 0) {
+                        constructionUpgradingMarkets++;
+                    }
+                    if ((reasons & CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW) != 0) {
+                        constructionReportedBuildingWithoutRawMarkets++;
+                    }
+                    if ((reasons & (CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN
+                            | CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN
+                            | CONSTRUCTION_REASON_PROBE_FAILURE
+                            | CONSTRUCTION_REASON_MUTATION_RACE)) != 0) {
+                        constructionUncertainMarkets++;
+                    }
+                    if (Integer.bitCount(reasons & CONSTRUCTION_REASON_OBSERVED_MASK) > 1) {
+                        constructionMultipleReasonMarkets++;
                     }
                 }
             }
         } catch (Throwable ignored) {
-            fallbackCounter.increment();
-            return;
+            MARKET_SCHEDULER_STATE_FAILURES.increment();
         }
-
-        for (int i = 0; i < markets.size(); i++) {
-            MarketAPI market = markets.get(i);
-            RemoteMarketScheduleState state = statesToFlush.get(i);
-            float pending = amounts.get(i);
-            boolean success = false;
-            try {
-                invokeObservedMarketAdvance(market, pending, origin);
-                success = true;
-                flushCounter.increment();
-            } catch (Throwable failure) {
-                fallbackCounter.increment();
-                PrepatcherLog.warn(label + " save flush failed for "
-                        + safeMarketId(market) + "; pending time remains deferred: "
-                        + failure.getClass().getName() + ": " + failure.getMessage());
-            } finally {
-                synchronized (state) {
-                    if (!success) state.pendingAmount += pending;
-                    state.inAdvance = false;
-                    if (success) state.lastAdvanceFrame = remoteMarketFrame;
-                }
-            }
-        }
+        return new MarketSchedulerGaugeSnapshot(pendingSteps, pendingRuns, constructionMarkets,
+                constructionQueueMarkets, constructionBuildingMarkets,
+                constructionUpgradingMarkets, constructionReportedBuildingWithoutRawMarkets,
+                constructionUncertainMarkets, constructionMultipleReasonMarkets);
     }
+
+    private record MarketSchedulerGaugeSnapshot(
+            long pendingMarketStepsCurrent,
+            long pendingMarketRunsCurrent,
+            int constructionFullRateMarkets,
+            int constructionMarketsQueueNonEmpty,
+            int constructionMarketsIndustryBuilding,
+            int constructionMarketsIndustryUpgrading,
+            int constructionMarketsReportedBuildingWithoutRaw,
+            int constructionMarketsUncertain,
+            int constructionMarketsMultipleReasons) {}
 
     private static int stableMarketPhase(MarketAPI market, int interval) {
         if (interval <= 1) return 0;
@@ -1644,15 +2773,6 @@ public final class StarsectorPrepatcherHooks {
         }
         hash ^= hash >>> 16;
         return Math.floorMod(hash, interval);
-    }
-
-    private static String safeMarketId(MarketAPI market) {
-        try {
-            String id = market == null ? null : market.getId();
-            return id == null ? String.valueOf(market) : id;
-        } catch (Throwable ignored) {
-            return market == null ? "null" : market.getClass().getName();
-        }
     }
 
     /** Allocates owner-local transient state used by persistent economy snapshots. */
@@ -2238,6 +3358,52 @@ public final class StarsectorPrepatcherHooks {
         return 1 + Math.floorMod(hash, interval);
     }
 
+    /**
+     * Exact List.add replacement used only at structurally proven scratch-local
+     * mutation sites. The vanilla concrete collection type and boolean result are
+     * preserved; peak observation is allocation-free and does not read the clock.
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static boolean scratchListAdd(List receiver, Object value) {
+        boolean changed = receiver.add(value);
+        if (changed) observeScratchListPeak(receiver);
+        return changed;
+    }
+
+    /** Exact Set.add replacement for structurally proven scratch-local sites. */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static boolean scratchSetAdd(Set receiver, Object value) {
+        boolean changed = receiver.add(value);
+        if (changed) observeScratchSetPeak(receiver);
+        return changed;
+    }
+
+    /** Exact Set.addAll replacement for structurally proven scratch-local sites. */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static boolean scratchSetAddAll(Set receiver, Collection values) {
+        boolean changed = receiver.addAll(values);
+        if (changed) observeScratchSetPeak(receiver);
+        return changed;
+    }
+
+    private static void observeScratchListPeak(Collection<?> receiver) {
+        try {
+            Scratch scratch = SCRATCH.get();
+            if (scratch.scopeDepth > 0) scratch.scopeFrame().observeRetainedList(receiver);
+        } catch (Throwable ignored) {
+            // Telemetry/trimming must never alter the original collection operation.
+        }
+    }
+
+    private static void observeScratchSetPeak(Collection<?> receiver) {
+        try {
+            Scratch scratch = SCRATCH.get();
+            if (scratch.scopeDepth > 0) scratch.scopeFrame().observeRetainedSet(receiver);
+        } catch (Throwable ignored) {
+            // Telemetry/trimming must never alter the original collection operation.
+        }
+    }
+
     /** Three frame-local command/group lists in Ship.advance(). */
     @SuppressWarnings({"rawtypes", "unchecked"})
     public static ArrayList borrowShipList() {
@@ -2252,8 +3418,10 @@ public final class StarsectorPrepatcherHooks {
     public static ArrayList borrowShipListSnapshot(Collection source) {
         PrepatcherConfig c = config;
         if (c == null || !c.shipAdvanceScratch) return new ArrayList(source);
-        ArrayList result = SCRATCH.get().scopeFrame().pooledList();
+        ScratchFrame frame = SCRATCH.get().scopeFrame();
+        ArrayList result = frame.pooledList();
         result.addAll(source);
+        frame.observeRetainedList(result);
         SHIP_SCRATCH_LISTS.increment();
         return result;
     }
@@ -2313,6 +3481,7 @@ public final class StarsectorPrepatcherHooks {
         clearIdentityMembership(membership);
         try {
             for (Object value : expired) membership.put(value, Boolean.TRUE);
+            SCRATCH.get().scopeFrame().observeIdentitySize(membership.size());
             boolean changed = false;
             Iterator iterator = particles.iterator();
             while (iterator.hasNext()) {
@@ -2419,7 +3588,7 @@ public final class StarsectorPrepatcherHooks {
     @SuppressWarnings({"rawtypes", "unchecked"})
     public static HashSet borrowClassSet() {
         PrepatcherConfig c = config;
-        if (c == null || !c.scratchCollections) return new HashSet();
+        if (c == null || !c.mapRenderStuff) return new HashSet();
         HashSet set = SCRATCH.get().scopeFrame().classSet;
         set.clear();
         return set;
@@ -2428,16 +3597,18 @@ public final class StarsectorPrepatcherHooks {
     @SuppressWarnings({"rawtypes", "unchecked"})
     public static ArrayList borrowHitList(Collection source) {
         PrepatcherConfig c = config;
-        if (c == null || !c.scratchCollections) return new ArrayList(source);
-        ArrayList list = SCRATCH.get().scopeFrame().hitList;
+        if (c == null || !c.mapHitTest) return new ArrayList(source);
+        ScratchFrame frame = SCRATCH.get().scopeFrame();
+        ArrayList list = frame.hitList;
         list.clear();
         list.addAll(source);
+        frame.observeRetainedList(list);
         return list;
     }
 
     public static Vector2f borrowHitPoint(float x, float y) {
         PrepatcherConfig c = config;
-        if (c == null || !c.scratchCollections) return new Vector2f(x, y);
+        if (c == null || !c.mapHitTest) return new Vector2f(x, y);
         Vector2f vector = SCRATCH.get().scopeFrame().hitPoint;
         vector.set(x, y);
         return vector;
@@ -2445,7 +3616,7 @@ public final class StarsectorPrepatcherHooks {
 
     public static Vector2f borrowArrowVector(float x, float y) {
         PrepatcherConfig c = config;
-        if (c == null || !c.arrowVectorPool) return new Vector2f(x, y);
+        if (c == null || !c.intelArrowRendering) return new Vector2f(x, y);
         ScratchFrame scratch = SCRATCH.get().scopeFrame();
         Vector2f vector = scratch.arrowVectors[scratch.arrowVectorIndex++ & (scratch.arrowVectors.length - 1)];
         vector.set(x, y);
@@ -2465,9 +3636,10 @@ public final class StarsectorPrepatcherHooks {
                 || icons.size() < 64) {
             return icons.values();
         }
+        LabelIndex leasedIndex = null;
         try {
             LabelIndex index;
-            long now = System.nanoTime();
+            long now = nanoTime();
             IdentityHashMap<LinkedHashMap<?, ?>, LabelIndex> labelIndexes = LABEL_INDEXES;
             synchronized (labelIndexes) {
                 if (!campaignCachesReady(generation)) return icons.values();
@@ -2477,15 +3649,15 @@ public final class StarsectorPrepatcherHooks {
                         || (ttlNs > 0L && now - index.builtAtNanos > ttlNs)) {
                     index = LabelIndex.build(icons, now);
                     if (!campaignCachesReady(generation)) return icons.values();
-                    if (labelIndexes.size() >= 32 && !labelIndexes.containsKey(icons)) {
-                        Iterator<LinkedHashMap<?, ?>> iterator = labelIndexes.keySet().iterator();
-                        if (iterator.hasNext()) {
-                            iterator.next();
-                            iterator.remove();
-                        }
+                    if (evictIdleAndLruForInsert(labelIndexes, icons, now,
+                            c.labelOwnerIdleTtlMs, 32,
+                            LABEL_OWNER_IDLE_EVICTIONS, LABEL_OWNER_LIMIT_EVICTIONS)) {
+                        labelIndexes.put(icons, index);
                     }
-                    labelIndexes.put(icons, index);
                 }
+                index.lastAccessNanos = now;
+                index.activeUsers++;
+                leasedIndex = index;
                 if (!campaignCachesReady(generation)) {
                     labelIndexes.clear();
                     return icons.values();
@@ -2505,11 +3677,14 @@ public final class StarsectorPrepatcherHooks {
                     if (bucket != null) result.addAll(bucket);
                 }
             }
+            SCRATCH.get().scopeFrame().observeRetainedList(result);
             LABEL_TOTAL.add(icons.size());
             LABEL_CANDIDATES.add(result.size());
             return result;
         } catch (Throwable ex) {
             return icons.values();
+        } finally {
+            if (leasedIndex != null) leasedIndex.activeUsers--;
         }
     }
 
@@ -2542,6 +3717,8 @@ public final class StarsectorPrepatcherHooks {
         static final float CELL_Y = 3_000f;
         final int size;
         final long builtAtNanos;
+        volatile long lastAccessNanos;
+        volatile int activeUsers;
         final Map<Long, List<Object>> buckets;
         final List<Object> fallback;
         final boolean failed;
@@ -2550,10 +3727,12 @@ public final class StarsectorPrepatcherHooks {
                            List<Object> fallback, boolean failed) {
             this.size = size;
             this.builtAtNanos = builtAtNanos;
+            this.lastAccessNanos = builtAtNanos;
             this.buckets = buckets;
             this.fallback = fallback;
             this.failed = failed;
         }
+
 
         static LabelIndex build(LinkedHashMap<?, ?> icons, long now) {
             Map<Long, List<Object>> buckets = new HashMap<>();
@@ -2630,7 +3809,7 @@ public final class StarsectorPrepatcherHooks {
     public static List getArrowDataCached(IntelInfoPlugin plugin, SectorMapAPI map) {
         PrepatcherConfig c = config;
         long generation = campaignCacheGeneration;
-        if (c == null || !c.intelCallbackCache || !campaignCachesReady(generation)
+        if (c == null || !c.intelArrowRendering || !campaignCachesReady(generation)
                 || c.intelArrowDataCacheMs <= 0) {
             return plugin.getArrowData(map);
         }
@@ -2669,13 +3848,14 @@ public final class StarsectorPrepatcherHooks {
     @SuppressWarnings({"rawtypes", "unchecked"})
     public static boolean fastContains(Collection collection, Object value) {
         PrepatcherConfig c = config;
-        if (c == null || !c.intelFastContains || collection.size() < 16) {
+        if (c == null || !c.intelReconciliation || collection.size() < 16) {
             return collection.contains(value);
         }
         ScratchFrame scratch = SCRATCH.get().scopeFrame();
         if (scratch.containsSource != collection || scratch.containsSourceSize != collection.size()) {
             scratch.containsSet.clear();
             scratch.containsSet.addAll(collection);
+            scratch.observeRetainedSet(scratch.containsSet);
             scratch.containsSource = collection;
             scratch.containsSourceSize = collection.size();
         }
@@ -2698,8 +3878,9 @@ public final class StarsectorPrepatcherHooks {
                 || intelEntities == null || plugin == null) {
             return invokeOriginalIntelIconLookup(owner, plugin);
         }
+        IntelEntityIndex leasedIndex = null;
         try {
-            long now = System.nanoTime();
+            long now = nanoTime();
             Object first = intelEntities.isEmpty() ? null : intelEntities.get(0);
             Object last = intelEntities.isEmpty() ? null : intelEntities.get(intelEntities.size() - 1);
             IntelEntityIndex index;
@@ -2717,16 +3898,20 @@ public final class StarsectorPrepatcherHooks {
                         if (!campaignCachesReady(generation)) {
                             index = null;
                         } else {
-                            if (intelEntityIndexes.size() >= 32
-                                    && !intelEntityIndexes.containsKey(intelEntities)) {
-                                Iterator<List<?>> iterator = intelEntityIndexes.keySet().iterator();
-                                if (iterator.hasNext()) {
-                                    iterator.next();
-                                    iterator.remove();
-                                }
+                            if (evictIdleAndLruForInsert(intelEntityIndexes, intelEntities, now,
+                                    c.intelEntityIndexOwnerIdleTtlMs, 32,
+                                    INTEL_ENTITY_OWNER_IDLE_EVICTIONS,
+                                    INTEL_ENTITY_OWNER_LIMIT_EVICTIONS)) {
+                                intelEntityIndexes.put(intelEntities, index);
                             }
-                            intelEntityIndexes.put(intelEntities, index);
                             INTEL_INDEX_BUILDS.increment();
+                        }
+                    }
+                    if (index != null) {
+                        index.lastAccessNanos = now;
+                        if (!index.failed) {
+                            index.activeUsers++;
+                            leasedIndex = index;
                         }
                     }
                     if (!campaignCachesReady(generation)) {
@@ -2742,6 +3927,8 @@ public final class StarsectorPrepatcherHooks {
         } catch (Throwable ignored) {
             // Fall through to the original method. Keep that invocation outside
             // this catch so an exception from game/mod code is never retried.
+        } finally {
+            if (leasedIndex != null) leasedIndex.activeUsers--;
         }
         return invokeOriginalIntelIconLookup(owner, plugin);
     }
@@ -2806,6 +3993,8 @@ public final class StarsectorPrepatcherHooks {
         final Object first;
         final Object last;
         final long builtAtNanos;
+        volatile long lastAccessNanos;
+        volatile int activeUsers;
         final IdentityHashMap<IntelInfoPlugin, Object> byPlugin;
         final boolean failed;
 
@@ -2815,9 +4004,11 @@ public final class StarsectorPrepatcherHooks {
             this.first = first;
             this.last = last;
             this.builtAtNanos = builtAtNanos;
+            this.lastAccessNanos = builtAtNanos;
             this.byPlugin = byPlugin;
             this.failed = failed;
         }
+
 
         @SuppressWarnings("rawtypes")
         static IntelEntityIndex build(List entities, Object first, Object last, long now) {
@@ -2861,83 +4052,95 @@ public final class StarsectorPrepatcherHooks {
     public static SectorEntityToken hitTestCached(Object handler, float x, float y, float radius) {
         PrepatcherConfig c = config;
         long generation = campaignCacheGeneration;
-        if (c == null || !c.hoverHitTestCache || !campaignCachesReady(generation)) {
+        if (c == null || !c.mapHitTest || !campaignCachesReady(generation)) {
             return invokeOriginalHitTest(handler, x, y, radius);
         }
 
         HitCache cache = null;
+        HitCache leasedCache = null;
         long now = 0L;
         long cellKey = 0L;
         boolean cacheCell = false;
         try {
-            HitAccess access = HitAccess.ACCESS.get(handler.getClass());
-            Object map = access.mapField.get(handler);
-            float factor = ((Number) access.getFactor.invoke(map)).floatValue();
-            Object icons = access.getIcons.invoke(map);
-            int iconCount = icons instanceof Map ? ((Map<?, ?>) icons).size() : -1;
-            Object location = access.getLocation.invoke(map);
-            now = System.nanoTime();
-            IdentityHashMap<Object, HitCache> hitCaches = HIT_CACHES;
-            synchronized (hitCaches) {
-                if (campaignCachesReady(generation)) {
-                    cache = hitCaches.computeIfAbsent(
-                            handler, ignored -> new HitCache(c.hoverMaxCells));
-                    if (hitCaches.size() > 64) {
-                        Iterator<Object> iterator = hitCaches.keySet().iterator();
-                        while (iterator.hasNext() && hitCaches.size() > 64) {
-                            Object candidate = iterator.next();
-                            if (candidate != handler) iterator.remove();
+            try {
+                HitAccess access = HitAccess.ACCESS.get(handler.getClass());
+                Object map = access.mapField.get(handler);
+                float factor = ((Number) access.getFactor.invoke(map)).floatValue();
+                Object icons = access.getIcons.invoke(map);
+                int iconCount = icons instanceof Map ? ((Map<?, ?>) icons).size() : -1;
+                Object location = access.getLocation.invoke(map);
+                now = nanoTime();
+                IdentityHashMap<Object, HitCache> hitCaches = HIT_CACHES;
+                synchronized (hitCaches) {
+                    if (campaignCachesReady(generation)) {
+                        cache = hitCaches.get(handler);
+                        if (cache == null) {
+                            boolean retain = evictIdleAndLruForInsert(hitCaches, handler, now,
+                                    c.hoverOwnerIdleTtlMs, 64,
+                                    HIT_OWNER_IDLE_EVICTIONS, HIT_OWNER_LIMIT_EVICTIONS);
+                            cache = new HitCache(c.hoverMaxCells, now);
+                            if (retain) hitCaches.put(handler, cache);
+                        }
+                        cache.lastAccessNanos = now;
+                    }
+                    if (!campaignCachesReady(generation)) {
+                        hitCaches.clear();
+                        cache = null;
+                    } else if (cache != null) {
+                        cache.activeUsers++;
+                        leasedCache = cache;
+                    }
+                }
+                if (cache != null) {
+                    synchronized (cache) {
+                        if (cache.location != location || cache.iconCount != iconCount
+                                || Float.floatToIntBits(cache.factor) != Float.floatToIntBits(factor)) {
+                            cache.reset(location, iconCount, factor);
+                        }
+                        long minInterval = c.hoverMaxHz <= 0 ? 0L : 1_000_000_000L / c.hoverMaxHz;
+                        if (cache.hasLast && minInterval > 0L && now - cache.lastAtNanos < minInterval) {
+                            HOVER_HITS.increment();
+                            return cache.lastResult;
+                        }
+                        if (c.hoverCellPixels > 0f && c.hoverCellTtlMs > 0 && c.hoverMaxCells > 0
+                                && Float.isFinite(factor) && factor > 0f) {
+                            int cellX = safeFloorToInt((x * factor) / c.hoverCellPixels);
+                            int cellY = safeFloorToInt((y * factor) / c.hoverCellPixels);
+                            cellKey = cellKey(cellX, cellY)
+                                    ^ ((long) Float.floatToIntBits(radius) * 0x9E3779B97F4A7C15L);
+                            CellHit hit = cache.cells.get(cellKey);
+                            if (hit != null && hoverCellFresh(now, hit.atNanos, c.hoverCellTtlMs)) {
+                                cache.setLast(hit.value, now);
+                                HOVER_HITS.increment();
+                                return hit.value;
+                            }
+                            cacheCell = true;
                         }
                     }
                 }
-                if (!campaignCachesReady(generation)) {
-                    hitCaches.clear();
-                    cache = null;
-                }
-            }
-            if (cache != null) {
-                if (cache.location != location || cache.iconCount != iconCount
-                        || Float.floatToIntBits(cache.factor) != Float.floatToIntBits(factor)) {
-                    cache.reset(location, iconCount, factor);
-                }
-                long minInterval = c.hoverMaxHz <= 0 ? 0L : 1_000_000_000L / c.hoverMaxHz;
-                if (cache.hasLast && minInterval > 0L && now - cache.lastAtNanos < minInterval) {
-                    HOVER_HITS.increment();
-                    return cache.lastResult;
-                }
-                if (c.hoverCellPixels > 0f && c.hoverCellTtlMs > 0 && c.hoverMaxCells > 0
-                        && Float.isFinite(factor) && factor > 0f) {
-                    int cellX = safeFloorToInt((x * factor) / c.hoverCellPixels);
-                    int cellY = safeFloorToInt((y * factor) / c.hoverCellPixels);
-                    cellKey = cellKey(cellX, cellY)
-                            ^ ((long) Float.floatToIntBits(radius) * 0x9E3779B97F4A7C15L);
-                    CellHit hit = cache.cells.get(cellKey);
-                    if (hit != null && now - hit.atNanos <= c.hoverCellTtlMs * 1_000_000L) {
-                        cache.setLast(hit.value, now);
-                        HOVER_HITS.increment();
-                        return hit.value;
-                    }
-                    cacheCell = true;
-                }
-            }
-        } catch (Throwable ignored) {
-            // Cache setup is optional. Invoke the original once, below, outside
-            // the catch boundary so its exception/side effects stay exact.
-            cache = null;
-            cacheCell = false;
-        }
-
-        SectorEntityToken value = invokeOriginalHitTest(handler, x, y, radius);
-        if (cache != null) {
-            try {
-                if (cacheCell) cache.cells.put(cellKey, new CellHit(value, now));
-                cache.setLast(value, now);
-                HOVER_MISSES.increment();
             } catch (Throwable ignored) {
-                // Returning the already-computed original result is always safe.
+                // Cache setup is optional. Invoke the original once, below, outside
+                // the catch boundary so its exception/side effects stay exact.
+                cache = null;
+                cacheCell = false;
             }
+
+            SectorEntityToken value = invokeOriginalHitTest(handler, x, y, radius);
+            if (cache != null) {
+                try {
+                    synchronized (cache) {
+                        if (cacheCell) cache.cells.put(cellKey, new CellHit(value, now));
+                        cache.setLast(value, now);
+                    }
+                    HOVER_MISSES.increment();
+                } catch (Throwable ignored) {
+                    // Returning the already-computed original result is always safe.
+                }
+            }
+            return value;
+        } finally {
+            if (leasedCache != null) leasedCache.activeUsers--;
         }
-        return value;
     }
 
     private static SectorEntityToken invokeOriginalHitTest(Object handler, float x, float y, float radius) {
@@ -3009,9 +4212,14 @@ public final class StarsectorPrepatcherHooks {
         boolean hasLast;
         SectorEntityToken lastResult;
         long lastAtNanos;
+        volatile long lastAccessNanos;
+        volatile int activeUsers;
+        long lastCellPruneNanos;
         final LinkedHashMap<Long, CellHit> cells;
 
-        HitCache(int maxEntries) {
+        HitCache(int maxEntries, long now) {
+            lastAccessNanos = now;
+            lastCellPruneNanos = now;
             final int limit = Math.max(1, maxEntries);
             cells = new LinkedHashMap<>(64, 0.75f, true) {
                 @Override
@@ -3020,6 +4228,7 @@ public final class StarsectorPrepatcherHooks {
                 }
             };
         }
+
 
         void reset(Object newLocation, int newIconCount, float newFactor) {
             location = newLocation;
@@ -3727,15 +4936,930 @@ public final class StarsectorPrepatcherHooks {
         }
     }
 
-    /** Transient per-market state for the aggressive central Economy scheduler. */
-    private static final class RemoteMarketScheduleState {
+    /** Per-simulation-tick context owned by the unified CampaignEngine scheduler. */
+    private static final class MarketSchedulerTick {
+        int depth;
+        boolean active;
+        long generation = -1L;
+        long simulationTick;
+        long batch;
+        LocationAPI currentLocation;
+        MarketAPI interactionMarket;
+
+        void clearContext() {
+            active = false;
+            generation = -1L;
+            simulationTick = 0L;
+            batch = 0L;
+            currentLocation = null;
+            interactionMarket = null;
+        }
+    }
+
+    /** One visual-frame batch containing one or more CampaignEngine.advance() calls. */
+    private static final class MarketSchedulerBatch {
+        boolean open;
+        boolean finishing;
+        boolean fastForwardIteration;
+        long generation = -1L;
+        long id;
+        int simulationTicks;
+        LocationAPI currentLocation;
+        MarketAPI interactionMarket;
+        final ArrayList<WeakIdentityEntry<MarketAPI, MarketScheduleState>> touched =
+                new ArrayList<>();
+
+        void open(long generation, long id) {
+            this.open = true;
+            this.finishing = false;
+            this.fastForwardIteration = false;
+            this.generation = generation;
+            this.id = id;
+            this.simulationTicks = 0;
+            this.currentLocation = null;
+            this.interactionMarket = null;
+            this.touched.clear();
+        }
+
+        void clearAfterFinish() {
+            open = false;
+            finishing = false;
+            fastForwardIteration = false;
+            generation = -1L;
+            id = 0L;
+            simulationTicks = 0;
+            currentLocation = null;
+            interactionMarket = null;
+            touched.clear();
+        }
+    }
+
+    private static final class MarketScheduleState {
         float pendingAmount;
-        int deferredCalls;
-        long lastCallFrame = Long.MIN_VALUE;
-        long lastAdvanceFrame = Long.MIN_VALUE;
-        long lastPolicyAuditFrame = Long.MIN_VALUE;
-        boolean memoryFullRate;
+        int pendingSteps;
+        ArrayDeque<PendingStepRun> pendingRuns;
+        long nextDueBatch = Long.MIN_VALUE;
+        long lastTouchedBatch = Long.MIN_VALUE;
+        long lastPolicyAuditBatch = Long.MIN_VALUE;
+        long lastSourceSimulationTick = Long.MIN_VALUE;
+        long debtSequence;
+        int lastSource = -1;
+        int sourceMask;
+        boolean perSimulationTick;
+        boolean constructionFullRate;
+        int constructionReasonMask;
+        long constructionMutationEpoch;
+        long constructionAuditedEpoch = Long.MIN_VALUE;
+        long lastConstructionAuditBatch = Long.MIN_VALUE;
         boolean inAdvance;
+        boolean disabled;
+    }
+
+    private static final class ConstructionProbe {
+        String queueClass = "";
+        int queueSize = -2;
+        int industryCount = -2;
+
+        // Legacy first-positive fields are retained for existing CSV consumers.
+        int industryIndex = -1;
+        String industryId = "";
+        String industryClass = "";
+        boolean industryBuilding;
+        boolean industryEffectiveBuilding;
+        boolean industryUpgrading;
+
+        int buildingIndustryIndex = -1;
+        String buildingIndustryId = "";
+        String buildingIndustryClass = "";
+        String buildingRawBuildingField = "";
+        String buildingBuildProgress = "";
+        String buildingBuildTime = "";
+        String buildingUpgradeId = "";
+        String buildingIsFunctional = "";
+
+        int reportedBuildingWithoutRawIndustryIndex = -1;
+        String reportedBuildingWithoutRawIndustryId = "";
+        String reportedBuildingWithoutRawIndustryClass = "";
+        String reportedBuildingWithoutRawRawBuildingField = "";
+        String reportedBuildingWithoutRawBuildProgress = "";
+        String reportedBuildingWithoutRawBuildTime = "";
+        String reportedBuildingWithoutRawUpgradeId = "";
+        String reportedBuildingWithoutRawIsFunctional = "";
+
+        int upgradingIndustryIndex = -1;
+        String upgradingIndustryId = "";
+        String upgradingIndustryClass = "";
+        String upgradingRawBuildingField = "";
+        String upgradingBuildProgress = "";
+        String upgradingBuildTime = "";
+        String upgradingUpgradeId = "";
+        String upgradingIsFunctional = "";
+
+        String exceptionClass = "";
+        String exceptionMessage = "";
+
+        void reset() {
+            queueClass = "";
+            queueSize = -2;
+            industryCount = -2;
+            industryIndex = -1;
+            industryId = "";
+            industryClass = "";
+            industryBuilding = false;
+            industryEffectiveBuilding = false;
+            industryUpgrading = false;
+            buildingIndustryIndex = -1;
+            buildingIndustryId = "";
+            buildingIndustryClass = "";
+            buildingRawBuildingField = "";
+            buildingBuildProgress = "";
+            buildingBuildTime = "";
+            buildingUpgradeId = "";
+            buildingIsFunctional = "";
+            reportedBuildingWithoutRawIndustryIndex = -1;
+            reportedBuildingWithoutRawIndustryId = "";
+            reportedBuildingWithoutRawIndustryClass = "";
+            reportedBuildingWithoutRawRawBuildingField = "";
+            reportedBuildingWithoutRawBuildProgress = "";
+            reportedBuildingWithoutRawBuildTime = "";
+            reportedBuildingWithoutRawUpgradeId = "";
+            reportedBuildingWithoutRawIsFunctional = "";
+            upgradingIndustryIndex = -1;
+            upgradingIndustryId = "";
+            upgradingIndustryClass = "";
+            upgradingRawBuildingField = "";
+            upgradingBuildProgress = "";
+            upgradingBuildTime = "";
+            upgradingUpgradeId = "";
+            upgradingIsFunctional = "";
+            exceptionClass = "";
+            exceptionMessage = "";
+        }
+
+        void captureIndustry(Industry industry, int index,
+                             boolean reportedBuilding, boolean effectiveBuilding,
+                             boolean upgrading) {
+            industryIndex = index;
+            industryClass = ((Object) industry).getClass().getName();
+            industryBuilding = reportedBuilding;
+            industryEffectiveBuilding = effectiveBuilding;
+            industryUpgrading = upgrading;
+            industryId = safeIndustryId(industry);
+        }
+
+        void captureBuildingIndustry(
+                Industry industry, int index, Boolean rawBuilding) {
+            if (buildingIndustryIndex >= 0) return;
+            buildingIndustryIndex = index;
+            buildingIndustryClass = ((Object) industry).getClass().getName();
+            buildingIndustryId = safeIndustryId(industry);
+            String[] details = baseIndustryDetails(industry, rawBuilding);
+            buildingRawBuildingField = details[0];
+            buildingBuildProgress = details[1];
+            buildingBuildTime = details[2];
+            buildingUpgradeId = details[3];
+            buildingIsFunctional = details[4];
+        }
+
+        void captureReportedBuildingWithoutRawIndustry(
+                Industry industry, int index, Boolean rawBuilding) {
+            if (reportedBuildingWithoutRawIndustryIndex >= 0) return;
+            reportedBuildingWithoutRawIndustryIndex = index;
+            reportedBuildingWithoutRawIndustryClass =
+                    ((Object) industry).getClass().getName();
+            reportedBuildingWithoutRawIndustryId = safeIndustryId(industry);
+            String[] details = baseIndustryDetails(industry, rawBuilding);
+            reportedBuildingWithoutRawRawBuildingField = details[0];
+            reportedBuildingWithoutRawBuildProgress = details[1];
+            reportedBuildingWithoutRawBuildTime = details[2];
+            reportedBuildingWithoutRawUpgradeId = details[3];
+            reportedBuildingWithoutRawIsFunctional = details[4];
+        }
+
+        void captureUpgradingIndustry(
+                Industry industry, int index, Boolean rawBuilding) {
+            if (upgradingIndustryIndex >= 0) return;
+            upgradingIndustryIndex = index;
+            upgradingIndustryClass = ((Object) industry).getClass().getName();
+            upgradingIndustryId = safeIndustryId(industry);
+            String[] details = baseIndustryDetails(industry, rawBuilding);
+            upgradingRawBuildingField = details[0];
+            upgradingBuildProgress = details[1];
+            upgradingBuildTime = details[2];
+            upgradingUpgradeId = details[3];
+            upgradingIsFunctional = details[4];
+        }
+
+        private static String safeIndustryId(Industry industry) {
+            try {
+                String id = industry.getId();
+                return id == null ? "" : id;
+            } catch (Throwable ignored) {
+                return "<unavailable>";
+            }
+        }
+
+        /**
+         * Snapshot BaseIndustry internals as scalar text only. Reflection keeps
+         * this diagnostics path compatible with API variations and avoids
+         * retaining strong references to the industry object.
+         */
+        private static String[] baseIndustryDetails(
+                Industry industry, Boolean rawBuilding) {
+            String[] result = {"", "", "", "", ""};
+            if (!(industry instanceof BaseIndustry)) return result;
+            result[0] = rawBuilding == null
+                    ? readField(industry, "building")
+                    : String.valueOf(rawBuilding.booleanValue());
+            result[1] = readMethodOrField(industry, "getBuildProgress", "buildProgress");
+            result[2] = readMethodOrField(industry, "getBuildTime", "buildTime");
+            result[3] = firstAvailable(
+                    readMethod(industry, "getUpgradeId"),
+                    readField(industry, "upgradeId"),
+                    readField(industry, "upgrade"));
+            result[4] = readMethod(industry, "isFunctional");
+            return result;
+        }
+
+        private static String readMethodOrField(
+                Object target, String methodName, String fieldName) {
+            return firstAvailable(readMethod(target, methodName),
+                    readField(target, fieldName));
+        }
+
+        private static String readMethod(Object target, String name) {
+            if (target == null) return "";
+            Class<?> type = target.getClass();
+            while (type != null) {
+                try {
+                    Method method = type.getDeclaredMethod(name);
+                    method.setAccessible(true);
+                    return diagnosticScalar(method.invoke(target));
+                } catch (NoSuchMethodException ignored) {
+                    type = type.getSuperclass();
+                } catch (Throwable ignored) {
+                    return "<unavailable>";
+                }
+            }
+            return "";
+        }
+
+        private static String readField(Object target, String name) {
+            if (target == null) return "";
+            Class<?> type = target.getClass();
+            while (type != null) {
+                try {
+                    Field field = type.getDeclaredField(name);
+                    field.setAccessible(true);
+                    return diagnosticScalar(field.get(target));
+                } catch (NoSuchFieldException ignored) {
+                    type = type.getSuperclass();
+                } catch (Throwable ignored) {
+                    return "<unavailable>";
+                }
+            }
+            return "";
+        }
+
+        private static String diagnosticScalar(Object value) {
+            if (value == null) return "<null>";
+            if (value instanceof Number || value instanceof Boolean
+                    || value instanceof Character || value instanceof String) {
+                return String.valueOf(value);
+            }
+            return value.getClass().getName() + ':' + String.valueOf(value);
+        }
+
+        private static String firstAvailable(String... values) {
+            for (String value : values) {
+                if (value != null && !value.isEmpty()) return value;
+            }
+            return "";
+        }
+
+        void failure(Throwable failure) {
+            if (failure == null || !exceptionClass.isEmpty()) return;
+            exceptionClass = failure.getClass().getName();
+            String message = failure.getMessage();
+            exceptionMessage = message == null ? "" : message;
+        }
+    }
+
+    private static final class ConstructionDiagnostics {
+        private static final DateTimeFormatter SESSION_FORMAT =
+                DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS")
+                        .withZone(ZoneOffset.UTC);
+        private static final String HEADER =
+                "timestamp_utc,first_seen_utc,last_seen_utc,occurrences,"
+                        + "market_identity_hash,market_id,market_name,trigger,sample_bucket,transition,"
+                        + "reason_mask,reasons,queue_class,queue_size,industry_count,"
+                        + "industry_index,industry_id,industry_class,is_building,"
+                        + "effective_is_building,is_upgrading,reported_building_without_raw,"
+                        + "building_industry_index,building_industry_id,building_industry_class,"
+                        + "building_raw_building_field,building_build_progress,building_build_time,"
+                        + "building_upgrade_id,building_is_functional,"
+                        + "reported_building_without_raw_industry_index,"
+                        + "reported_building_without_raw_industry_id,"
+                        + "reported_building_without_raw_industry_class,"
+                        + "reported_building_without_raw_raw_building_field,"
+                        + "reported_building_without_raw_build_progress,"
+                        + "reported_building_without_raw_build_time,"
+                        + "reported_building_without_raw_upgrade_id,"
+                        + "reported_building_without_raw_is_functional,"
+                        + "upgrading_industry_index,upgrading_industry_id,upgrading_industry_class,"
+                        + "upgrading_raw_building_field,upgrading_build_progress,upgrading_build_time,"
+                        + "upgrading_upgrade_id,upgrading_is_functional,"
+                        + "mutation_epoch,audited_epoch,last_audit_batch,old_active,new_active,"
+                        + "old_reason_mask,new_reason_mask,exception_class,exception_message\n";
+
+        private final int maxSamplesPerReason;
+        private final int reportIntervalSeconds;
+        private final Path output;
+        private final ConcurrentHashMap<String, ConstructionDiagnosticSample> samples =
+                new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<String, AtomicInteger> samplesPerReason =
+                new ConcurrentHashMap<>();
+        private final Object writeLock = new Object();
+
+        ConstructionDiagnostics(PrepatcherConfig configuration, Path root) throws IOException {
+            maxSamplesPerReason = configuration
+                    .marketConstructionDiagnosticsMaxSamplesPerReason;
+            reportIntervalSeconds = configuration.statsLogIntervalSeconds > 0
+                    ? configuration.statsLogIntervalSeconds : 30;
+            String sessionName = "session-" + SESSION_FORMAT.format(Instant.now())
+                    + "-pid" + ProcessHandle.current().pid();
+            Path directory = root.resolve("logs")
+                    .resolve("market-construction-diagnostics").resolve(sessionName);
+            Files.createDirectories(directory);
+            output = directory.resolve("samples.csv");
+            Files.writeString(output, HEADER, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE_NEW);
+            System.setProperty("starsector.prepatcher.marketConstructionDiagnosticsDir",
+                    directory.toAbsolutePath().toString());
+            PrepatcherLog.info("Market construction diagnostics session: "
+                    + directory.toAbsolutePath());
+        }
+
+        void start() {
+            Thread reporter = new Thread(this::reportLoop,
+                    "StarsectorPrepatcher-ConstructionDiagnostics");
+            reporter.setDaemon(true);
+            reporter.setPriority(Thread.MIN_PRIORITY);
+            reporter.start();
+        }
+
+        void observe(MarketAPI market, ConstructionProbe probe, String trigger,
+                     long mutationEpoch, long auditedEpoch, long lastAuditBatch,
+                     boolean oldActive, boolean newActive,
+                     int oldReasonMask, int newReasonMask) {
+            if (newReasonMask == 0 && oldReasonMask == 0 && oldActive == newActive) return;
+            int identityHash = market == null ? 0 : System.identityHashCode(market);
+            String marketId = safeMarketText(market, true);
+            String marketName = safeMarketText(market, false);
+            String reasonBucket = constructionSampleBucket(oldReasonMask, newReasonMask);
+            String industryClass = probe == null ? "" : probe.industryClass;
+            String industryId = probe == null ? "" : probe.industryId;
+            String buildingClass = probe == null ? "" : probe.buildingIndustryClass;
+            String buildingId = probe == null ? "" : probe.buildingIndustryId;
+            String reportedWithoutRawClass = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawIndustryClass;
+            String reportedWithoutRawId = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawIndustryId;
+            String upgradingClass = probe == null ? "" : probe.upgradingIndustryClass;
+            String upgradingId = probe == null ? "" : probe.upgradingIndustryId;
+            String key = reasonBucket + '\u001f' + identityHash + '\u001f' + marketId
+                    + '\u001f' + oldReasonMask + '\u001f' + newReasonMask
+                    + '\u001f' + industryClass + '\u001f' + industryId
+                    + '\u001f' + buildingClass + '\u001f' + buildingId
+                    + '\u001f' + reportedWithoutRawClass
+                    + '\u001f' + reportedWithoutRawId
+                    + '\u001f' + upgradingClass + '\u001f' + upgradingId
+                    + '\u001f' + trigger;
+            ConstructionDiagnosticSample existing = samples.get(key);
+            if (existing == null) {
+                AtomicInteger count = samplesPerReason.computeIfAbsent(
+                        reasonBucket, ignored -> new AtomicInteger());
+                int slot = count.incrementAndGet();
+                if (slot > maxSamplesPerReason) {
+                    count.decrementAndGet();
+                    CONSTRUCTION_DIAGNOSTIC_SAMPLES_DROPPED.increment();
+                    return;
+                }
+                ConstructionDiagnosticSample candidate = new ConstructionDiagnosticSample(
+                        identityHash, marketId, marketName, trigger, reasonBucket,
+                        mutationEpoch, auditedEpoch, lastAuditBatch,
+                        oldActive, newActive, oldReasonMask, newReasonMask, probe);
+                ConstructionDiagnosticSample raced = samples.putIfAbsent(key, candidate);
+                existing = raced == null ? candidate : raced;
+                if (raced != null) count.decrementAndGet();
+            }
+            existing.observe();
+        }
+
+        private void reportLoop() {
+            while (true) {
+                try {
+                    Thread.sleep(reportIntervalSeconds * 1000L);
+                    writePending();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    try { writePending(); } catch (Throwable ignored) {}
+                    return;
+                } catch (Throwable failure) {
+                    PrepatcherLog.error("Market construction diagnostics report failed", failure);
+                }
+            }
+        }
+
+        private void writePending() throws IOException {
+            String timestamp = Instant.now().toString();
+            StringBuilder rows = new StringBuilder();
+            for (ConstructionDiagnosticSample sample : samples.values()) {
+                long occurrences = sample.pendingOccurrences.sumThenReset();
+                if (occurrences <= 0L) continue;
+                sample.append(rows, timestamp, occurrences);
+            }
+            if (rows.length() == 0) return;
+            synchronized (writeLock) {
+                Files.writeString(output, rows, StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            }
+        }
+
+        private static String safeMarketText(MarketAPI market, boolean id) {
+            if (market == null) return "<null>";
+            try {
+                String value = id ? market.getId() : market.getName();
+                return value == null ? "" : value;
+            } catch (Throwable failure) {
+                return "<" + failure.getClass().getSimpleName() + ">";
+            }
+        }
+    }
+
+    private static final class ConstructionDiagnosticSample {
+        final int marketIdentityHash;
+        final String marketId;
+        final String marketName;
+        final String trigger;
+        final String sampleBucket;
+        final String transition;
+        final long mutationEpoch;
+        final long auditedEpoch;
+        final long lastAuditBatch;
+        final boolean oldActive;
+        final boolean newActive;
+        final int oldReasonMask;
+        final int newReasonMask;
+        final String queueClass;
+        final int queueSize;
+        final int industryCount;
+        final int industryIndex;
+        final String industryId;
+        final String industryClass;
+        final boolean building;
+        final boolean effectiveBuilding;
+        final boolean upgrading;
+        final boolean reportedBuildingWithoutRaw;
+        final int buildingIndustryIndex;
+        final String buildingIndustryId;
+        final String buildingIndustryClass;
+        final String buildingRawBuildingField;
+        final String buildingBuildProgress;
+        final String buildingBuildTime;
+        final String buildingUpgradeId;
+        final String buildingIsFunctional;
+        final int reportedBuildingWithoutRawIndustryIndex;
+        final String reportedBuildingWithoutRawIndustryId;
+        final String reportedBuildingWithoutRawIndustryClass;
+        final String reportedBuildingWithoutRawRawBuildingField;
+        final String reportedBuildingWithoutRawBuildProgress;
+        final String reportedBuildingWithoutRawBuildTime;
+        final String reportedBuildingWithoutRawUpgradeId;
+        final String reportedBuildingWithoutRawIsFunctional;
+        final int upgradingIndustryIndex;
+        final String upgradingIndustryId;
+        final String upgradingIndustryClass;
+        final String upgradingRawBuildingField;
+        final String upgradingBuildProgress;
+        final String upgradingBuildTime;
+        final String upgradingUpgradeId;
+        final String upgradingIsFunctional;
+        final String exceptionClass;
+        final String exceptionMessage;
+        final long firstSeenMillis = System.currentTimeMillis();
+        final AtomicLong lastSeenMillis = new AtomicLong(firstSeenMillis);
+        final LongAdder pendingOccurrences = new LongAdder();
+
+        ConstructionDiagnosticSample(int marketIdentityHash,
+                                     String marketId, String marketName, String trigger,
+                                     String sampleBucket,
+                                     long mutationEpoch, long auditedEpoch, long lastAuditBatch,
+                                     boolean oldActive, boolean newActive,
+                                     int oldReasonMask, int newReasonMask,
+                                     ConstructionProbe probe) {
+            this.marketIdentityHash = marketIdentityHash;
+            this.marketId = marketId;
+            this.marketName = marketName;
+            this.trigger = trigger;
+            this.sampleBucket = sampleBucket;
+            this.transition = oldReasonMask == newReasonMask
+                    ? "" : oldReasonMask + "->" + newReasonMask;
+            this.mutationEpoch = mutationEpoch;
+            this.auditedEpoch = auditedEpoch;
+            this.lastAuditBatch = lastAuditBatch;
+            this.oldActive = oldActive;
+            this.newActive = newActive;
+            this.oldReasonMask = oldReasonMask;
+            this.newReasonMask = newReasonMask;
+            queueClass = probe == null ? "" : probe.queueClass;
+            queueSize = probe == null ? -2 : probe.queueSize;
+            industryCount = probe == null ? -2 : probe.industryCount;
+            industryIndex = probe == null ? -1 : probe.industryIndex;
+            industryId = probe == null ? "" : probe.industryId;
+            industryClass = probe == null ? "" : probe.industryClass;
+            building = probe != null && probe.industryBuilding;
+            effectiveBuilding = probe != null && probe.industryEffectiveBuilding;
+            upgrading = probe != null && probe.industryUpgrading;
+            reportedBuildingWithoutRaw = probe != null
+                    && probe.reportedBuildingWithoutRawIndustryIndex >= 0;
+            buildingIndustryIndex = probe == null ? -1 : probe.buildingIndustryIndex;
+            buildingIndustryId = probe == null ? "" : probe.buildingIndustryId;
+            buildingIndustryClass = probe == null ? "" : probe.buildingIndustryClass;
+            buildingRawBuildingField = probe == null ? "" : probe.buildingRawBuildingField;
+            buildingBuildProgress = probe == null ? "" : probe.buildingBuildProgress;
+            buildingBuildTime = probe == null ? "" : probe.buildingBuildTime;
+            buildingUpgradeId = probe == null ? "" : probe.buildingUpgradeId;
+            buildingIsFunctional = probe == null ? "" : probe.buildingIsFunctional;
+            reportedBuildingWithoutRawIndustryIndex = probe == null
+                    ? -1 : probe.reportedBuildingWithoutRawIndustryIndex;
+            reportedBuildingWithoutRawIndustryId = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawIndustryId;
+            reportedBuildingWithoutRawIndustryClass = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawIndustryClass;
+            reportedBuildingWithoutRawRawBuildingField = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawRawBuildingField;
+            reportedBuildingWithoutRawBuildProgress = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawBuildProgress;
+            reportedBuildingWithoutRawBuildTime = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawBuildTime;
+            reportedBuildingWithoutRawUpgradeId = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawUpgradeId;
+            reportedBuildingWithoutRawIsFunctional = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawIsFunctional;
+            upgradingIndustryIndex = probe == null ? -1 : probe.upgradingIndustryIndex;
+            upgradingIndustryId = probe == null ? "" : probe.upgradingIndustryId;
+            upgradingIndustryClass = probe == null ? "" : probe.upgradingIndustryClass;
+            upgradingRawBuildingField = probe == null ? "" : probe.upgradingRawBuildingField;
+            upgradingBuildProgress = probe == null ? "" : probe.upgradingBuildProgress;
+            upgradingBuildTime = probe == null ? "" : probe.upgradingBuildTime;
+            upgradingUpgradeId = probe == null ? "" : probe.upgradingUpgradeId;
+            upgradingIsFunctional = probe == null ? "" : probe.upgradingIsFunctional;
+            exceptionClass = probe == null ? "" : probe.exceptionClass;
+            exceptionMessage = probe == null ? "" : probe.exceptionMessage;
+        }
+
+        void observe() {
+            lastSeenMillis.set(System.currentTimeMillis());
+            pendingOccurrences.increment();
+        }
+
+        void append(StringBuilder output, String timestamp, long occurrences) {
+            output.append(DirectMarketObserver.csv(timestamp)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            Instant.ofEpochMilli(firstSeenMillis).toString())).append(',')
+                    .append(DirectMarketObserver.csv(
+                            Instant.ofEpochMilli(lastSeenMillis.get()).toString())).append(',')
+                    .append(occurrences).append(',')
+                    .append(marketIdentityHash).append(',')
+                    .append(DirectMarketObserver.csv(marketId)).append(',')
+                    .append(DirectMarketObserver.csv(marketName)).append(',')
+                    .append(DirectMarketObserver.csv(trigger)).append(',')
+                    .append(DirectMarketObserver.csv(sampleBucket)).append(',')
+                    .append(DirectMarketObserver.csv(transition)).append(',')
+                    .append(newReasonMask).append(',')
+                    .append(DirectMarketObserver.csv(
+                            constructionReasonText(newReasonMask))).append(',')
+                    .append(DirectMarketObserver.csv(queueClass)).append(',')
+                    .append(queueSize).append(',')
+                    .append(industryCount).append(',')
+                    .append(industryIndex).append(',')
+                    .append(DirectMarketObserver.csv(industryId)).append(',')
+                    .append(DirectMarketObserver.csv(industryClass)).append(',')
+                    .append(building).append(',')
+                    .append(effectiveBuilding).append(',')
+                    .append(upgrading).append(',')
+                    .append(reportedBuildingWithoutRaw).append(',')
+                    .append(buildingIndustryIndex).append(',')
+                    .append(DirectMarketObserver.csv(buildingIndustryId)).append(',')
+                    .append(DirectMarketObserver.csv(buildingIndustryClass)).append(',')
+                    .append(DirectMarketObserver.csv(buildingRawBuildingField)).append(',')
+                    .append(DirectMarketObserver.csv(buildingBuildProgress)).append(',')
+                    .append(DirectMarketObserver.csv(buildingBuildTime)).append(',')
+                    .append(DirectMarketObserver.csv(buildingUpgradeId)).append(',')
+                    .append(DirectMarketObserver.csv(buildingIsFunctional)).append(',')
+                    .append(reportedBuildingWithoutRawIndustryIndex).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawIndustryId)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawIndustryClass)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawRawBuildingField)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawBuildProgress)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawBuildTime)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawUpgradeId)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawIsFunctional)).append(',')
+                    .append(upgradingIndustryIndex).append(',')
+                    .append(DirectMarketObserver.csv(upgradingIndustryId)).append(',')
+                    .append(DirectMarketObserver.csv(upgradingIndustryClass)).append(',')
+                    .append(DirectMarketObserver.csv(upgradingRawBuildingField)).append(',')
+                    .append(DirectMarketObserver.csv(upgradingBuildProgress)).append(',')
+                    .append(DirectMarketObserver.csv(upgradingBuildTime)).append(',')
+                    .append(DirectMarketObserver.csv(upgradingUpgradeId)).append(',')
+                    .append(DirectMarketObserver.csv(upgradingIsFunctional)).append(',')
+                    .append(mutationEpoch).append(',')
+                    .append(auditedEpoch).append(',')
+                    .append(lastAuditBatch).append(',')
+                    .append(oldActive).append(',')
+                    .append(newActive).append(',')
+                    .append(oldReasonMask).append(',')
+                    .append(newReasonMask).append(',')
+                    .append(DirectMarketObserver.csv(exceptionClass)).append(',')
+                    .append(DirectMarketObserver.csv(exceptionMessage)).append('\n');
+        }
+    }
+
+    private static String constructionSampleBucket(
+            int oldReasonMask, int newReasonMask) {
+        if (oldReasonMask != 0 && oldReasonMask != newReasonMask) {
+            // Keep the number of quota categories fixed. The exact masks remain
+            // available in the transition/old_reason_mask/new_reason_mask columns.
+            if (oldReasonMask == CONSTRUCTION_REASON_INDUSTRY_UPGRADING
+                    && newReasonMask == (CONSTRUCTION_REASON_INDUSTRY_BUILDING
+                    | CONSTRUCTION_REASON_INDUSTRY_UPGRADING)) {
+                return "TRANSITION_4_TO_6";
+            }
+            if (oldReasonMask == CONSTRUCTION_REASON_INDUSTRY_UPGRADING
+                    && newReasonMask == (CONSTRUCTION_REASON_INDUSTRY_UPGRADING
+                    | CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW)) {
+                return "TRANSITION_4_TO_132";
+            }
+            return "TRANSITION_OTHER";
+        }
+        return constructionReasonBucket(newReasonMask);
+    }
+
+    private static String constructionReasonBucket(int reasonMask) {
+        int semantic = reasonMask & CONSTRUCTION_REASON_OBSERVED_MASK;
+        if (semantic == CONSTRUCTION_REASON_INDUSTRY_UPGRADING) {
+            return "INDUSTRY_UPGRADING_WITHOUT_BUILDING";
+        }
+        if (semantic == CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW
+                || semantic == (CONSTRUCTION_REASON_INDUSTRY_UPGRADING
+                | CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW)) {
+            return "REPORTED_BUILDING_WITHOUT_RAW";
+        }
+        if (Integer.bitCount(semantic) > 1) return "MULTIPLE";
+        if ((semantic & CONSTRUCTION_REASON_QUEUE_NON_EMPTY) != 0) return "QUEUE_NON_EMPTY";
+        if ((semantic & CONSTRUCTION_REASON_INDUSTRY_BUILDING) != 0) return "INDUSTRY_BUILDING";
+        if ((semantic & CONSTRUCTION_REASON_INDUSTRY_UPGRADING) != 0) return "INDUSTRY_UPGRADING";
+        if ((semantic & CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN) != 0) return "QUEUE_ITEMS_UNKNOWN";
+        if ((semantic & CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN) != 0) return "INDUSTRIES_UNKNOWN";
+        if ((semantic & CONSTRUCTION_REASON_PROBE_FAILURE) != 0) return "PROBE_FAILURE";
+        if ((semantic & CONSTRUCTION_REASON_MUTATION_RACE) != 0) return "MUTATION_RACE";
+        if ((semantic & CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW) != 0) {
+            return "REPORTED_BUILDING_WITHOUT_RAW";
+        }
+        return "INACTIVE";
+    }
+
+    private static String constructionReasonText(int reasonMask) {
+        if (reasonMask == 0) return "NONE";
+        StringBuilder result = new StringBuilder();
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_QUEUE_NON_EMPTY, "QUEUE_NON_EMPTY");
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_INDUSTRY_BUILDING, "INDUSTRY_BUILDING");
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_INDUSTRY_UPGRADING, "INDUSTRY_UPGRADING");
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN, "QUEUE_ITEMS_UNKNOWN");
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN, "INDUSTRIES_UNKNOWN");
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_PROBE_FAILURE, "PROBE_FAILURE");
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_MUTATION_RACE, "MUTATION_RACE");
+        appendReason(result, reasonMask,
+                CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW,
+                "REPORTED_BUILDING_WITHOUT_RAW");
+        return result.toString();
+    }
+
+    private static void appendReason(
+            StringBuilder output, int mask, int bit, String label) {
+        if ((mask & bit) == 0) return;
+        if (output.length() > 0) output.append('|');
+        output.append(label);
+    }
+
+    private static final class PendingStepRun {
+        final float amount;
+        int count;
+
+        PendingStepRun(float amount) {
+            this.amount = amount;
+            this.count = 1;
+        }
+    }
+
+    private static final class MarketAdvanceInvocationContext {
+        int depth;
+    }
+
+    private static final class MarketAdvanceBatchFrame {
+        MarketAPI market;
+        float[] runAmounts = new float[4];
+        int[] runRepeats = new int[4];
+        int runCount;
+        int totalSteps;
+        float totalAmount;
+        boolean visible;
+        int boundInvocationDepth;
+
+        void load(MarketAPI market, MarketScheduleState state, boolean visible) {
+            int runs = state.pendingRuns == null ? 0 : state.pendingRuns.size();
+            ensureCapacity(runs);
+            int index = 0;
+            int steps = 0;
+            if (state.pendingRuns != null) {
+                for (PendingStepRun run : state.pendingRuns) {
+                    if (run == null || run.count <= 0) {
+                        throw new IllegalStateException("Corrupt pending Market.advance run");
+                    }
+                    runAmounts[index] = run.amount;
+                    runRepeats[index] = run.count;
+                    steps += run.count;
+                    index++;
+                }
+            }
+            if (steps != state.pendingSteps || index != runs) {
+                throw new IllegalStateException("Pending Market.advance history invariant failed");
+            }
+            this.market = market;
+            this.runCount = runs;
+            this.totalSteps = state.pendingSteps;
+            this.totalAmount = state.pendingAmount;
+            this.visible = visible;
+            this.boundInvocationDepth = 0;
+        }
+
+        void ensureCapacity(int wanted) {
+            if (wanted <= runAmounts.length) return;
+            int capacity = runAmounts.length;
+            while (capacity < wanted) capacity = Math.max(capacity << 1, 4);
+            runAmounts = Arrays.copyOf(runAmounts, capacity);
+            runRepeats = Arrays.copyOf(runRepeats, capacity);
+        }
+
+        void clear() {
+            market = null;
+            Arrays.fill(runAmounts, 0, runCount, 0f);
+            Arrays.fill(runRepeats, 0, runCount, 0);
+            runCount = 0;
+            totalSteps = 0;
+            totalAmount = 0f;
+            visible = false;
+            boundInvocationDepth = 0;
+        }
+    }
+
+    private static final class MarketAdvanceBatchStack {
+        final ArrayList<MarketAdvanceBatchFrame> frames = new ArrayList<>();
+        int depth;
+
+        MarketAdvanceBatchFrame push(
+                MarketAPI market, MarketScheduleState state, boolean visible) {
+            MarketAdvanceBatchFrame frame;
+            if (depth < frames.size()) frame = frames.get(depth);
+            else {
+                frame = new MarketAdvanceBatchFrame();
+                frames.add(frame);
+            }
+            depth++;
+            try {
+                frame.load(market, state, visible);
+                return frame;
+            } catch (Throwable failure) {
+                depth--;
+                frame.clear();
+                throw failure;
+            }
+        }
+
+        MarketAdvanceBatchFrame current() {
+            return depth <= 0 ? null : frames.get(depth - 1);
+        }
+
+        void pop(MarketAdvanceBatchFrame expected) {
+            MarketAdvanceBatchFrame current = current();
+            if (current != expected) {
+                depth = 0;
+                for (MarketAdvanceBatchFrame frame : frames) frame.clear();
+                throw new IllegalStateException("Market.advance batch stack order changed");
+            }
+            current.clear();
+            depth--;
+            if (depth == 0 && frames.size() > 8) {
+                while (frames.size() > 8) frames.remove(frames.size() - 1);
+            }
+        }
+    }
+
+    private static final class WeakIdentityEntry<K, V> {
+        final K key;
+        final V value;
+
+        WeakIdentityEntry(K key, V value) {
+            this.key = key;
+            this.value = value;
+        }
+    }
+
+    /** Weak-key map with identity, rather than equals(), key semantics. */
+    private static final class WeakIdentityMap<K, V> {
+        private final ReferenceQueue<K> queue = new ReferenceQueue<>();
+        private final HashMap<IdentityWeakReference<K>, V> values = new HashMap<>();
+
+        synchronized V get(K key) {
+            if (key == null) return null;
+            expungeStaleEntries();
+            return values.get(new IdentityWeakReference<>(key));
+        }
+
+        synchronized V putIfAbsent(K key, V value) {
+            if (key == null) throw new NullPointerException("key");
+            expungeStaleEntries();
+            IdentityWeakReference<K> lookup = new IdentityWeakReference<>(key);
+            V existing = values.get(lookup);
+            if (existing != null) return existing;
+            values.put(new IdentityWeakReference<>(key, queue), value);
+            return null;
+        }
+
+        synchronized void put(K key, V value) {
+            if (key == null) throw new NullPointerException("key");
+            expungeStaleEntries();
+            values.remove(new IdentityWeakReference<>(key));
+            values.put(new IdentityWeakReference<>(key, queue), value);
+        }
+
+        synchronized List<WeakIdentityEntry<K, V>> entriesSnapshot() {
+            expungeStaleEntries();
+            ArrayList<WeakIdentityEntry<K, V>> result = new ArrayList<>(values.size());
+            for (Map.Entry<IdentityWeakReference<K>, V> entry : values.entrySet()) {
+                K key = entry.getKey().get();
+                if (key != null) result.add(new WeakIdentityEntry<>(key, entry.getValue()));
+            }
+            return result;
+        }
+
+        synchronized int size() {
+            expungeStaleEntries();
+            return values.size();
+        }
+
+        @SuppressWarnings("unchecked")
+        private void expungeStaleEntries() {
+            IdentityWeakReference<K> stale;
+            while ((stale = (IdentityWeakReference<K>) queue.poll()) != null) {
+                values.remove(stale);
+            }
+        }
+    }
+
+    private static final class IdentityWeakReference<T> extends WeakReference<T> {
+        private final int identityHash;
+
+        IdentityWeakReference(T referent) {
+            super(referent);
+            identityHash = System.identityHashCode(referent);
+        }
+
+        IdentityWeakReference(T referent, ReferenceQueue<T> queue) {
+            super(referent, queue);
+            identityHash = System.identityHashCode(referent);
+        }
+
+        @Override
+        public int hashCode() {
+            return identityHash;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) return true;
+            if (!(other instanceof IdentityWeakReference<?> reference)) return false;
+            Object left = get();
+            return left != null && left == reference.get();
+        }
     }
 
     private static final class CommRelaySystemEntry {
@@ -4352,6 +6476,63 @@ public final class StarsectorPrepatcherHooks {
         return ((long) x << 32) ^ (y & 0xffffffffL);
     }
 
+    private static CacheGaugeSnapshot cacheGaugeSnapshot() {
+        int labelCurrent = 0;
+        long labelIcons = 0L;
+        long labelBuckets = 0L;
+        IdentityHashMap<LinkedHashMap<?, ?>, LabelIndex> labels = LABEL_INDEXES;
+        synchronized (labels) {
+            if (labels == LABEL_INDEXES) {
+                labelCurrent = labels.size();
+                for (LabelIndex index : labels.values()) {
+                    labelIcons += Math.max(0, index.size);
+                    labelBuckets += index.buckets.size();
+                }
+            }
+        }
+
+        int intelCurrent = 0;
+        long intelEntries = 0L;
+        IdentityHashMap<List<?>, IntelEntityIndex> intel = INTEL_ENTITY_INDEXES;
+        synchronized (intel) {
+            if (intel == INTEL_ENTITY_INDEXES) {
+                intelCurrent = intel.size();
+                for (IntelEntityIndex index : intel.values()) {
+                    intelEntries += index.byPlugin.size();
+                }
+            }
+        }
+
+        int hitCurrent = 0;
+        long hitCells = 0L;
+        int hitMax = 0;
+        IdentityHashMap<Object, HitCache> hits = HIT_CACHES;
+        synchronized (hits) {
+            if (hits == HIT_CACHES) {
+                hitCurrent = hits.size();
+                for (HitCache cache : hits.values()) {
+                    synchronized (cache) {
+                        int cells = cache.cells.size();
+                        hitCells += cells;
+                        if (cells > hitMax) hitMax = cells;
+                    }
+                }
+            }
+        }
+        return new CacheGaugeSnapshot(labelCurrent, labelIcons, labelBuckets,
+                intelCurrent, intelEntries, hitCurrent, hitCells, hitMax);
+    }
+
+    private record CacheGaugeSnapshot(
+            int labelIndexesCurrent,
+            long labelIndexesTotalIcons,
+            long labelIndexesTotalBuckets,
+            int intelEntityIndexesCurrent,
+            long intelEntityIndexesTotalEntries,
+            int hitCachesCurrent,
+            long hitCachesTotalCells,
+            int hitCachesMaxCellsPerOwner) {}
+
     private static void statsLoop() {
         PrepatcherConfig c = config;
         int seconds = c == null ? 0 : c.statsLogIntervalSeconds;
@@ -4359,6 +6540,9 @@ public final class StarsectorPrepatcherHooks {
         while (true) {
             try {
                 Thread.sleep(seconds * 1000L);
+                CacheGaugeSnapshot gauges = cacheGaugeSnapshot();
+                ScratchGaugeSnapshot scratchGauges = SCRATCH_GAUGES;
+                MarketSchedulerGaugeSnapshot marketGauges = marketSchedulerGaugeSnapshot();
                 PrepatcherLog.info("stats: retainCalls=" + RETAIN_CALLS.sumThenReset()
                         + ", avoidedContainsUpperBound=" + RETAIN_UPPER_BOUND.sumThenReset()
                         + ", retainKeysScanned=" + RETAIN_KEYS.sumThenReset()
@@ -4366,6 +6550,31 @@ public final class StarsectorPrepatcherHooks {
                         + ", retainEqualityFallbacks=" + RETAIN_EQUALITY_FALLBACKS.sumThenReset()
                         + ", hoverHits=" + HOVER_HITS.sumThenReset()
                         + ", hoverMisses=" + HOVER_MISSES.sumThenReset()
+                        + ", labelIndexesCurrent=" + gauges.labelIndexesCurrent()
+                        + ", labelIndexesTotalIcons=" + gauges.labelIndexesTotalIcons()
+                        + ", labelIndexesTotalBuckets=" + gauges.labelIndexesTotalBuckets()
+                        + ", intelEntityIndexesCurrent=" + gauges.intelEntityIndexesCurrent()
+                        + ", intelEntityIndexesTotalEntries=" + gauges.intelEntityIndexesTotalEntries()
+                        + ", hitCachesCurrent=" + gauges.hitCachesCurrent()
+                        + ", hitCachesTotalCells=" + gauges.hitCachesTotalCells()
+                        + ", hitCachesMaxCellsPerOwner=" + gauges.hitCachesMaxCellsPerOwner()
+                        + ", labelOwnerIdleEvictions=" + LABEL_OWNER_IDLE_EVICTIONS.sum()
+                        + ", labelOwnerLimitEvictions=" + LABEL_OWNER_LIMIT_EVICTIONS.sum()
+                        + ", intelEntityOwnerIdleEvictions=" + INTEL_ENTITY_OWNER_IDLE_EVICTIONS.sum()
+                        + ", intelEntityOwnerLimitEvictions=" + INTEL_ENTITY_OWNER_LIMIT_EVICTIONS.sum()
+                        + ", hitOwnerIdleEvictions=" + HIT_OWNER_IDLE_EVICTIONS.sum()
+                        + ", hitOwnerLimitEvictions=" + HIT_OWNER_LIMIT_EVICTIONS.sum()
+                        + ", hitExpiredCellEvictions=" + HIT_EXPIRED_CELL_EVICTIONS.sum()
+                        + ", scratchFrameCount=" + scratchGauges.frameCount()
+                        + ", scratchPooledListCount=" + scratchGauges.pooledListCount()
+                        + ", scratchPooledSetCount=" + scratchGauges.pooledSetCount()
+                        + ", scratchRetainedListCapacity=" + scratchGauges.retainedListCapacity()
+                        + ", scratchRetainedSetCapacity=" + scratchGauges.retainedSetCapacity()
+                        + ", scratchRetainedIdentityCapacity=" + scratchGauges.retainedIdentityCapacity()
+                        + ", scratchListTrims=" + SCRATCH_LIST_TRIMS.sum()
+                        + ", scratchSetTrims=" + SCRATCH_SET_TRIMS.sum()
+                        + ", scratchIdentityTrims=" + SCRATCH_IDENTITY_TRIMS.sum()
+                        + ", scratchFrameReplacements=" + SCRATCH_FRAME_REPLACEMENTS.sum()
                         + ", mapLocationHits=" + MAP_LOCATION_HITS.sumThenReset()
                         + ", mapLocationMisses=" + MAP_LOCATION_MISSES.sumThenReset()
                         + ", arrowHits=" + ARROW_HITS.sumThenReset()
@@ -4388,26 +6597,171 @@ public final class StarsectorPrepatcherHooks {
                         + ", economyLocationChecks=" + ECONOMY_LOCATION_CHECKS.sumThenReset()
                         + ", economyLocationDirty=" + ECONOMY_LOCATION_DIRTY.sumThenReset()
                         + ", economyLocationSkips=" + ECONOMY_LOCATION_SKIPS.sumThenReset()
-                        + ", economySnapshotElements=" + ECONOMY_SNAPSHOT_ELEMENTS.sumThenReset()
-                        + ", remoteMarketFrames=" + REMOTE_MARKET_FRAMES.sumThenReset()
-                        + ", remoteMarketFullAdvances=" + REMOTE_MARKET_FULL_ADVANCES.sumThenReset()
-                        + ", remoteMarketDeferredCalls=" + REMOTE_MARKET_DEFERRED_CALLS.sumThenReset()
-                        + ", remoteMarketHotAdvances=" + REMOTE_MARKET_HOT_ADVANCES.sumThenReset()
-                        + ", remoteMarketHiddenAdvances=" + REMOTE_MARKET_HIDDEN_ADVANCES.sumThenReset()
-                        + ", remoteMarketSaveFlushes=" + REMOTE_MARKET_SAVE_FLUSHES.sumThenReset()
-                        + ", remoteMarketFallbacks=" + REMOTE_MARKET_FALLBACKS.sumThenReset()
-                        + ", planetConditionMarketCalls="
-                        + PLANET_CONDITION_MARKET_CALLS.sumThenReset()
-                        + ", planetConditionMarketFullAdvances="
-                        + PLANET_CONDITION_MARKET_FULL_ADVANCES.sumThenReset()
-                        + ", planetConditionMarketDeferredCalls="
-                        + PLANET_CONDITION_MARKET_DEFERRED_CALLS.sumThenReset()
-                        + ", planetConditionMarketHotAdvances="
-                        + PLANET_CONDITION_MARKET_HOT_ADVANCES.sumThenReset()
-                        + ", planetConditionMarketSaveFlushes="
-                        + PLANET_CONDITION_MARKET_SAVE_FLUSHES.sumThenReset()
-                        + ", planetConditionMarketFallbacks="
-                        + PLANET_CONDITION_MARKET_FALLBACKS.sumThenReset()
+                        + ", marketSchedulerSimulationTicks="
+                        + MARKET_SCHEDULER_SIMULATION_TICKS.sumThenReset()
+                        + ", marketSchedulerRenderBatches="
+                        + MARKET_SCHEDULER_RENDER_BATCHES.sumThenReset()
+                        + ", marketSchedulerFastForwardTicks="
+                        + MARKET_SCHEDULER_FAST_FORWARD_TICKS.sumThenReset()
+                        + ", marketSchedulerMaxTicksPerBatch="
+                        + MARKET_SCHEDULER_MAX_TICKS_PER_BATCH.getAndSet(0L)
+                        + ", marketSchedulerCalls=" + MARKET_SCHEDULER_CALLS.sumThenReset()
+                        + ", marketSchedulerEconomyCalls="
+                        + MARKET_SCHEDULER_ECONOMY_CALLS.sumThenReset()
+                        + ", marketSchedulerPlanetConditionCalls="
+                        + MARKET_SCHEDULER_PLANET_CONDITION_CALLS.sumThenReset()
+                        + ", marketSchedulerFullAdvances="
+                        + MARKET_SCHEDULER_FULL_ADVANCES.sumThenReset()
+                        + ", marketSchedulerAccumulatedCalls="
+                        + MARKET_SCHEDULER_ACCUMULATED_CALLS.sumThenReset()
+                        + ", marketSchedulerHotAdvances="
+                        + MARKET_SCHEDULER_HOT_ADVANCES.sumThenReset()
+                        + ", marketSchedulerHiddenAdvances="
+                        + MARKET_SCHEDULER_HIDDEN_ADVANCES.sumThenReset()
+                        + ", marketSchedulerPerSimulationTickMarkets="
+                        + countPerSimulationTickMarkets()
+                        + ", marketSchedulerPerSimulationTickCalls="
+                        + MARKET_SCHEDULER_PER_SIMULATION_TICK_CALLS.sumThenReset()
+                        + ", marketSchedulerPerSimulationTickFlagChanges="
+                        + MARKET_SCHEDULER_PER_SIMULATION_TICK_FLAG_CHANGES.sumThenReset()
+                        + ", marketSchedulerSaveFlushes="
+                        + MARKET_SCHEDULER_SAVE_FLUSHES.sumThenReset()
+                        + ", marketSchedulerNotReadyTicks="
+                        + MARKET_SCHEDULER_NOT_READY_TICKS.sumThenReset()
+                        + ", marketSchedulerNotReadyCalls="
+                        + MARKET_SCHEDULER_NOT_READY_CALLS.sumThenReset()
+                        + ", marketSchedulerNestedTicks="
+                        + MARKET_SCHEDULER_NESTED_TICKS.sumThenReset()
+                        + ", marketSchedulerOutsideTickCalls="
+                        + MARKET_SCHEDULER_OUTSIDE_TICK_CALLS.sumThenReset()
+                        + ", marketSchedulerLifecycleInactiveCalls="
+                        + MARKET_SCHEDULER_LIFECYCLE_INACTIVE_CALLS.sumThenReset()
+                        + ", marketSchedulerFrameCaptureFailures="
+                        + MARKET_SCHEDULER_FRAME_CAPTURE_FAILURES.sumThenReset()
+                        + ", marketSchedulerInvalidSourceCalls="
+                        + MARKET_SCHEDULER_INVALID_SOURCE_CALLS.sumThenReset()
+                        + ", marketSchedulerInvalidAmountCalls="
+                        + MARKET_SCHEDULER_INVALID_AMOUNT_CALLS.sumThenReset()
+                        + ", marketSchedulerAmountOverflowSplits="
+                        + MARKET_SCHEDULER_AMOUNT_OVERFLOW_SPLITS.sumThenReset()
+                        + ", marketSchedulerStateFailures="
+                        + MARKET_SCHEDULER_STATE_FAILURES.sumThenReset()
+                        + ", marketSchedulerReentrantCalls="
+                        + MARKET_SCHEDULER_REENTRANT_CALLS.sumThenReset()
+                        + ", marketSchedulerMultipleSourceTickCalls="
+                        + MARKET_SCHEDULER_MULTIPLE_SOURCE_TICK_CALLS.sumThenReset()
+                        + ", marketSchedulerPolicyFailures="
+                        + MARKET_SCHEDULER_POLICY_FAILURES.sumThenReset()
+                        + ", marketSchedulerAdvanceFailures="
+                        + MARKET_SCHEDULER_ADVANCE_FAILURES.sumThenReset()
+                        + ", marketSchedulerDisabledMarketCalls="
+                        + MARKET_SCHEDULER_DISABLED_MARKET_CALLS.sumThenReset()
+                        + ", marketSchedulerSynchronizedAdvances="
+                        + MARKET_SCHEDULER_SYNCHRONIZED_ADVANCES.sumThenReset()
+                        + ", marketSchedulerDirectSynchronizations="
+                        + MARKET_SCHEDULER_DIRECT_SYNCHRONIZATIONS.sumThenReset()
+                        + ", marketSchedulerSaveFlushFailures="
+                        + MARKET_SCHEDULER_SAVE_FLUSH_FAILURES.sumThenReset()
+                        + ", pendingMarketStepsCurrent="
+                        + marketGauges.pendingMarketStepsCurrent()
+                        + ", pendingMarketRunsCurrent="
+                        + marketGauges.pendingMarketRunsCurrent()
+                        + ", pendingMarketStepsHighWater="
+                        + PENDING_MARKET_STEPS_HIGH_WATER.get()
+                        + ", pendingMarketRunsHighWater="
+                        + PENDING_MARKET_RUNS_HIGH_WATER.get()
+                        + ", pendingRunOverflowFlushes="
+                        + PENDING_RUN_OVERFLOW_FLUSHES.sumThenReset()
+                        + ", coalescedMarketFlushes="
+                        + COALESCED_MARKET_FLUSHES.sumThenReset()
+                        + ", coalescedMarketAmount="
+                        + COALESCED_MARKET_AMOUNT.sumThenReset()
+                        + ", marketBatchContextsCreated="
+                        + MARKET_BATCH_CONTEXTS_CREATED.sumThenReset()
+                        + ", militaryBaseReplayedSteps="
+                        + MILITARY_BASE_REPLAYED_STEPS.sumThenReset()
+                        + ", lionsGuardReplayedSteps="
+                        + LIONS_GUARD_REPLAYED_STEPS.sumThenReset()
+                        + ", recentUnrestReplayedSteps="
+                        + RECENT_UNREST_REPLAYED_STEPS.sumThenReset()
+                        + ", constructionFullRateCalls="
+                        + CONSTRUCTION_FULL_RATE_CALLS.sumThenReset()
+                        + ", constructionFullRateMarkets="
+                        + marketGauges.constructionFullRateMarkets()
+                        + ", constructionMarketsQueueNonEmpty="
+                        + marketGauges.constructionMarketsQueueNonEmpty()
+                        + ", constructionMarketsIndustryBuilding="
+                        + marketGauges.constructionMarketsIndustryBuilding()
+                        + ", constructionMarketsIndustryUpgrading="
+                        + marketGauges.constructionMarketsIndustryUpgrading()
+                        + ", constructionMarketsReportedBuildingWithoutRaw="
+                        + marketGauges.constructionMarketsReportedBuildingWithoutRaw()
+                        + ", constructionMarketsUncertain="
+                        + marketGauges.constructionMarketsUncertain()
+                        + ", constructionMarketsMultipleReasons="
+                        + marketGauges.constructionMarketsMultipleReasons()
+                        + ", constructionModeEntries="
+                        + CONSTRUCTION_MODE_ENTRIES.sumThenReset()
+                        + ", constructionModeExits="
+                        + CONSTRUCTION_MODE_EXITS.sumThenReset()
+                        + ", constructionBoundaryExactReplays="
+                        + CONSTRUCTION_BOUNDARY_EXACT_REPLAYS.sumThenReset()
+                        + ", constructionScans="
+                        + CONSTRUCTION_SCANS.sumThenReset()
+                        + ", constructionDirtyScans="
+                        + CONSTRUCTION_DIRTY_SCANS.sumThenReset()
+                        + ", constructionSafetyAuditScans="
+                        + CONSTRUCTION_SAFETY_AUDIT_SCANS.sumThenReset()
+                        + ", constructionForcedScans="
+                        + CONSTRUCTION_FORCED_SCANS.sumThenReset()
+                        + ", constructionCachedDecisions="
+                        + CONSTRUCTION_CACHED_DECISIONS.sumThenReset()
+                        + ", constructionDetectedQueueNonEmpty="
+                        + CONSTRUCTION_DETECTED_QUEUE_NON_EMPTY.sumThenReset()
+                        + ", constructionDetectedIndustryBuilding="
+                        + CONSTRUCTION_DETECTED_INDUSTRY_BUILDING.sumThenReset()
+                        + ", constructionDetectedIndustryUpgrading="
+                        + CONSTRUCTION_DETECTED_INDUSTRY_UPGRADING.sumThenReset()
+                        + ", constructionDetectedReportedBuildingWithoutRaw="
+                        + CONSTRUCTION_DETECTED_REPORTED_BUILDING_WITHOUT_RAW.sumThenReset()
+                        + ", constructionDetectedMultipleReasons="
+                        + CONSTRUCTION_DETECTED_MULTIPLE_REASONS.sumThenReset()
+                        + ", constructionDetectedProbeFailure="
+                        + CONSTRUCTION_DETECTED_PROBE_FAILURE.sumThenReset()
+                        + ", constructionQueueNullScans="
+                        + CONSTRUCTION_QUEUE_NULL_SCANS.sumThenReset()
+                        + ", constructionQueueItemsNullScans="
+                        + CONSTRUCTION_QUEUE_ITEMS_NULL_SCANS.sumThenReset()
+                        + ", constructionIndustriesNullScans="
+                        + CONSTRUCTION_INDUSTRIES_NULL_SCANS.sumThenReset()
+                        + ", constructionQueueItemsObserved="
+                        + CONSTRUCTION_QUEUE_ITEMS_OBSERVED.sumThenReset()
+                        + ", constructionIndustriesScanned="
+                        + CONSTRUCTION_INDUSTRIES_SCANNED.sumThenReset()
+                        + ", constructionMaxQueueItems="
+                        + CONSTRUCTION_MAX_QUEUE_ITEMS.get()
+                        + ", constructionMaxIndustriesScanned="
+                        + CONSTRUCTION_MAX_INDUSTRIES_SCANNED.get()
+                        + ", constructionAuditStateChanges="
+                        + CONSTRUCTION_AUDIT_STATE_CHANGES.sumThenReset()
+                        + ", constructionAuditFalseToTrue="
+                        + CONSTRUCTION_AUDIT_FALSE_TO_TRUE.sumThenReset()
+                        + ", constructionAuditTrueToFalse="
+                        + CONSTRUCTION_AUDIT_TRUE_TO_FALSE.sumThenReset()
+                        + ", constructionReasonChanges="
+                        + CONSTRUCTION_REASON_CHANGES.sumThenReset()
+                        + ", constructionMutationRaces="
+                        + CONSTRUCTION_MUTATION_RACES.sumThenReset()
+                        + ", constructionDiagnosticSamplesDropped="
+                        + CONSTRUCTION_DIAGNOSTIC_SAMPLES_DROPPED.sumThenReset()
+                        + ", saveCoalescedMarkets="
+                        + SAVE_COALESCED_MARKETS.sumThenReset()
+                        + ", saveExactReplayMarkets="
+                        + SAVE_EXACT_REPLAY_MARKETS.sumThenReset()
+                        + ", saveExactReplaySteps="
+                        + SAVE_EXACT_REPLAY_STEPS.sumThenReset()
+                        + ", saveFlushDurationNanos="
+                        + SAVE_FLUSH_DURATION_NANOS.sumThenReset()
                         + ", economyPersistentRebuilds=" + ECONOMY_PERSISTENT_SNAPSHOT_REBUILDS.sumThenReset()
                         + ", economyPersistentAudits=" + ECONOMY_PERSISTENT_SNAPSHOT_AUDITS.sumThenReset()
                         + ", economyPersistentMismatches=" + ECONOMY_PERSISTENT_SNAPSHOT_MISMATCHES.sumThenReset()
@@ -4464,7 +6818,8 @@ public final class StarsectorPrepatcherHooks {
                         + STARTUP_LOG_SPEC.sumThenReset() + STARTUP_LOG_TEXTURE.sumThenReset()
                         + STARTUP_LOG_SOUND.sumThenReset() + STARTUP_LOG_OTHER.sumThenReset()));
                 PrepatcherLog.info("stats: "
-                        + StarsectorPrepatcherTempModHooks.statsAndReset());
+                        + StarsectorPrepatcherTempModHooks.statsAndReset()
+                        + StarsectorPrepatcherCoreWorldsRuntime.statsAndResetFragment());
             } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();
                 return;
@@ -4503,9 +6858,9 @@ public final class StarsectorPrepatcherHooks {
         private static final DateTimeFormatter SESSION_FORMAT =
                 DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS").withZone(ZoneOffset.UTC);
         private static final String SITE_HEADER =
-                "site_id,source,class,method,descriptor,line,ordinal,amount_source,call_owner,opcode\n";
+                "site_id,mod_id,mod_name,mod_directory,jar_name,source,class,method,descriptor,line,ordinal,amount_source,call_owner,opcode\n";
         private static final String OBSERVATION_HEADER =
-                "timestamp_utc,interval_seconds,site_id,source,class,method,descriptor,line,ordinal,"
+                "timestamp_utc,interval_seconds,site_id,mod_id,mod_name,mod_directory,jar_name,source,class,method,descriptor,line,ordinal,"
                         + "amount_source,call_owner,opcode,interval_calls,cumulative_calls,calls_per_second,"
                         + "sampled_calls,sampled_inclusive_ns,estimated_inclusive_ns,avg_sample_ns,"
                         + "exceptions,recursive_calls,finite_amounts,amount_sum,amount_avg,"
@@ -4515,8 +6870,7 @@ public final class StarsectorPrepatcherHooks {
         private static final String SUMMARY_HEADER =
                 "timestamp_utc,interval_seconds,scheduled_entries,scheduler_fallback_entries,"
                         + "save_flush_entries,planet_condition_scheduled_entries,"
-                        + "planet_condition_fallback_entries,planet_condition_save_flush_entries,"
-                        + "planet_condition_immediate_entries,direct_callsite_entries,unknown_entries,"
+                        + "planet_condition_fallback_entries,direct_callsite_entries,unknown_entries,"
                         + "direct_wrapper_calls,site_count,site_overflow_calls,metadata_collisions\n";
         private static final String UNKNOWN_HEADER =
                 "timestamp_utc,samples,stack\n";
@@ -4544,8 +6898,6 @@ public final class StarsectorPrepatcherHooks {
         private final LongAdder saveFlushEntries = new LongAdder();
         private final LongAdder planetConditionScheduledEntries = new LongAdder();
         private final LongAdder planetConditionFallbackEntries = new LongAdder();
-        private final LongAdder planetConditionSaveFlushEntries = new LongAdder();
-        private final LongAdder planetConditionImmediateEntries = new LongAdder();
         private final LongAdder directCallsiteEntries = new LongAdder();
         private final LongAdder unknownEntries = new LongAdder();
         private final LongAdder directWrapperCalls = new LongAdder();
@@ -4662,10 +7014,6 @@ public final class StarsectorPrepatcherHooks {
                         planetConditionScheduledEntries.increment();
                 case MARKET_ORIGIN_PLANET_CONDITION_FALLBACK ->
                         planetConditionFallbackEntries.increment();
-                case MARKET_ORIGIN_PLANET_CONDITION_SAVE_FLUSH ->
-                        planetConditionSaveFlushEntries.increment();
-                case MARKET_ORIGIN_PLANET_CONDITION_IMMEDIATE ->
-                        planetConditionImmediateEntries.increment();
                 case MARKET_ORIGIN_DIRECT_CALL_SITE -> directCallsiteEntries.increment();
                 default -> {
                     unknownEntries.increment();
@@ -4804,8 +7152,6 @@ public final class StarsectorPrepatcherHooks {
             long save = saveFlushEntries.sumThenReset();
             long planetScheduled = planetConditionScheduledEntries.sumThenReset();
             long planetFallback = planetConditionFallbackEntries.sumThenReset();
-            long planetSave = planetConditionSaveFlushEntries.sumThenReset();
-            long planetImmediate = planetConditionImmediateEntries.sumThenReset();
             long direct = directCallsiteEntries.sumThenReset();
             long unknown = unknownEntries.sumThenReset();
             long wrappers = directWrapperCalls.sumThenReset();
@@ -4813,20 +7159,19 @@ public final class StarsectorPrepatcherHooks {
             long collisions = metadataCollisions.sumThenReset();
             String summary = csv(timestamp) + ',' + decimal(elapsedSeconds) + ','
                     + scheduled + ',' + fallback + ',' + save + ','
-                    + planetScheduled + ',' + planetFallback + ',' + planetSave + ','
-                    + planetImmediate + ',' + direct + ',' + unknown + ',' + wrappers + ','
+                    + planetScheduled + ',' + planetFallback + ','
+                    + direct + ',' + unknown + ',' + wrappers + ','
                     + sites.size() + ',' + overflowCalls + ',' + collisions + '\n';
             append(summaryFile, new StringBuilder(summary));
 
             if (wrappers > 0L || unknown > 0L || planetScheduled > 0L
-                    || planetFallback > 0L || planetImmediate > 0L
+                    || planetFallback > 0L
                     || overflowCalls > 0L || collisions > 0L) {
                 PrepatcherLog.info("direct-market-observe: calls=" + wrappers
                         + ", sites=" + sites.size()
                         + ", scheduledEntries=" + scheduled
                         + ", planetScheduledEntries=" + planetScheduled
                         + ", planetFallbackEntries=" + planetFallback
-                        + ", planetImmediateEntries=" + planetImmediate
                         + ", directEntries=" + direct
                         + ", unknownEntries=" + unknown
                         + ", overflowCalls=" + overflowCalls
@@ -4837,7 +7182,7 @@ public final class StarsectorPrepatcherHooks {
         private String sessionJson() {
             String version = System.getProperty("starsector.prepatcher.version", "unknown");
             return "{\n"
-                    + "  \"schema\": 2,\n"
+                    + "  \"schema\": 3,\n"
                     + "  \"mode\": \"observe\",\n"
                     + "  \"createdUtc\": " + json(Instant.now().toString()) + ",\n"
                     + "  \"prepatcherVersion\": " + json(version) + ",\n"
@@ -4849,7 +7194,7 @@ public final class StarsectorPrepatcherHooks {
                     + "  \"maxSites\": " + maxSites + ",\n"
                     + "  \"unknownStackSamplesPerInterval\": "
                     + unknownStackSampleLimit + ",\n"
-                    + "  \"behavior\": \"Direct mod calls remain synchronous and immediate; the separately classified planet-condition engine path may be staggered when its patch is enabled.\"\n"
+                    + "  \"behavior\": \"Engine-owned market calls share one scheduler. Direct mod calls remain synchronous and consume any pending scheduler debt before their own amount.\"\n"
                     + "}\n";
         }
 
@@ -4871,6 +7216,10 @@ public final class StarsectorPrepatcherHooks {
 
         private static void appendSiteRow(StringBuilder output, DirectMarketMetadata metadata) {
             output.append(csv(unsignedHex(metadata.siteId))).append(',')
+                    .append(csv(metadata.modId)).append(',')
+                    .append(csv(metadata.modName)).append(',')
+                    .append(csv(metadata.modDirectory)).append(',')
+                    .append(csv(metadata.jarName)).append(',')
                     .append(csv(metadata.source)).append(',')
                     .append(csv(metadata.className)).append(',')
                     .append(csv(metadata.method)).append(',')
@@ -4892,6 +7241,10 @@ public final class StarsectorPrepatcherHooks {
             output.append(csv(timestamp)).append(',')
                     .append(decimal(elapsedSeconds)).append(',')
                     .append(csv(unsignedHex(metadata.siteId))).append(',')
+                    .append(csv(metadata.modId)).append(',')
+                    .append(csv(metadata.modName)).append(',')
+                    .append(csv(metadata.modDirectory)).append(',')
+                    .append(csv(metadata.jarName)).append(',')
                     .append(csv(metadata.source)).append(',')
                     .append(csv(metadata.className)).append(',')
                     .append(csv(metadata.method)).append(',')
@@ -5047,9 +7400,11 @@ public final class StarsectorPrepatcherHooks {
 
         static DirectMarketSiteStats overflow() {
             DirectMarketSiteStats result = new DirectMarketSiteStats(
-                    new DirectMarketMetadata(0L, "<site-overflow>", "<site-overflow>",
-                            "<site-overflow>", "", -1, -1, "UNKNOWN", "", -1,
-                            "<site-overflow>"));
+                    new DirectMarketMetadata(0L,
+                            "<site-overflow>", "<site-overflow>",
+                            "<site-overflow>", "", "<site-overflow>",
+                            "<site-overflow>", "<site-overflow>", "",
+                            -1, -1, "UNKNOWN", "", -1, "<site-overflow>"));
             result.metadataWritten = true;
             return result;
         }
@@ -5134,6 +7489,10 @@ public final class StarsectorPrepatcherHooks {
 
     private static final class DirectMarketMetadata {
         final long siteId;
+        final String modId;
+        final String modName;
+        final String modDirectory;
+        final String jarName;
         final String source;
         final String className;
         final String method;
@@ -5145,10 +7504,16 @@ public final class StarsectorPrepatcherHooks {
         final int opcode;
         final String raw;
 
-        DirectMarketMetadata(long siteId, String source, String className, String method,
+        DirectMarketMetadata(long siteId, String modId, String modName,
+                             String modDirectory, String jarName,
+                             String source, String className, String method,
                              String descriptor, int line, int ordinal, String amountSource,
                              String callOwner, int opcode, String raw) {
             this.siteId = siteId;
+            this.modId = modId;
+            this.modName = modName;
+            this.modDirectory = modDirectory;
+            this.jarName = jarName;
             this.source = source;
             this.className = className;
             this.method = method;
@@ -5164,13 +7529,41 @@ public final class StarsectorPrepatcherHooks {
         static DirectMarketMetadata parse(long siteId, String metadata) {
             String raw = metadata == null ? "" : metadata;
             String[] fields = raw.split("\u001f", -1);
-            if (fields.length != 10 || !"1".equals(fields[0])) {
-                return new DirectMarketMetadata(siteId, "<malformed>", "<malformed>",
-                        "<malformed>", "", -1, -1, "UNKNOWN", "", -1, raw);
+            if (fields.length == 14 && "2".equals(fields[0])) {
+                return new DirectMarketMetadata(siteId,
+                        fields[2], fields[3], fields[4], fields[5], fields[1],
+                        fields[6], fields[7], fields[8], parseInt(fields[9], -1),
+                        parseInt(fields[10], -1), fields[11], fields[12],
+                        parseInt(fields[13], -1), raw);
             }
-            return new DirectMarketMetadata(siteId, fields[1], fields[2], fields[3], fields[4],
-                    parseInt(fields[5], -1), parseInt(fields[6], -1), fields[7], fields[8],
-                    parseInt(fields[9], -1), raw);
+            if (fields.length == 10 && "1".equals(fields[0])) {
+                String modId = modIdFromSource(fields[1]);
+                return new DirectMarketMetadata(siteId, modId, modId, modId,
+                        jarNameFromSource(fields[1]), fields[1], fields[2], fields[3], fields[4],
+                        parseInt(fields[5], -1), parseInt(fields[6], -1), fields[7], fields[8],
+                        parseInt(fields[9], -1), raw);
+            }
+            return new DirectMarketMetadata(siteId,
+                    "<malformed>", "<malformed>", "<malformed>", "",
+                    "<malformed>", "<malformed>", "<malformed>", "",
+                    -1, -1, "UNKNOWN", "", -1, raw);
+        }
+
+        private static String modIdFromSource(String source) {
+            String normalized = source == null ? "" : source.replace('\\', '/');
+            int marker = normalized.indexOf("/mods/");
+            int start = marker >= 0 ? marker + 6
+                    : (normalized.startsWith("mods/") ? 5 : -1);
+            if (start < 0) return "unknown";
+            int end = normalized.indexOf('/', start);
+            return end < 0 ? normalized.substring(start) : normalized.substring(start, end);
+        }
+
+        private static String jarNameFromSource(String source) {
+            String normalized = source == null ? "" : source.replace('\\', '/');
+            int slash = normalized.lastIndexOf('/');
+            String tail = slash < 0 ? normalized : normalized.substring(slash + 1);
+            return tail.toLowerCase(java.util.Locale.ROOT).endsWith(".jar") ? tail : "";
         }
 
         private static int parseInt(String value, int fallback) {
@@ -5249,6 +7642,8 @@ public final class StarsectorPrepatcherHooks {
     private static final class Scratch {
         final ArrayList<ScratchFrame> frames = new ArrayList<>(2);
         int scopeDepth;
+        int maxDepthSinceIdle;
+        long trailingFramesLastUseNanos = Long.MIN_VALUE;
         boolean removeWhenIdle;
 
         ScratchFrame frameAt(int index) {
@@ -5262,31 +7657,51 @@ public final class StarsectorPrepatcherHooks {
     }
 
     private static final class ScratchFrame {
-        final ArrayList<Object> entityList = new ArrayList<>(1024);
-        final ArrayList<Object> hitList = new ArrayList<>(1024);
-        final HashSet<Object> classSet = new HashSet<>(16);
-        final IdentityHashMap<Object, Boolean> identityMembership = new IdentityHashMap<>(2048);
-        final HashSet<Object> equalityMembership = new HashSet<>(2048);
-        final HashSet<Object> containsSet = new HashSet<>(512);
+        ArrayList<Object> entityList = new ArrayList<>(1024);
+        int entityListHighWater = 1024;
+        ArrayList<Object> hitList = new ArrayList<>(1024);
+        int hitListHighWater = 1024;
+        HashSet<Object> classSet = new HashSet<>(16);
+        int classSetHighWater = 16;
+        IdentityHashMap<Object, Boolean> identityMembership = new IdentityHashMap<>(2048);
+        int identityMembershipHighWater = 2048;
+        HashSet<Object> equalityMembership = new HashSet<>(2048);
+        int equalityMembershipHighWater = 2048;
+        HashSet<Object> containsSet = new HashSet<>(512);
+        int containsSetHighWater = 512;
         Collection<?> containsSource;
         int containsSourceSize = -1;
-        final ArrayList<Object> labelCandidates = new ArrayList<>(256);
+        ArrayList<Object> labelCandidates = new ArrayList<>(256);
+        int labelCandidatesHighWater = 256;
         final Vector2f hitPoint = new Vector2f();
         final Vector2f[] arrowVectors = new Vector2f[] {
                 new Vector2f(), new Vector2f(), new Vector2f(), new Vector2f(),
                 new Vector2f(), new Vector2f(), new Vector2f(), new Vector2f()
         };
         int arrowVectorIndex;
-        final ArrayList<SnapshotList> campaignSnapshots = new ArrayList<>(3);
+        ArrayList<SnapshotList> campaignSnapshots = new ArrayList<>(3);
         int campaignSnapshotIndex;
-        final ArrayList<ArrayList<Object>> pooledLists = new ArrayList<>(8);
+        ArrayList<ArrayList<Object>> pooledLists = new ArrayList<>(8);
+        ArrayList<Integer> pooledListHighWaters = new ArrayList<>(8);
         int pooledListIndex;
-        final ArrayList<HashSet<Object>> pooledSets = new ArrayList<>(4);
+        ArrayList<HashSet<Object>> pooledSets = new ArrayList<>(4);
+        ArrayList<Integer> pooledSetHighWaters = new ArrayList<>(4);
         int pooledSetIndex;
+        int listHighWater = 1024;
+        int setHighWater = 2048;
+        int identityHighWater = 2048;
+        boolean listOversizedTouched;
+        boolean setOversizedTouched;
+        boolean identityOversizedTouched;
+        long oversizedLastUseNanos = Long.MIN_VALUE;
 
         ArrayList<Object> pooledList() {
+            PrepatcherConfig c = config;
+            int limit = c == null ? 32 : c.scratchTrimMaxPooledCollections;
+            if (pooledListIndex >= limit) return new ArrayList<>();
             while (pooledLists.size() <= pooledListIndex) {
                 pooledLists.add(new ArrayList<>());
+                pooledListHighWaters.add(0);
             }
             ArrayList<Object> result = pooledLists.get(pooledListIndex++);
             if (!result.isEmpty()) result.clear();
@@ -5294,8 +7709,12 @@ public final class StarsectorPrepatcherHooks {
         }
 
         HashSet<Object> pooledSet() {
+            PrepatcherConfig c = config;
+            int limit = c == null ? 32 : c.scratchTrimMaxPooledCollections;
+            if (pooledSetIndex >= limit) return new HashSet<>();
             while (pooledSets.size() <= pooledSetIndex) {
                 pooledSets.add(new HashSet<>());
+                pooledSetHighWaters.add(0);
             }
             HashSet<Object> result = pooledSets.get(pooledSetIndex++);
             if (!result.isEmpty()) result.clear();
@@ -5309,12 +7728,129 @@ public final class StarsectorPrepatcherHooks {
             return campaignSnapshots.get(index);
         }
 
-        void clear() {
-            // Scope exit is itself a hot path. In particular, most
-            // BaseCampaignEntity.runScripts() invocations have no scripts. Avoid
-            // touching every historical scratch container when this frame never
-            // borrowed it; clearing a zero-sized collection is cheap in isolation
-            // but becomes measurable across hundreds of thousands of entities.
+        void observeRetainedList(Collection<?> list) {
+            if (list == null) return;
+            int size = list.size();
+            if (list == entityList) entityListHighWater = Math.max(entityListHighWater, size);
+            else if (list == hitList) hitListHighWater = Math.max(hitListHighWater, size);
+            else if (list == labelCandidates) {
+                labelCandidatesHighWater = Math.max(labelCandidatesHighWater, size);
+            } else {
+                for (int i = 0; i < pooledLists.size(); i++) {
+                    if (list == pooledLists.get(i)) {
+                        pooledListHighWaters.set(i,
+                                Math.max(pooledListHighWaters.get(i), size));
+                        break;
+                    }
+                }
+            }
+            observeListSize(size);
+        }
+
+        void observeRetainedSet(Collection<?> set) {
+            if (set == null) return;
+            int size = set.size();
+            if (set == classSet) classSetHighWater = Math.max(classSetHighWater, size);
+            else if (set == equalityMembership) {
+                equalityMembershipHighWater = Math.max(equalityMembershipHighWater, size);
+            } else if (set == containsSet) {
+                containsSetHighWater = Math.max(containsSetHighWater, size);
+            } else {
+                for (int i = 0; i < pooledSets.size(); i++) {
+                    if (set == pooledSets.get(i)) {
+                        pooledSetHighWaters.set(i,
+                                Math.max(pooledSetHighWaters.get(i), size));
+                        break;
+                    }
+                }
+            }
+            observeSetSize(size);
+        }
+
+        void observeListSize(int size) {
+            if (size > listHighWater) listHighWater = size;
+            PrepatcherConfig c = config;
+            if (c != null && size > c.scratchTrimMaxListCapacity) {
+                listOversizedTouched = true;
+            }
+        }
+
+        void observeSetSize(int size) {
+            if (size > setHighWater) setHighWater = size;
+            PrepatcherConfig c = config;
+            if (c != null && size > c.scratchTrimMaxSetEntries) {
+                setOversizedTouched = true;
+            }
+        }
+
+        void observeIdentitySize(int size) {
+            identityMembershipHighWater = Math.max(identityMembershipHighWater, size);
+            if (size > identityHighWater) identityHighWater = size;
+            PrepatcherConfig c = config;
+            if (c != null && size > c.scratchTrimMaxIdentityEntries) {
+                identityOversizedTouched = true;
+            }
+        }
+
+        void refreshHighWater() {
+            listHighWater = Math.max(entityListHighWater, hitListHighWater);
+            listHighWater = Math.max(listHighWater, labelCandidatesHighWater);
+            for (SnapshotList snapshot : campaignSnapshots) {
+                listHighWater = Math.max(listHighWater, snapshot.retainedCapacity());
+            }
+            for (Integer peak : pooledListHighWaters) {
+                listHighWater = Math.max(listHighWater, peak);
+            }
+            setHighWater = Math.max(classSetHighWater, equalityMembershipHighWater);
+            setHighWater = Math.max(setHighWater, containsSetHighWater);
+            for (Integer peak : pooledSetHighWaters) {
+                setHighWater = Math.max(setHighWater, peak);
+            }
+            identityHighWater = Math.max(identityHighWater, identityMembershipHighWater);
+        }
+
+        private boolean consumeOversizedUse() {
+            boolean touched = listOversizedTouched || setOversizedTouched
+                    || identityOversizedTouched;
+            listOversizedTouched = false;
+            setOversizedTouched = false;
+            identityOversizedTouched = false;
+            for (SnapshotList snapshot : campaignSnapshots) {
+                touched |= snapshot.consumeOversizedTouch();
+            }
+            return touched;
+        }
+
+        boolean shouldTrim(PrepatcherConfig c, long now) {
+            refreshHighWater();
+            boolean oversized = listHighWater > c.scratchTrimMaxListCapacity
+                    || setHighWater > c.scratchTrimMaxSetEntries
+                    || identityHighWater > c.scratchTrimMaxIdentityEntries
+                    || pooledLists.size() > c.scratchTrimMaxPooledCollections
+                    || pooledSets.size() > c.scratchTrimMaxPooledCollections;
+            if (!oversized || oversizedLastUseNanos == Long.MIN_VALUE) return false;
+            return now - oversizedLastUseNanos >= millisToNanos(c.scratchTrimGraceMs);
+        }
+
+        long retainedListCapacityEstimate() {
+            long total = entityListHighWater + hitListHighWater + labelCandidatesHighWater;
+            total += 3L + 8L + 4L; // known initial capacities of retained list containers
+            for (SnapshotList snapshot : campaignSnapshots) total += snapshot.retainedCapacity();
+            for (Integer peak : pooledListHighWaters) total += peak;
+            return total;
+        }
+
+        long retainedSetCapacityEstimate() {
+            long total = classSetHighWater + equalityMembershipHighWater + containsSetHighWater;
+            for (Integer peak : pooledSetHighWaters) total += peak;
+            return total;
+        }
+
+        void clear(PrepatcherConfig c, long now) {
+            refreshHighWater();
+            if (c != null && c.scratchTrimEnabled && consumeOversizedUse()) {
+                oversizedLastUseNanos = now;
+            }
             if (!entityList.isEmpty()) entityList.clear();
             if (!hitList.isEmpty()) hitList.clear();
             if (!classSet.isEmpty()) classSet.clear();
@@ -5329,17 +7865,28 @@ public final class StarsectorPrepatcherHooks {
                 campaignSnapshots.get(i).clearSnapshot();
             }
             campaignSnapshotIndex = 0;
-            for (int i = 0; i < pooledListIndex; i++) {
+            for (int i = 0; i < pooledListIndex && i < pooledLists.size(); i++) {
                 ArrayList<Object> list = pooledLists.get(i);
                 if (!list.isEmpty()) list.clear();
             }
             pooledListIndex = 0;
-            for (int i = 0; i < pooledSetIndex; i++) {
+            for (int i = 0; i < pooledSetIndex && i < pooledSets.size(); i++) {
                 HashSet<Object> set = pooledSets.get(i);
                 if (!set.isEmpty()) set.clear();
             }
             pooledSetIndex = 0;
         }
+    }
+
+    private record ScratchGaugeSnapshot(
+            int frameCount,
+            int pooledListCount,
+            int pooledSetCount,
+            long retainedListCapacity,
+            long retainedSetCapacity,
+            long retainedIdentityCapacity) {
+        static final ScratchGaugeSnapshot EMPTY =
+                new ScratchGaugeSnapshot(0, 0, 0, 0L, 0L, 0L);
     }
 
     /** Array-backed, reusable read-only snapshot used only by verified loops. */
@@ -5348,6 +7895,7 @@ public final class StarsectorPrepatcherHooks {
         private int size;
         private final ArrayList<SnapshotIterator> iterators = new ArrayList<>(2);
         private int iteratorIndex;
+        private boolean oversizedTouched;
 
         void copyFrom(Collection<?> source) {
             int oldSize = size;
@@ -5362,6 +7910,11 @@ public final class StarsectorPrepatcherHooks {
                 }
                 elements = copied;
                 size = copiedSize;
+                PrepatcherConfig c = config;
+                if (c != null && copiedSize > c.scratchTrimMaxListCapacity) {
+                    // Snapshot peak is observed before scope close even if later cleared.
+                    oversizedTouched = true;
+                }
                 iteratorIndex = 0;
                 modCount++;
             } catch (Throwable ex) {
@@ -5381,6 +7934,16 @@ public final class StarsectorPrepatcherHooks {
             size = 0;
             iteratorIndex = 0;
             modCount++;
+        }
+
+        int retainedCapacity() {
+            return elements == null ? 0 : elements.length;
+        }
+
+        boolean consumeOversizedTouch() {
+            boolean result = oversizedTouched;
+            oversizedTouched = false;
+            return result;
         }
 
         @Override

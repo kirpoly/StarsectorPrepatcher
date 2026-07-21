@@ -12,6 +12,7 @@ import jdk.internal.org.objectweb.asm.tree.FrameNode;
 import jdk.internal.org.objectweb.asm.tree.InsnList;
 import jdk.internal.org.objectweb.asm.tree.IntInsnNode;
 import jdk.internal.org.objectweb.asm.tree.InsnNode;
+import jdk.internal.org.objectweb.asm.tree.IincInsnNode;
 import jdk.internal.org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import jdk.internal.org.objectweb.asm.tree.JumpInsnNode;
 import jdk.internal.org.objectweb.asm.tree.LabelNode;
@@ -58,25 +59,55 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             "com/fs/starfarer/api/StarsectorPrepatcherHooks";
     private static final String TEMP_MOD_HOOKS =
             "com/fs/starfarer/api/StarsectorPrepatcherTempModHooks";
+    private static final String CORE_WORLDS_RUNTIME =
+            "com/fs/starfarer/api/StarsectorPrepatcherCoreWorldsRuntime";
+    private static final int MARKET_SCHEDULER_COMPONENT_ENGINE = 1;
+    private static final int MARKET_SCHEDULER_COMPONENT_ECONOMY = 2;
+    private static final int MARKET_SCHEDULER_COMPONENT_ENTITY = 4;
+    private static final int MARKET_SCHEDULER_COMPONENT_SAVE = 8;
+    private static final int MARKET_SCHEDULER_COMPONENT_BATCH_PROTOCOL = 16;
+    private static final int MARKET_SCHEDULER_COMPONENT_MARKET_SEMANTICS = 32;
+    private static final int MARKET_SCHEDULER_COMPONENT_MILITARY_BASE = 64;
+    private static final int MARKET_SCHEDULER_COMPONENT_LIONS_GUARD = 128;
+    private static final int MARKET_SCHEDULER_COMPONENT_RECENT_UNREST = 256;
+    private static final int MARKET_SCHEDULER_COMPONENT_BASE_INDUSTRY = 512;
+    private static final int MARKET_SCHEDULER_COMPONENT_CONSTRUCTION_QUEUE = 1024;
     static final String H = "com/fs/starfarer/coreui/A/H";
     static final String A = "com/fs/starfarer/coreui/A/A";
     static final String Z = "com/fs/starfarer/coreui/A/Z";
     static final String EVENTS = "com/fs/starfarer/campaign/comms/v2/EventsPanel";
+    static final String CAMPAIGN_STATE = "com/fs/starfarer/campaign/CampaignState";
     static final String CAMPAIGN_ENGINE = "com/fs/starfarer/campaign/CampaignEngine";
     static final String COURSE_WIDGET = "com/fs/starfarer/coreui/A/O0Oo";
     static final String BASE_LOCATION = "com/fs/starfarer/campaign/BaseLocation";
     static final String BASE_CAMPAIGN_ENTITY = "com/fs/starfarer/campaign/BaseCampaignEntity";
     static final String MEMORY = "com/fs/starfarer/campaign/rules/Memory";
+    static final String CORE_SCRIPT =
+            "com/fs/starfarer/api/impl/campaign/CoreScript";
     static final String ECONOMY = "com/fs/starfarer/campaign/econ/Economy";
     static final String MARKET = "com/fs/starfarer/campaign/econ/Market";
     static final String BASE_INDUSTRY =
             "com/fs/starfarer/api/impl/campaign/econ/impl/BaseIndustry";
+    static final String MILITARY_BASE =
+            "com/fs/starfarer/api/impl/campaign/econ/impl/MilitaryBase";
+    static final String LIONS_GUARD_HQ =
+            "com/fs/starfarer/api/impl/campaign/econ/impl/LionsGuardHQ";
+    static final String RECENT_UNREST =
+            "com/fs/starfarer/api/impl/campaign/econ/RecentUnrest";
+    static final String CONSTRUCTION_QUEUE =
+            "com/fs/starfarer/api/impl/campaign/econ/impl/ConstructionQueue";
     static final String COMMODITY_ON_MARKET =
             "com/fs/starfarer/campaign/econ/CommodityOnMarket";
     private static final String ECONOMY_PERSISTENT_STATE_FIELD =
             "smo$economyMarketsSnapshotState";
     private static final String ECONOMY_PERSISTENT_ACCESSOR =
             "smo$borrowPersistentMarketsSnapshot";
+    private static final String ECONOMY_ADVANCE_PLAN_PATCH_ID = "economyAdvancePlan";
+    private static final String ECONOMY_ADVANCE_PLAN_MASK_FIELD =
+            "smo$economyAdvancePlanMask";
+    private static final int ECONOMY_ADVANCE_FEATURE_PERSISTENT_SNAPSHOTS = 1;
+    private static final int ECONOMY_ADVANCE_FEATURE_LOCATION_CACHE = 2;
+    private static final int ECONOMY_ADVANCE_FEATURE_MARKET_SCHEDULER = 4;
     private static final String MARKET_CONDITIONS_STATE_FIELD =
             "smo$marketConditionsSnapshotState";
     private static final String MARKET_INDUSTRIES_STATE_FIELD =
@@ -85,6 +116,20 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             "smo$borrowPersistentConditionsSnapshot";
     private static final String MARKET_INDUSTRIES_ACCESSOR =
             "smo$borrowPersistentIndustriesSnapshot";
+    private static final String MARKET_ADVANCE_PLAN_PATCH_ID = "marketAdvancePlan";
+    private static final String MARKET_ADVANCE_PLAN_MASK_FIELD =
+            "smo$marketAdvancePlanMask";
+    private static final int MARKET_ADVANCE_FEATURE_PERSISTENT_SNAPSHOTS = 1;
+    private static final int MARKET_ADVANCE_FEATURE_COMMODITY_TEMPORAL = 2;
+    private static final int MARKET_ADVANCE_FEATURE_ENTRY_OBSERVATION = 4;
+    private static final int MARKET_ADVANCE_FEATURE_SCHEDULER_SEMANTICS = 8;
+    private static final String SAVE_METHOD_PLAN_PATCH_ID = "saveMethodPlan";
+    private static final String SAVE_METHOD_PLAN_MASK_FIELD =
+            "smo$saveMethodPlanMask";
+    private static final int SAVE_METHOD_FEATURE_CACHE_MAINTENANCE = 1;
+    private static final int SAVE_METHOD_FEATURE_MARKET_SCHEDULER_FLUSH = 2;
+    private static final String SAVE_OUTPUT_BUFFER_DEDUP_PATCH_ID =
+            "saveOutputBufferDedup";
     private static final String PERSISTENT_STATE_DESC = "Ljava/lang/Object;";
     static final String MUTABLE_STAT =
             "com/fs/starfarer/api/combat/MutableStat";
@@ -102,13 +147,27 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     static final String PROGRESS_INPUT = "com/fs/starfarer/util/oOoOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO";
     static final String PROGRESS_OUTPUT = "com/fs/starfarer/util/do";
     static final String CAMPAIGN_GAME_MANAGER = "com/fs/starfarer/campaign/save/CampaignGameManager";
-    static final Set<String> TARGET_CLASSES = Set.of(H, A, Z, EVENTS, CAMPAIGN_ENGINE,
-            COURSE_WIDGET, BASE_LOCATION, BASE_CAMPAIGN_ENTITY, MEMORY, ECONOMY,
-            MARKET, BASE_INDUSTRY, COMMODITY_ON_MARKET, MUTABLE_STAT, MUTABLE_STAT_WITH_TEMP_MODS,
+    static final String PLANET_SURVEY_PANEL =
+            "com/fs/starfarer/campaign/ui/marketinfo/PlanetSurveyPanel";
+    static final String LUDDIC_PATH_BASE_INTEL =
+            "com/fs/starfarer/api/impl/campaign/intel/bases/LuddicPathBaseIntel";
+    static final String PIRATE_BASE_INTEL =
+            "com/fs/starfarer/api/impl/campaign/intel/bases/PirateBaseIntel";
+    static final String DECIV_TRACKER =
+            "com/fs/starfarer/api/impl/campaign/intel/deciv/DecivTracker";
+    static final String PK_CMD =
+            "com/fs/starfarer/api/impl/campaign/rulecmd/PK_CMD";
+    static final Set<String> TARGET_CLASSES = Set.of(H, A, Z, EVENTS, CAMPAIGN_STATE,
+            CAMPAIGN_ENGINE,
+            COURSE_WIDGET, BASE_LOCATION, BASE_CAMPAIGN_ENTITY, MEMORY, CORE_SCRIPT, ECONOMY,
+            MARKET, BASE_INDUSTRY, MILITARY_BASE, LIONS_GUARD_HQ, RECENT_UNREST,
+            CONSTRUCTION_QUEUE, COMMODITY_ON_MARKET, MUTABLE_STAT, MUTABLE_STAT_WITH_TEMP_MODS,
             INTEL_MANAGER, SHIP,
             DYNAMIC_PARTICLE_GROUP, LOADING_UTILS,
             SCRIPT_STORE_RUNNER, RULES, SPEC_STORE, TEXTURE_LOADER, SOUND,
             PROGRESS_INPUT, PROGRESS_OUTPUT, CAMPAIGN_GAME_MANAGER,
+            PLANET_SURVEY_PANEL, LUDDIC_PATH_BASE_INTEL, PIRATE_BASE_INTEL,
+            DECIV_TRACKER, PK_CMD,
             HyperspacePatches.BASE_TILED, HyperspacePatches.HYPER_TERRAIN,
             HyperspacePatches.AUTOMATON, HyperspacePatches.STARFIELD);
     private static final String ENTITY_TOKEN_DESC = "Lcom/fs/starfarer/api/campaign/SectorEntityToken;";
@@ -134,6 +193,7 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     private final AtomicInteger patchedClasses = new AtomicInteger();
     private final AtomicInteger appliedPatches = new AtomicInteger();
     private final AtomicInteger skippedPatches = new AtomicInteger();
+    private final AtomicInteger compositionFailures = new AtomicInteger();
     private final AtomicInteger alreadyPatched = new AtomicInteger();
 
     public PrepatcherTransformer(PrepatcherConfig config) {
@@ -166,11 +226,24 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             return null;
         }
 
-        TransformState state = new TransformState(className, classfileBuffer);
+        PresentationStructuralContract.State presentationComposition;
+        try {
+            presentationComposition = PresentationStructuralContract.inspect(
+                    className, classfileBuffer, config);
+            if (presentationComposition.present()) {
+                recordStatus(className, "presentationStructuralComposition",
+                        "INPUT_VALIDATED");
+            }
+        } catch (Throwable failure) {
+            recordPresentationCompositionSkip(className, failure);
+            return null;
+        }
+
+        TransformState state = new TransformState(
+                className, classfileBuffer, presentationComposition);
         switch (className) {
             case H -> {
-                apply(state, "retainAll", config.retainAll, this::patchRetainAll);
-                apply(state, "scratchCollections", config.scratchCollections, this::patchHScratchCollections);
+                apply(state, "mapRenderStuff", config.mapRenderStuff, this::patchHRenderStuff);
                 apply(state, "labelSpatialCandidates", config.labelSpatialCandidates, this::patchLabelCandidates);
                 apply(state, "intelEntityIndex", config.intelEntityIndex, this::patchIntelEntityIndex);
                 apply(state, "systemNebulaCache", config.systemNebulaCache, this::patchSystemNebulaCache);
@@ -179,26 +252,27 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 apply(state, "gridLineCap", config.gridLineCap, this::patchGridLineCap);
             }
             case A -> {
-                apply(state, "scratchCollections", config.scratchCollections, this::patchAScratchCollections);
                 apply(state, "intelCallbackCache", config.intelCallbackCache,
                         node -> patchIntelMapLocationCalls(node, 1));
-                // Wrapper last so earlier patches are applied to the preserved original body.
-                apply(state, "hoverHitTestCache", config.hoverHitTestCache, this::patchHoverHitTestCache);
+                // The complete hit-test method is one transformation surface. Keep the wrapper last
+                // so independent call-site patches are applied to the preserved original body.
+                apply(state, "mapHitTest", config.mapHitTest, this::patchMapHitTest);
             }
-            case Z -> {
-                apply(state, "intelCallbackCache", config.intelCallbackCache, this::patchArrowCallbackCache);
-                apply(state, "arrowVectorPool", config.arrowVectorPool, this::patchArrowVectorPool);
-            }
+            case Z -> apply(state, "intelArrowRendering", config.intelArrowRendering,
+                    this::patchIntelArrowRendering);
             case EVENTS -> {
                 apply(state, "intelCallbackCache", config.intelCallbackCache,
                         node -> patchIntelMapLocationCalls(node, 7));
-                apply(state, "intelFastContains", config.intelFastContains, this::patchIntelFastContains);
-                apply(state, "intelExistingIconLookup", config.intelExistingIconLookup,
-                        this::patchExistingIntelIconLookup);
+                apply(state, "intelReconciliation", config.intelReconciliation,
+                        this::patchIntelReconciliation);
             }
+            case CAMPAIGN_STATE -> apply(state, "marketScheduler", config.marketScheduler,
+                    this::patchMarketSchedulerBatchProtocol);
             case CAMPAIGN_ENGINE -> {
                 apply(state, "campaignCacheLifecycle", campaignCacheLifecycleEnabled(),
                         this::patchCampaignCacheLifecycle);
+                apply(state, "marketScheduler", config.marketScheduler,
+                        this::patchMarketSchedulerEngineTick);
                 apply(state, "campaignListenerThrottle",
                         config.campaignListenerThrottle, this::patchCampaignListenerThrottle);
             }
@@ -209,40 +283,37 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             case BASE_CAMPAIGN_ENTITY -> {
                 apply(state, "entityScriptSnapshotReuse",
                         config.entityScriptSnapshotReuse, this::patchEntityScriptSnapshotReuse);
-                apply(state, "planetConditionMarketAdvanceBridge",
-                        config.planetConditionMarketScheduler || config.directMarketObservation,
-                        this::patchPlanetConditionMarketAdvanceBridge);
+                apply(state, "marketScheduler",
+                        config.marketScheduler,
+                        this::patchMarketSchedulerEntitySource);
             }
             case MEMORY -> apply(state, "emptyMemoryAdvanceFastPath",
                     config.emptyMemoryAdvanceFastPath, this::patchEmptyMemoryAdvanceFastPath);
-            case ECONOMY -> {
-                apply(state, "economyPersistentSnapshots", config.economyPersistentSnapshots,
-                        this::patchEconomyPersistentSnapshots);
-                apply(state, "economyLocationCache", config.economyLocationCache,
-                        this::patchEconomyLocationCache);
-                apply(state, "economySnapshotReuse",
-                        config.economySnapshotReuse && !config.economyPersistentSnapshots,
-                        this::patchEconomySnapshots);
-                apply(state, "remoteMarketScheduler", config.remoteMarketScheduler,
-                        this::patchRemoteMarketScheduler);
-                apply(state, "planetConditionMarketFrameClock",
-                        config.planetConditionMarketScheduler && !config.remoteMarketScheduler,
-                        this::patchPlanetConditionMarketFrameClock);
+            case CORE_SCRIPT -> apply(state, "coreWorldsExtentCache",
+                    config.coreWorldsExtentCache, this::patchCoreWorldsExtentCache);
+            case ECONOMY -> apply(state, ECONOMY_ADVANCE_PLAN_PATCH_ID,
+                    economyAdvancePlanEnabled(), this::patchEconomyAdvancePlan);
+            case MARKET -> apply(state, MARKET_ADVANCE_PLAN_PATCH_ID,
+                    marketAdvancePlanEnabled(), this::patchMarketAdvancePlan);
+            case BASE_INDUSTRY -> {
+                apply(state, "marketNoOpCallbacks",
+                        config.marketNoOpCallbacks && config.marketNoOpIndustryAuditFrames > 0,
+                        this::patchBaseIndustryDormantFastPath);
+                apply(state, "marketConstructionMutationBarriers", config.marketScheduler,
+                        this::patchBaseIndustryConstructionMutationBarriers);
             }
-            case MARKET -> {
-                apply(state, "economyPersistentSnapshots", config.economyPersistentSnapshots,
-                        this::patchMarketPersistentSnapshots);
-                apply(state, "economySnapshotReuse",
-                        config.economySnapshotReuse && !config.economyPersistentSnapshots,
-                        this::patchMarketSnapshots);
-                apply(state, "commodityTemporalFastPath", config.commodityTemporalFastPath,
-                        this::patchMarketCommodityTemporalFastPath);
-                apply(state, "directMarketObservation", config.directMarketObservation,
-                        this::patchDirectMarketObservationEntry);
-            }
-            case BASE_INDUSTRY -> apply(state, "marketNoOpCallbacks",
-                    config.marketNoOpCallbacks && config.marketNoOpIndustryAuditFrames > 0,
-                    this::patchBaseIndustryDormantFastPath);
+            case MILITARY_BASE -> apply(state, "marketStepReplayMilitaryBase",
+                    config.marketScheduler,
+                    node -> patchMarketComponentStepReplay(node, 1));
+            case LIONS_GUARD_HQ -> apply(state, "marketStepReplayLionsGuardHQ",
+                    config.marketScheduler,
+                    node -> patchMarketComponentStepReplay(node, 2));
+            case RECENT_UNREST -> apply(state, "marketStepReplayRecentUnrest",
+                    config.marketScheduler,
+                    node -> patchMarketComponentStepReplay(node, 3));
+            case CONSTRUCTION_QUEUE -> apply(state, "marketConstructionMutationBarriers",
+                    config.marketScheduler,
+                    this::patchConstructionQueueMutationBarriers);
             case COMMODITY_ON_MARKET -> apply(state, "commodityEventModDirtyCache",
                     config.commodityEventModDirtyCache,
                     this::patchCommodityEventModDirtyCache);
@@ -283,19 +354,22 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                     config.saveLoadProgressThrottle,
                     node -> patchSaveLoadProgressThrottle(node, "o00000"));
             case CAMPAIGN_GAME_MANAGER -> {
-                apply(state, "saveOutputBufferDedup",
+                apply(state, SAVE_METHOD_PLAN_PATCH_ID,
+                        saveMethodPlanEnabled(), this::patchSaveMethodPlan);
+                // The output-chain allocation rewrite is optional and deliberately
+                // ordered after the correctness-critical pre-save barrier. A layout
+                // mismatch may skip deduplication without disabling scheduler readiness.
+                apply(state, SAVE_OUTPUT_BUFFER_DEDUP_PATCH_ID,
                         config.saveOutputBufferDedup, this::patchSaveOutputBufferDedup);
-                apply(state, "remoteMarketScheduler",
-                        config.remoteMarketScheduler || config.planetConditionMarketScheduler,
-                        this::patchRemoteMarketSaveFlush);
             }
+            case PLANET_SURVEY_PANEL, LUDDIC_PATH_BASE_INTEL, PIRATE_BASE_INTEL,
+                    DECIV_TRACKER, PK_CMD -> apply(state, "marketScheduler",
+                    config.marketScheduler, this::patchMarketSchedulerCoreEventCalls);
             case HyperspacePatches.BASE_TILED -> {
-                applyHyperspace(state, "hyperspaceCulling", config.hyperspaceCulling,
-                        "culling", 2, HyperspacePatches::patchCull,
-                        HyperspacePatches::countPatchedCull);
-                applyHyperspace(state, "hyperspaceYClamp", config.hyperspaceYClamp,
-                        "yClamp", 2, HyperspacePatches::patchClamp,
-                        HyperspacePatches::countPatchedClamp);
+                applyHyperspace(state, "hyperspaceViewportBounds",
+                        config.hyperspaceViewportBounds, "viewportBounds", 2,
+                        HyperspacePatches::patchViewportBounds,
+                        HyperspacePatches::countPatchedViewportBounds);
                 applyHyperspace(state, "terrainRandomReuse", config.terrainRandomReuse,
                         "random", 3, HyperspacePatches::patchRandom,
                         HyperspacePatches::countPatchedRandom);
@@ -322,6 +396,11 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             default -> { return null; }
         }
 
+        if (!validateFinalComposition(state)) {
+            return null;
+        }
+        finalizeAppliedPatches(state);
+
         if (!state.changed) {
             PrepatcherLog.info("Structural scan completed for " + className
                     + "; no new compatible patch was applied.");
@@ -339,11 +418,14 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     private void apply(TransformState state, String patchId, boolean enabled, PatchAction action) {
         if (!enabled) return;
         boolean markerPresent = false;
+        boolean matchCompleted = false;
+        PatchPostcondition postcondition = postconditionFor(action, patchId);
         try {
             ClassNode node = readClass(state.bytes);
             Set<String> publicApi = publicApi(node);
             markerPresent = hasPatchMarker(node, patchId);
             PatchReport report = action.apply(node);
+            matchCompleted = true;
             if (report.total == 0) {
                 throw mismatch("patch reported no changed sites");
             }
@@ -361,29 +443,36 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             if (!publicApi.equals(publicApi(reparsed))) {
                 throw mismatch("public/protected API surface changed after serialization");
             }
-            verifyPatchPostcondition(action, reparsed, patchId);
+            postcondition.validate(candidate);
+            validateEarlierPostconditions(state, candidate, patchId);
 
             state.bytes = candidate;
             state.changed = true;
             String detail = patchId + "{" + report + "}";
             state.appliedDetails.add(detail);
-            int count = appliedPatches.incrementAndGet();
-            System.setProperty("starsector.prepatcher.appliedPatches", Integer.toString(count));
-            recordStatus(state.className, patchId, "APPLIED");
-            PrepatcherLog.info("APPLIED " + patchId + " to " + state.className + ": " + report);
+            state.applied.add(new AppliedPatch(patchId, postcondition, detail, true));
         } catch (AlreadyPatchedException ex) {
             if (!markerPresent) {
                 recordStructuralSkip(state.className, patchId,
                         "hook-shaped postcondition exists without this optimizer's structural marker");
             } else {
+                state.applied.add(new AppliedPatch(patchId, postcondition, null, false));
                 int count = alreadyPatched.incrementAndGet();
                 System.setProperty("starsector.prepatcher.alreadyPatched", Integer.toString(count));
                 recordStatus(state.className, patchId, "ALREADY_APPLIED");
                 PrepatcherLog.info("ALREADY_APPLIED " + patchId + " in " + state.className
                         + ": " + ex.getMessage());
             }
+        } catch (CompositionMismatchException ex) {
+            recordCompositionSkip(state, patchId, ex.getMessage());
         } catch (StructuralMismatchException ex) {
-            recordStructuralSkip(state.className, patchId, ex.getMessage());
+            if (!matchCompleted && wasApplicableBeforeEarlierPatches(state, patchId, action)) {
+                recordCompositionSkip(state, patchId,
+                        "the patch matched the incoming class but no longer matches after earlier "
+                                + "patches: " + ex.getMessage());
+            } else {
+                recordStructuralSkip(state.className, patchId, ex.getMessage());
+            }
         } catch (Throwable ex) {
             int count = skippedPatches.incrementAndGet();
             System.setProperty("starsector.prepatcher.skippedPatches", Integer.toString(count));
@@ -417,14 +506,134 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         PrepatcherLog.warn("SKIPPED_STRUCTURAL " + patchId + " in " + className + ": " + reason);
     }
 
-    private static void verifyPatchPostcondition(PatchAction action, ClassNode node,
+    private static PatchPostcondition postconditionFor(PatchAction action, String patchId) {
+        return bytes -> verifyPatchPostcondition(action, bytes, patchId);
+    }
+
+    private static void verifyPatchPostcondition(PatchAction action, byte[] bytes,
                                                  String patchId) {
+        ClassNode validationNode = readClass(bytes);
+        if (!hasPatchMarker(validationNode, patchId)) {
+            throw mismatch(patchId + " structural marker is missing from the candidate class");
+        }
         try {
-            PatchReport repeated = action.apply(node);
+            PatchReport repeated = action.apply(validationNode);
             throw mismatch(patchId + " remains patchable after serialization: " + repeated);
         } catch (AlreadyPatchedException expected) {
-            // The serialized bytes must satisfy the complete idempotency contract.
+            // Validation runs on a separate ClassNode. Any accidental mutation by a matcher
+            // cannot affect the candidate bytes or another patch's validation.
         }
+    }
+
+    private void validateEarlierPostconditions(TransformState state, byte[] candidate,
+                                               String currentPatchId) {
+        try {
+            state.presentationComposition.validate(candidate, config);
+        } catch (Throwable ex) {
+            throw composition("applying " + currentPatchId
+                    + " invalidated the earlier fast-forward presentation transformation: "
+                    + failureMessage(ex));
+        }
+        for (AppliedPatch previous : state.applied) {
+            try {
+                previous.postcondition.validate(candidate);
+            } catch (Throwable ex) {
+                throw composition("applying " + currentPatchId + " invalidated earlier patch "
+                        + previous.patchId + ": " + failureMessage(ex));
+            }
+        }
+    }
+
+    private boolean validateFinalComposition(TransformState state) {
+        try {
+            state.presentationComposition.validate(state.bytes, config);
+            for (AppliedPatch patch : state.applied) {
+                patch.postcondition.validate(state.bytes);
+            }
+            if (!state.applied.isEmpty() && !state.compositionFailed) {
+                recordStatus(state.className, "composition", "PASSED");
+            }
+            if (state.presentationComposition.present() && !state.compositionFailed) {
+                recordStatus(state.className, "presentationStructuralComposition",
+                        "PASSED");
+            }
+            return true;
+        } catch (Throwable ex) {
+            recordStatus(state.className, "composition", "FAILED");
+            for (AppliedPatch patch : state.applied) {
+                if (patch.newlyApplied) {
+                    recordStatus(state.className, patch.patchId, "ROLLED_BACK_COMPOSITION");
+                }
+            }
+            int count = compositionFailures.incrementAndGet();
+            System.setProperty("starsector.prepatcher.compositionFailures",
+                    Integer.toString(count));
+            PrepatcherLog.error("COMPOSITION_FAILED final validation for " + state.className
+                    + "; all structural changes made by this transformer invocation are rolled "
+                    + "back to the incoming class bytes.", ex);
+            return false;
+        }
+    }
+
+    private void finalizeAppliedPatches(TransformState state) {
+        for (AppliedPatch patch : state.applied) {
+            if (!patch.newlyApplied) continue;
+            int count = appliedPatches.incrementAndGet();
+            System.setProperty("starsector.prepatcher.appliedPatches", Integer.toString(count));
+            recordStatus(state.className, patch.patchId, "APPLIED");
+            PrepatcherLog.info("APPLIED " + patch.patchId + " to " + state.className
+                    + ": " + patch.detail);
+        }
+    }
+
+    private static boolean wasApplicableBeforeEarlierPatches(TransformState state,
+                                                              String patchId,
+                                                              PatchAction action) {
+        if (!state.changed || state.applied.isEmpty()) return false;
+        try {
+            ClassNode baseline = readClass(state.incomingBytes);
+            if (hasPatchMarker(baseline, patchId)) return false;
+            PatchReport report = action.apply(baseline);
+            return report.total > 0;
+        } catch (AlreadyPatchedException | StructuralMismatchException ex) {
+            return false;
+        } catch (Throwable ex) {
+            return false;
+        }
+    }
+
+    private void recordCompositionSkip(TransformState state, String patchId, String reason) {
+        state.compositionFailed = true;
+        int skipped = skippedPatches.incrementAndGet();
+        System.setProperty("starsector.prepatcher.skippedPatches", Integer.toString(skipped));
+        int failures = compositionFailures.incrementAndGet();
+        System.setProperty("starsector.prepatcher.compositionFailures",
+                Integer.toString(failures));
+        recordStatus(state.className, patchId, "SKIPPED_COMPOSITION");
+        recordStatus(state.className, "composition", "FAILED");
+        PrepatcherLog.warn("SKIPPED_COMPOSITION " + patchId + " in " + state.className + ": "
+                + reason + "; the preceding class bytes remain active.");
+    }
+
+    private static String failureMessage(Throwable ex) {
+        String message = ex.getMessage();
+        return message == null || message.isBlank()
+                ? ex.getClass().getSimpleName()
+                : message;
+    }
+
+    private void recordPresentationCompositionSkip(String className, Throwable failure) {
+        int skipped = skippedPatches.incrementAndGet();
+        System.setProperty("starsector.prepatcher.skippedPatches", Integer.toString(skipped));
+        int failures = compositionFailures.incrementAndGet();
+        System.setProperty("starsector.prepatcher.compositionFailures",
+                Integer.toString(failures));
+        recordStatus(className, "presentationStructuralComposition",
+                "SKIPPED_COMPOSITION");
+        recordStatus(className, "composition", "FAILED");
+        PrepatcherLog.warn("SKIPPED_COMPOSITION presentation/structural contract in "
+                + className + ": " + failureMessage(failure)
+                + "; incoming class bytes remain active.");
     }
 
     private static void recordStatus(String className, String patchId, String status) {
@@ -434,26 +643,29 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
 
     boolean isTargetEnabled(String className) {
         return switch (className) {
-            case H -> config.retainAll || config.scratchCollections || config.labelSpatialCandidates
+            case H -> config.mapRenderStuff || config.labelSpatialCandidates
                     || config.intelEntityIndex || config.systemNebulaCache
                     || config.sampleCacheClearThrottle || config.gridLineCap;
-            case A -> config.scratchCollections || config.hoverHitTestCache || config.intelCallbackCache;
-            case Z -> config.intelCallbackCache || config.arrowVectorPool;
-            case EVENTS -> config.intelCallbackCache || config.intelFastContains
-                    || config.intelExistingIconLookup;
+            case A -> config.mapHitTest || config.intelCallbackCache;
+            case Z -> config.intelArrowRendering;
+            case EVENTS -> config.intelCallbackCache || config.intelReconciliation;
+            case CAMPAIGN_STATE -> config.marketScheduler;
             case CAMPAIGN_ENGINE -> campaignCacheLifecycleEnabled() || config.campaignListenerThrottle;
             case COURSE_WIDGET -> config.routeJumpPointIndex;
             case BASE_LOCATION -> config.campaignSnapshotReuse;
             case BASE_CAMPAIGN_ENTITY -> config.entityScriptSnapshotReuse
-                    || config.planetConditionMarketScheduler || config.directMarketObservation;
+                    || config.marketScheduler;
             case MEMORY -> config.emptyMemoryAdvanceFastPath;
-            case ECONOMY -> config.economyLocationCache || config.economySnapshotReuse
-                    || config.economyPersistentSnapshots || config.remoteMarketScheduler
-                    || config.planetConditionMarketScheduler;
-            case MARKET -> config.economySnapshotReuse || config.economyPersistentSnapshots
-                    || config.commodityTemporalFastPath || config.directMarketObservation;
-            case BASE_INDUSTRY -> config.marketNoOpCallbacks
-                    && config.marketNoOpIndustryAuditFrames > 0;
+            case CORE_SCRIPT -> config.coreWorldsExtentCache;
+            case ECONOMY -> config.economyLocationCache
+                    || config.economyPersistentSnapshots || config.marketScheduler;
+            case MARKET -> config.economyPersistentSnapshots
+                    || config.commodityTemporalFastPath || config.directMarketObservation
+                    || config.marketScheduler;
+            case BASE_INDUSTRY -> (config.marketNoOpCallbacks
+                    && config.marketNoOpIndustryAuditFrames > 0) || config.marketScheduler;
+            case MILITARY_BASE, LIONS_GUARD_HQ, RECENT_UNREST, CONSTRUCTION_QUEUE ->
+                    config.marketScheduler;
             case COMMODITY_ON_MARKET -> config.commodityEventModDirtyCache;
             case MUTABLE_STAT -> config.commodityTemporalFastPath;
             case MUTABLE_STAT_WITH_TEMP_MODS ->
@@ -465,10 +677,12 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             case SCRIPT_STORE_RUNNER, SPEC_STORE, TEXTURE_LOADER, SOUND -> config.startupLogAggregation;
             case RULES -> config.startupLogAggregation || config.rulesLiteralParser;
             case PROGRESS_INPUT, PROGRESS_OUTPUT -> config.saveLoadProgressThrottle;
-            case CAMPAIGN_GAME_MANAGER -> config.saveOutputBufferDedup
-                    || config.remoteMarketScheduler || config.planetConditionMarketScheduler;
-            case HyperspacePatches.BASE_TILED -> config.hyperspaceCulling
-                    || config.hyperspaceYClamp || config.terrainRandomReuse;
+            case CAMPAIGN_GAME_MANAGER -> saveMethodPlanEnabled()
+                    || config.saveOutputBufferDedup;
+            case PLANET_SURVEY_PANEL, LUDDIC_PATH_BASE_INTEL, PIRATE_BASE_INTEL,
+                    DECIV_TRACKER, PK_CMD -> config.marketScheduler;
+            case HyperspacePatches.BASE_TILED -> config.hyperspaceViewportBounds
+                    || config.terrainRandomReuse;
             case HyperspacePatches.HYPER_TERRAIN -> config.skipNoOpTerrainLayer
                     || config.terrainRandomReuse || config.automatonBufferReuse;
             case HyperspacePatches.AUTOMATON -> config.automatonBufferReuse;
@@ -477,14 +691,71 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         };
     }
 
+    private boolean economyAdvancePlanEnabled() {
+        return config.economyPersistentSnapshots
+                || config.economyLocationCache
+                || config.marketScheduler;
+    }
+
+    private int requestedEconomyAdvanceFeatureMask() {
+        int mask = 0;
+        if (config.economyPersistentSnapshots) {
+            mask |= ECONOMY_ADVANCE_FEATURE_PERSISTENT_SNAPSHOTS;
+        }
+        if (config.economyLocationCache) {
+            mask |= ECONOMY_ADVANCE_FEATURE_LOCATION_CACHE;
+        }
+        if (config.marketScheduler) {
+            mask |= ECONOMY_ADVANCE_FEATURE_MARKET_SCHEDULER;
+        }
+        return mask;
+    }
+
+    private boolean marketAdvancePlanEnabled() {
+        return config.economyPersistentSnapshots
+                || config.commodityTemporalFastPath
+                || config.directMarketObservation
+                || config.marketScheduler;
+    }
+
+    private boolean saveMethodPlanEnabled() {
+        return config.marketScheduler || campaignCacheLifecycleEnabled();
+    }
+
+    private int requestedSaveMethodFeatureMask() {
+        int mask = 0;
+        if (campaignCacheLifecycleEnabled()) mask |= SAVE_METHOD_FEATURE_CACHE_MAINTENANCE;
+        if (config.marketScheduler) mask |= SAVE_METHOD_FEATURE_MARKET_SCHEDULER_FLUSH;
+        return mask;
+    }
+
+    private int requestedMarketAdvanceFeatureMask() {
+        int mask = 0;
+        if (config.economyPersistentSnapshots) {
+            mask |= MARKET_ADVANCE_FEATURE_PERSISTENT_SNAPSHOTS;
+        }
+        if (config.commodityTemporalFastPath) {
+            mask |= MARKET_ADVANCE_FEATURE_COMMODITY_TEMPORAL;
+        }
+        if (config.directMarketObservation) {
+            mask |= MARKET_ADVANCE_FEATURE_ENTRY_OBSERVATION;
+        }
+        if (config.marketScheduler) {
+            mask |= MARKET_ADVANCE_FEATURE_SCHEDULER_SEMANTICS;
+        }
+        return mask;
+    }
+
     private boolean campaignCacheLifecycleEnabled() {
         return config.labelSpatialCandidates || config.intelCallbackCache
-                || config.intelEntityIndex || config.hoverHitTestCache
+                || config.intelArrowRendering || config.intelEntityIndex || config.mapHitTest
                 || config.systemNebulaCache || config.sampleCacheClearThrottle
                 || config.campaignListenerThrottle || config.routeJumpPointIndex
-                || config.economyLocationCache || config.remoteMarketScheduler
-                || config.planetConditionMarketScheduler || config.commRelaySystemIndex
-                || config.commodityTemporalFastPath;
+                || config.economyLocationCache || config.marketScheduler
+                || config.commRelaySystemIndex
+                || config.commodityTemporalFastPath
+                || config.scratchTrimEnabled
+                || config.starfieldCleanupBuffers;
     }
 
 
@@ -747,6 +1018,156 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         return report;
     }
 
+    /**
+     * Owns the correctness-critical CampaignGameManager pre-save barrier.
+     * Forced cache maintenance and scheduler debt settlement are inspected
+     * against the same incoming class, built on one isolated candidate, and
+     * committed in one transaction with a combined postcondition.
+     *
+     * The optional output-buffer allocation rewrite is intentionally applied
+     * afterwards as a separate ordered patch. Its incompatibility must not
+     * remove the save capability bit or disable market-scheduler readiness.
+     */
+    private PatchReport patchSaveMethodPlan(ClassNode node) {
+        int requestedMask = requestedSaveMethodFeatureMask();
+        if (requestedMask == 0) {
+            throw mismatch("save method patch plan has an empty feature mask");
+        }
+        rejectLegacySaveMethodMarkers(node);
+
+        boolean owned = hasPatchMarker(node, SAVE_METHOD_PLAN_PATCH_ID);
+        if (owned) {
+            requireSaveMethodPlanMask(node, requestedMask);
+            requireSaveMethodPlanPostcondition(node, requestedMask);
+            throw already("save method barrier plan postcondition matches mask="
+                    + requestedMask);
+        }
+        if (findField(node, SAVE_METHOD_PLAN_MASK_FIELD) != null) {
+            throw mismatch("save method plan mask exists without the ownership marker");
+        }
+
+        SaveMethodPatchPlan plan = inspectSaveMethodPatchPlan(node, requestedMask);
+        if (plan.featureMask() != requestedMask) {
+            throw mismatch("save method plan feature mask changed during inspection");
+        }
+        PatchReport report = applySaveMethodPatchPlan(node, plan);
+        node.fields.add(new FieldNode(Opcodes.ASM8, saveMethodPlanMaskAccess(),
+                SAVE_METHOD_PLAN_MASK_FIELD, "I", null, requestedMask));
+        requireSaveMethodPlanMask(node, requestedMask);
+        requireSaveMethodPlanPostcondition(node, requestedMask);
+        report.add("atomic pre-save barrier plan", 1);
+        return report;
+    }
+
+    private SaveMethodPatchPlan inspectSaveMethodPatchPlan(
+            ClassNode incoming, int requestedMask) {
+        // Disabled barrier components must remain vanilla as well. The unified
+        // owner never adopts a legacy split barrier, a foreign hook, or a
+        // partial pre-save state. Output-buffer deduplication is not part of
+        // this transaction and may already be present under its own marker.
+        requireSaveMethodComponentVanilla(incoming,
+                this::patchMarketSchedulerSaveFlush, "market scheduler pre-save barrier");
+        requireSaveMethodComponentVanilla(incoming,
+                this::patchCacheMaintenanceBeforeSave, "cache maintenance pre-save barrier");
+
+        ClassNode planned = readClass(writeClass(incoming));
+        PatchReport combined = new PatchReport();
+        // Explicit barrier order: remove already-idle cache roots, then settle
+        // market debt. Optional output-chain rewriting is applied afterwards.
+        if ((requestedMask & SAVE_METHOD_FEATURE_CACHE_MAINTENANCE) != 0) {
+            PatchReport component = patchCacheMaintenanceBeforeSave(planned);
+            combined.add("cache maintenance pre-save barrier", component.total);
+        }
+        if ((requestedMask & SAVE_METHOD_FEATURE_MARKET_SCHEDULER_FLUSH) != 0) {
+            PatchReport component = patchMarketSchedulerSaveFlush(planned);
+            combined.add("market scheduler pre-save barrier", component.total);
+        }
+        return new SaveMethodPatchPlan(requestedMask, writeClass(planned), combined);
+    }
+
+    private static PatchReport applySaveMethodPatchPlan(
+            ClassNode node, SaveMethodPatchPlan plan) {
+        ClassNode planned = readClass(plan.plannedBytes());
+        if (!node.name.equals(planned.name)) {
+            throw mismatch("save method plan candidate owner changed");
+        }
+        node.fields.clear();
+        node.fields.addAll(planned.fields);
+        node.methods.clear();
+        node.methods.addAll(planned.methods);
+        return plan.report();
+    }
+
+    private void requireSaveMethodPlanPostcondition(ClassNode node, int mask) {
+        requireSaveMethodComponentState(node,
+                (mask & SAVE_METHOD_FEATURE_MARKET_SCHEDULER_FLUSH) != 0,
+                this::patchMarketSchedulerSaveFlush, "market scheduler pre-save barrier");
+        requireSaveMethodComponentState(node,
+                (mask & SAVE_METHOD_FEATURE_CACHE_MAINTENANCE) != 0,
+                this::patchCacheMaintenanceBeforeSave, "cache maintenance pre-save barrier");
+    }
+
+    private static void requireSaveMethodComponentVanilla(
+            ClassNode incoming, PatchAction component, String label) {
+        ClassNode probe = readClass(writeClass(incoming));
+        try {
+            PatchReport report = component.apply(probe);
+            if (report.total <= 0) {
+                throw mismatch("save method " + label + " probe reported no sites");
+            }
+        } catch (AlreadyPatchedException ex) {
+            throw mismatch("save method " + label
+                    + " is already hook-shaped without unified ownership");
+        }
+    }
+
+    private static void requireSaveMethodComponentState(
+            ClassNode node, boolean enabled, PatchAction component, String label) {
+        ClassNode probe = readClass(writeClass(node));
+        try {
+            PatchReport report = component.apply(probe);
+            if (enabled) {
+                throw mismatch("enabled save method " + label
+                        + " remains patchable after unified commit: " + report);
+            }
+            if (report.total <= 0) {
+                throw mismatch("disabled save method " + label
+                        + " vanilla probe reported no sites");
+            }
+        } catch (AlreadyPatchedException ex) {
+            if (!enabled) {
+                throw mismatch("disabled save method " + label
+                        + " is present in the unified post-state");
+            }
+        }
+    }
+
+    private static void rejectLegacySaveMethodMarkers(ClassNode node) {
+        for (String legacy : List.of("marketScheduler", "remoteMarketScheduler")) {
+            if (hasPatchMarker(node, legacy)) {
+                throw mismatch("legacy split save-method ownership marker is present: "
+                        + legacy);
+            }
+        }
+    }
+
+    private static int saveMethodPlanMaskAccess() {
+        return Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL
+                | Opcodes.ACC_SYNTHETIC;
+    }
+
+    private static void requireSaveMethodPlanMask(ClassNode node, int expectedMask) {
+        FieldNode mask = findField(node, SAVE_METHOD_PLAN_MASK_FIELD);
+        if (mask == null || !"I".equals(mask.desc)
+                || mask.access != saveMethodPlanMaskAccess()
+                || mask.signature != null
+                || !(mask.value instanceof Integer value)
+                || value != expectedMask) {
+            throw mismatch("save method plan feature mask changed; expected="
+                    + expectedMask);
+        }
+    }
+
     private PatchReport patchSaveOutputBufferDedup(ClassNode node) {
         MethodNode method = requireMethod(node, "o00000",
                 "(Lcom/fs/starfarer/campaign/CampaignEngine$o;JZ)Ljava/lang/String;");
@@ -776,29 +1197,83 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         return report;
     }
 
-    private PatchReport patchRemoteMarketSaveFlush(ClassNode node) {
+    private PatchReport patchCacheMaintenanceBeforeSave(ClassNode node) {
         MethodNode method = requireMethod(node, "o00000",
                 "(Lcom/fs/starfarer/campaign/CampaignEngine$o;JZ)Ljava/lang/String;");
         int hooks = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
-                "flushRemoteMarketsBeforeSave", "()V");
+                "runCacheMaintenance", "(Z)V");
         if (hooks == 1) {
             AbstractInsnNode first = firstMeaningful(method);
-            if (!(first instanceof MethodInsnNode call)
-                    || !callMatches(call, Opcodes.INVOKESTATIC, HOOKS,
-                    "flushRemoteMarketsBeforeSave", "()V")) {
-                throw mismatch("remote-market save flush is not the first save instruction");
+            if (first == null || first.getOpcode() != Opcodes.ICONST_1) {
+                throw mismatch("forced cache maintenance true argument is not first");
             }
-            throw already("remote-market save flush postcondition matches");
+            MethodInsnNode call = asMethod(nextMeaningful(first),
+                    "forced cache maintenance hook");
+            requireCall(call, Opcodes.INVOKESTATIC, HOOKS,
+                    "runCacheMaintenance", "(Z)V", "forced cache maintenance hook");
+            throw already("cache maintenance pre-save barrier postcondition matches");
         }
-        requireCount("remote-market save flush hooks", hooks, 0);
-
-        method.instructions.insert(new MethodInsnNode(Opcodes.INVOKESTATIC,
-                HOOKS, "flushRemoteMarketsBeforeSave", "()V", false));
-        requireCount("remote-market save flush hooks",
-                countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
-                        "flushRemoteMarketsBeforeSave", "()V"), 1);
+        requireCount("forced cache maintenance hooks", hooks, 0);
+        InsnList prefix = new InsnList();
+        prefix.add(new InsnNode(Opcodes.ICONST_1));
+        prefix.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                HOOKS, "runCacheMaintenance", "(Z)V", false));
+        method.instructions.insert(prefix);
         PatchReport report = new PatchReport();
-        report.add("pending remote-market time flushed before save", 1);
+        report.add("idle cache and scratch maintenance before save", 1);
+        return report;
+    }
+
+    private PatchReport patchMarketSchedulerSaveFlush(ClassNode node) {
+        MethodNode method = requireMethod(node, "o00000",
+                "(Lcom/fs/starfarer/campaign/CampaignEngine$o;JZ)Ljava/lang/String;");
+        PatchState registration = marketSchedulerRegistrationState(node,
+                MARKET_SCHEDULER_COMPONENT_SAVE, "CampaignGameManager market scheduler");
+        int hooks = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "flushMarketSchedulerBeforeSave", "()V");
+        if (hooks == 1 && registration == PatchState.PATCHED) {
+            MethodInsnNode call = only(calls(method, Opcodes.INVOKESTATIC, HOOKS,
+                    "flushMarketSchedulerBeforeSave", "()V"),
+                    "market scheduler save flush");
+            AbstractInsnNode previous = previousMeaningful(call);
+            if (previous instanceof MethodInsnNode maintenance
+                    && callMatches(maintenance, Opcodes.INVOKESTATIC, HOOKS,
+                    "runCacheMaintenance", "(Z)V")) {
+                AbstractInsnNode flag = previousMeaningful(maintenance);
+                if (flag == null || flag.getOpcode() != Opcodes.ICONST_1) {
+                    throw mismatch("market scheduler save flush follows malformed maintenance barrier");
+                }
+            } else if (previous != null) {
+                throw mismatch("market scheduler save flush is not the first barrier after optional maintenance");
+            }
+            throw already("market scheduler save component postcondition matches");
+        }
+        if (hooks != 0 || registration == PatchState.PATCHED) {
+            throw mismatch("market scheduler save component is partially patched");
+        }
+
+        MethodInsnNode flush = new MethodInsnNode(Opcodes.INVOKESTATIC,
+                HOOKS, "flushMarketSchedulerBeforeSave", "()V", false);
+        List<MethodInsnNode> maintenance = calls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "runCacheMaintenance", "(Z)V");
+        if (maintenance.isEmpty()) method.instructions.insert(flush);
+        else {
+            requireCount("forced cache maintenance hooks before scheduler flush",
+                    maintenance.size(), 1);
+            method.instructions.insert(maintenance.get(0), flush);
+        }
+        installMarketSchedulerRegistration(node, MARKET_SCHEDULER_COMPONENT_SAVE,
+                "CampaignGameManager market scheduler");
+        requireCount("market scheduler save flush hooks",
+                countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                        "flushMarketSchedulerBeforeSave", "()V"), 1);
+        if (marketSchedulerRegistrationState(node, MARKET_SCHEDULER_COMPONENT_SAVE,
+                "CampaignGameManager market scheduler") != PatchState.PATCHED) {
+            throw mismatch("market scheduler save component registration is absent");
+        }
+        PatchReport report = new PatchReport();
+        report.add("pending market scheduler time flushed before save", 1);
+        report.add("market scheduler save component registration", 1);
         return report;
     }
 
@@ -1023,6 +1498,11 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 && (integer.getOpcode() == Opcodes.BIPUSH || integer.getOpcode() == Opcodes.SIPUSH));
     }
 
+    private static boolean sourceIsIntegerConstant(SourceValue value, int expected) {
+        return value != null && value.insns != null && value.insns.size() == 1
+                && isIntegerLdc(value.insns.iterator().next(), expected);
+    }
+
     private static void requireNoControlBoundary(AbstractInsnNode start, AbstractInsnNode end,
                                                  String label) {
         for (AbstractInsnNode cursor = start; cursor != null; cursor = cursor.getNext()) {
@@ -1048,7 +1528,219 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     // H: core map renderer
     // ---------------------------------------------------------------------
 
-    private PatchReport patchRetainAll(ClassNode node) {
+    /**
+     * Atomically installs the complete renderStuff optimization surface: the semantic map
+     * reconciliation hook, both reusable collection hooks, and their single reentrant scratch
+     * scope. A mixed or partial state rejects the whole group so one sub-optimization can never
+     * silently survive without the other two.
+     */
+    private PatchReport patchHRenderStuff(ClassNode node) {
+        MethodNode method = requireMethod(node, "renderStuff", "(FZ)V");
+        String hookDesc = "(Ljava/util/Set;Ljava/util/Collection;Ljava/lang/Object;)Z";
+        List<AllocationSpec> specs = hRenderStuffAllocationSpecs();
+        PatchState scopeState = scratchScopeState(node.name, method, "H.renderStuff");
+        PatchState mutationState = hRenderScratchMutationState(method);
+
+        List<MethodInsnNode> rawCalls = calls(method, Opcodes.INVOKEINTERFACE,
+                "java/util/Set", "retainAll", "(Ljava/util/Collection;)Z");
+        Frame<SourceValue>[] frames = sourceFrames(node.name, method);
+        List<MethodInsnNode> originalRetain = new ArrayList<>();
+        for (MethodInsnNode candidate : rawCalls) {
+            if (isMapReconciliationSite(node, method, candidate, frames)) {
+                originalRetain.add(candidate);
+            }
+        }
+        List<MethodInsnNode> retainHooks = calls(method, Opcodes.INVOKESTATIC,
+                HOOKS, "retainAllFast", hookDesc);
+        boolean retainOriginal = originalRetain.size() == 1 && retainHooks.isEmpty();
+        boolean retainPatched = originalRetain.isEmpty() && retainHooks.size() == 1;
+
+        boolean allocationsOriginal = true;
+        boolean allocationsPatched = true;
+        List<List<AllocationPlan>> plans = new ArrayList<>();
+        List<List<Integer>> hookedLocals = new ArrayList<>();
+        for (AllocationSpec spec : specs) {
+            List<AllocationPlan> found = hRenderStuffAllocationPlans(node.name, method, spec);
+            List<Integer> locals = storedHookResultLocals(method, spec);
+            allocationsOriginal &= found.size() == spec.expected && locals.isEmpty();
+            allocationsPatched &= found.isEmpty() && locals.size() == spec.expected;
+            plans.add(found);
+            hookedLocals.add(locals);
+        }
+
+        if (retainPatched && allocationsPatched) {
+            if (scopeState != PatchState.PATCHED || mutationState != PatchState.PATCHED) {
+                throw mismatch("H.renderStuff hooks exist without the complete scratch scope");
+            }
+            validatePatchedHRenderStuff(node, method, retainHooks.get(0), specs, hookedLocals);
+            throw already("H.renderStuff map reconciliation, scratch collections, and scope "
+                    + "are already present");
+        }
+
+        if (!retainOriginal || !allocationsOriginal) {
+            throw mismatch("H.renderStuff has mixed, missing, or ambiguous reconciliation/"
+                    + "allocation sites");
+        }
+        if (scopeState != PatchState.ORIGINAL || mutationState != PatchState.ORIGINAL) {
+            throw mismatch("H.renderStuff has a scope/mutation hook without the complete owned group");
+        }
+
+        // Validate every scratch local before changing any instruction in the shared method.
+        for (int i = 0; i < specs.size(); i++) {
+            AllocationSpec spec = specs.get(i);
+            for (int j = 0; j < plans.get(i).size(); j++) {
+                requireScratchUseContract(node.name, method, plans.get(i).get(j).local,
+                        spec, j, "H.renderStuff");
+            }
+        }
+
+        applyHRetainAll(node);
+        applyHRenderScratchCollections(method, specs, plans);
+        int observedMutations = replaceHRenderScratchMutations(method);
+
+        PatchReport report = new PatchReport();
+        report.add("linear map reconciliation", 1);
+        report.add("render scratch collections", 2);
+        report.add("render scratch peak observations", observedMutations);
+        return report;
+    }
+
+    private static PatchState hRenderScratchMutationState(MethodNode method) {
+        int raw = countCalls(method, Opcodes.INVOKEINTERFACE,
+                "java/util/Set", "add", "(Ljava/lang/Object;)Z");
+        int hooks = countCalls(method, Opcodes.INVOKESTATIC,
+                HOOKS, "scratchSetAdd", "(Ljava/util/Set;Ljava/lang/Object;)Z");
+        boolean original = raw == 7 && hooks == 0;
+        boolean patched = raw == 0 && hooks == 7;
+        if (!original && !patched) {
+            throw mismatch("H.renderStuff scratch-set mutation sites are partial or changed");
+        }
+        return original ? PatchState.ORIGINAL : PatchState.PATCHED;
+    }
+
+    private static int replaceHRenderScratchMutations(MethodNode method) {
+        AllocationSpec setSpec = hRenderStuffAllocationSpecs().get(1);
+        List<Integer> locals = storedHookResultLocals(method, setSpec);
+        if (locals.size() != 1) throw mismatch("H.renderStuff scratch-set local is ambiguous");
+        int local = locals.get(0);
+        Frame<SourceValue>[] frames = sourceFrames(H, method);
+        int changed = 0;
+        for (MethodInsnNode call : new ArrayList<>(calls(method, Opcodes.INVOKEINTERFACE,
+                "java/util/Set", "add", "(Ljava/lang/Object;)Z"))) {
+            if (!sourceIsLocal(receiverSource(method, call, frames), Opcodes.ALOAD, local)) {
+                throw mismatch("H.renderStuff Set.add receiver escaped the owned scratch local");
+            }
+            makeStatic(call, HOOKS, "scratchSetAdd",
+                    "(Ljava/util/Set;Ljava/lang/Object;)Z");
+            changed++;
+        }
+        if (changed != 7 || hRenderScratchMutationState(method) != PatchState.PATCHED) {
+            throw mismatch("H.renderStuff scratch-set peak hooks failed postcondition");
+        }
+        return changed;
+    }
+
+    private static List<AllocationSpec> hRenderStuffAllocationSpecs() {
+        return List.of(
+                new AllocationSpec("java/util/ArrayList", "(Ljava/util/Collection;)V",
+                        "borrowEntityList", "(Ljava/util/Collection;)Ljava/util/ArrayList;", 1),
+                new AllocationSpec("java/util/HashSet", "()V",
+                        "borrowClassSet", "()Ljava/util/HashSet;", 1));
+    }
+
+    private static List<AllocationPlan> hRenderStuffAllocationPlans(
+            String owner, MethodNode method, AllocationSpec spec) {
+        Frame<SourceValue>[] frames = sourceFrames(owner, method);
+        List<AllocationPlan> result = new ArrayList<>();
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (!(insn instanceof TypeInsnNode allocation)
+                    || allocation.getOpcode() != Opcodes.NEW
+                    || !allocation.desc.equals(spec.type)) continue;
+            AbstractInsnNode duplicate = nextMeaningful(allocation);
+            if (duplicate == null || duplicate.getOpcode() != Opcodes.DUP) continue;
+
+            MethodInsnNode constructor = null;
+            for (AbstractInsnNode cursor = duplicate.getNext(); cursor != null; cursor = cursor.getNext()) {
+                if (cursor instanceof MethodInsnNode call
+                        && call.getOpcode() == Opcodes.INVOKESPECIAL
+                        && call.owner.equals(spec.type) && call.name.equals("<init>")
+                        && call.desc.equals(spec.constructorDesc)) {
+                    SourceValue receiver = receiverSource(method, call, frames);
+                    if (sourceContains(receiver, duplicate)) constructor = call;
+                    break;
+                }
+                if (cursor.getOpcode() == Opcodes.NEW && cursor != allocation) break;
+            }
+            if (constructor == null) continue;
+            AbstractInsnNode storeInsn = nextMeaningful(constructor);
+            if (!(storeInsn instanceof VarInsnNode store) || store.getOpcode() != Opcodes.ASTORE
+                    || countStores(method, store.var) != 1) {
+                continue;
+            }
+            try {
+                requireScratchUseContract(owner, method, store.var, spec, result.size(),
+                        "H.renderStuff candidate");
+                result.add(new AllocationPlan(allocation, duplicate, constructor, store.var));
+            } catch (StructuralMismatchException ignored) {
+                // A same-type allocation with a different use contract is unrelated to this surface.
+            }
+        }
+        return result;
+    }
+
+    private static void applyHRenderScratchCollections(MethodNode method,
+                                                        List<AllocationSpec> specs,
+                                                        List<List<AllocationPlan>> plans) {
+        for (int i = 0; i < specs.size(); i++) {
+            AllocationSpec spec = specs.get(i);
+            for (AllocationPlan plan : plans.get(i)) {
+                method.instructions.remove(plan.allocation);
+                method.instructions.remove(plan.duplicate);
+                makeStatic(plan.constructor, HOOKS, spec.hookName, spec.hookDesc);
+            }
+            requireCount("H.renderStuff postcondition " + spec.hookName,
+                    countCalls(method, Opcodes.INVOKESTATIC, HOOKS, spec.hookName, spec.hookDesc),
+                    spec.expected);
+        }
+    }
+
+    private static void validatePatchedHRenderStuff(ClassNode node, MethodNode method,
+                                                     MethodInsnNode retainHook,
+                                                     List<AllocationSpec> specs,
+                                                     List<List<Integer>> hookedLocals) {
+        Frame<SourceValue>[] frames = sourceFrames(node.name, method);
+        MethodInsnNode keySet = requireSourceMethod(argumentSource(method, retainHook, frames, 0),
+                Opcodes.INVOKEVIRTUAL, "java/util/LinkedHashMap", "keySet",
+                "()Ljava/util/Set;", "retainAllFast set argument");
+        FieldInsnNode iconsField = requireSourceField(receiverSource(method, keySet, frames),
+                Opcodes.GETFIELD, node.name, LINKED_MAP_DESC, "icons map receiver");
+        requireIconsGetter(node, iconsField.name);
+
+        int entityListLocal = requireLoadedLocal(argumentSource(method, retainHook, frames, 1),
+                Opcodes.ALOAD, "retainAllFast keep collection");
+        if (hookedLocals.get(0).size() != 1 || hookedLocals.get(0).get(0) != entityListLocal) {
+            throw mismatch("retainAllFast does not consume the owned borrowEntityList local");
+        }
+        int ownerLocal = requireLoadedLocal(argumentSource(method, retainHook, frames, 2),
+                Opcodes.ALOAD, "retainAllFast owner");
+        if (ownerLocal != 0) {
+            throw mismatch("retainAllFast owner is not H.this");
+        }
+        if (nextMeaningful(retainHook) == null
+                || nextMeaningful(retainHook).getOpcode() != Opcodes.POP) {
+            throw mismatch("retainAllFast boolean result is not discarded as expected");
+        }
+
+        for (int i = 0; i < specs.size(); i++) {
+            AllocationSpec spec = specs.get(i);
+            for (int j = 0; j < hookedLocals.get(i).size(); j++) {
+                requireScratchUseContract(node.name, method, hookedLocals.get(i).get(j),
+                        spec, j, "H.renderStuff");
+            }
+        }
+    }
+
+    private PatchReport applyHRetainAll(ClassNode node) {
         MethodNode method = requireMethod(node, "renderStuff", "(FZ)V");
         boolean scopeInstalled = ensureScratchScope(node.name, method, "H.renderStuff");
         String hookDesc = "(Ljava/util/Set;Ljava/util/Collection;Ljava/lang/Object;)Z";
@@ -1115,21 +1807,6 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         } catch (StructuralMismatchException ex) {
             return false;
         }
-    }
-
-    private PatchReport patchHScratchCollections(ClassNode node) {
-        MethodNode method = requireMethod(node, "renderStuff", "(FZ)V");
-        boolean scopeInstalled = ensureScratchScope(node.name, method, "H.renderStuff");
-        List<AllocationSpec> specs = List.of(
-                new AllocationSpec("java/util/ArrayList", "(Ljava/util/Collection;)V",
-                        "borrowEntityList", "(Ljava/util/Collection;)Ljava/util/ArrayList;", 1),
-                new AllocationSpec("java/util/HashSet", "()V",
-                        "borrowClassSet", "()Ljava/util/HashSet;", 1));
-        int changed = replaceAllocationGroup(node.name, method, specs, scopeInstalled,
-                "H.renderStuff scratch");
-        PatchReport report = new PatchReport();
-        report.add("render scratch collections", changed);
-        return report;
     }
 
     private PatchReport patchLabelCandidates(ClassNode node) {
@@ -1418,43 +2095,28 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     // A/Z/EventsPanel: hit tests and Intel map
     // ---------------------------------------------------------------------
 
-    private PatchReport patchAScratchCollections(ClassNode node) {
+    private PatchReport patchMapHitTest(ClassNode node) {
         String desc = "(FFF)" + ENTITY_TOKEN_DESC;
-        List<MethodNode> preserved = methods(node, "smo$originalHitTest", desc);
-        MethodNode method = preserved.isEmpty()
-                ? requireMethod(node, "OO0000", desc)
-                : only(preserved, "preserved hit-test method");
-        boolean scopeInstalled = ensureScratchScope(node.name, method, "A.OO0000");
+        String renamed = "smo$originalHitTest";
+        String hookDesc = "(Ljava/lang/Object;FFF)" + ENTITY_TOKEN_DESC;
         List<AllocationSpec> specs = List.of(
                 new AllocationSpec("java/util/ArrayList", "(Ljava/util/Collection;)V",
                         "borrowHitList", "(Ljava/util/Collection;)Ljava/util/ArrayList;", 1),
                 new AllocationSpec("org/lwjgl/util/vector/Vector2f", "(FF)V",
                         "borrowHitPoint", "(FF)Lorg/lwjgl/util/vector/Vector2f;", 1));
-        int changed = replaceAllocationGroup(node.name, method, specs, scopeInstalled,
-                "A.OO0000 scratch");
-        PatchReport report = new PatchReport();
-        report.add("hit-test scratch allocations", changed);
-        return report;
-    }
 
-    private PatchReport patchHoverHitTestCache(ClassNode node) {
-        String desc = "(FFF)" + ENTITY_TOKEN_DESC;
-        String renamed = "smo$originalHitTest";
-        String hookDesc = "(Ljava/lang/Object;FFF)" + ENTITY_TOKEN_DESC;
         boolean wrapperAlready = methods(node, renamed, desc).size() == 1;
         MethodNode original = requireWrapperSource(node, "OO0000", desc, renamed,
                 "hitTestCached", hookDesc);
+        PatchState scopeState = scratchScopeState(node.name, original, "A.OO0000");
+        PatchState allocationState = scratchAllocationGroupState(
+                node.name, original, specs, "A.OO0000 hit-test scratch");
+
         if (containsWriteOrMonitor(original)) {
             throw mismatch("hit-test method writes state or uses monitor/invokedynamic operations");
         }
-        int scopeBegins = countCalls(original, Opcodes.INVOKESTATIC,
-                HOOKS, "beginScratchScope", "()V");
-        if (scopeBegins == 0) {
-            requireCount("hit-test semantic call count", totalMethodCalls(original), 50);
-        } else {
-            ensureScratchScope(node.name, original, "A.OO0000");
-            requireCount("scoped hit-test semantic call count", totalMethodCalls(original), 54);
-        }
+        requireCount("hit-test semantic call count", totalMethodCalls(original),
+                scopeState == PatchState.PATCHED ? 54 : 50);
         List<FieldNode> mapFields = fields(node, "L" + H + ";");
         requireCount("A map-handler fields", mapFields.size(), 1);
         requireCountAtLeast("hit-test H.getLocation", countCalls(original, Opcodes.INVOKEVIRTUAL,
@@ -1463,10 +2125,23 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 H, "getFactor", "()F"), 1);
         requireCountAtLeast("hit-test H.getIcons", countCalls(original, Opcodes.INVOKEVIRTUAL,
                 H, "getIcons", "()Ljava/util/LinkedHashMap;"), 1);
+
         if (wrapperAlready) {
+            if (scopeState != PatchState.PATCHED || allocationState != PatchState.PATCHED) {
+                throw mismatch("hit-test wrapper exists without the complete scratch allocation group");
+            }
+            requireWrapperPostcondition(node, "OO0000", desc, renamed,
+                    "hitTestCached", hookDesc);
             requireHitTestWrapper(node, desc, hookDesc);
-            throw already("OO0000 wrapper and original semantic contract match");
+            throw already("hit-test wrapper, scratch scope, allocation hooks and semantic contract match");
         }
+        if (scopeState != PatchState.ORIGINAL || allocationState != PatchState.ORIGINAL) {
+            throw mismatch("hit-test method has a mixed wrapper/scope/allocation state");
+        }
+
+        installScratchScope(node.name, original, "A.OO0000");
+        int changed = replaceAllocationGroup(node.name, original, specs, true,
+                "A.OO0000 hit-test scratch");
 
         int originalAccess = original.access;
         String signature = original.signature;
@@ -1484,11 +2159,22 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 "hitTestCached", hookDesc, false));
         wrapper.instructions.add(new InsnNode(Opcodes.ARETURN));
         node.methods.add(wrapper);
-        requireWrapperPostcondition(node, "OO0000", desc, renamed, "hitTestCached", hookDesc);
+
+        requireWrapperPostcondition(node, "OO0000", desc, renamed,
+                "hitTestCached", hookDesc);
         requireHitTestWrapper(node, desc, hookDesc);
+        requireCount("hit-test scratch scope",
+                countCalls(original, Opcodes.INVOKESTATIC, HOOKS, "beginScratchScope", "()V"), 1);
+        requireCount("hit-test list hook",
+                countCalls(original, Opcodes.INVOKESTATIC, HOOKS,
+                        "borrowHitList", "(Ljava/util/Collection;)Ljava/util/ArrayList;"), 1);
+        requireCount("hit-test point hook",
+                countCalls(original, Opcodes.INVOKESTATIC, HOOKS,
+                        "borrowHitPoint", "(FF)Lorg/lwjgl/util/vector/Vector2f;"), 1);
 
         PatchReport report = new PatchReport();
-        report.add("hyperspace/map hover hit-test cache", 1);
+        report.add("hit-test scratch allocations", changed);
+        report.add("bounded exact-result hover cache", 1);
         return report;
     }
 
@@ -1517,101 +2203,183 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         return report;
     }
 
-    private PatchReport patchArrowCallbackCache(ClassNode node) {
+    /**
+     * Atomically installs the complete Intel-arrow rendering surface in Z.o00000: the
+     * getArrowData callback cache, both temporary Vector2f scratch allocations, and the
+     * single reentrant scratch scope. Partial or foreign hook-shaped states reject the
+     * whole group.
+     */
+    private PatchReport patchIntelArrowRendering(ClassNode node) {
         MethodNode method = requireMethod(node, "o00000", "(FF)V");
         String originalDesc = "(" + MAP_API_DESC + ")Ljava/util/List;";
         String hookDesc = "(" + INTEL_DESC + MAP_API_DESC + ")Ljava/util/List;";
-        List<MethodInsnNode> original = calls(method, Opcodes.INVOKEINTERFACE,
-                "com/fs/starfarer/api/campaign/comm/IntelInfoPlugin", "getArrowData", originalDesc);
-        int hooks = countCalls(method, Opcodes.INVOKESTATIC, HOOKS, "getArrowDataCached", hookDesc);
-        requireUnpatchedOrAlready("Z arrow-data callback", original.size(), 1, hooks, 1);
-        MethodInsnNode call = only(original, "Z arrow-data callback");
-        if (nextMeaningful(call) != null && nextMeaningful(call).getOpcode() == Opcodes.POP) {
-            throw mismatch("getArrowData result is discarded");
-        }
-        makeStatic(call, HOOKS, "getArrowDataCached", hookDesc);
-        PatchReport report = new PatchReport();
-        report.add("Intel arrow-data callback cache", 1);
-        return report;
-    }
-
-    private PatchReport patchArrowVectorPool(ClassNode node) {
-        MethodNode method = requireMethod(node, "o00000", "(FF)V");
-        boolean scopeInstalled = ensureScratchScope(node.name, method, "Z.o00000");
         List<AllocationSpec> specs = List.of(new AllocationSpec(
                 "org/lwjgl/util/vector/Vector2f", "(FF)V",
                 "borrowArrowVector", "(FF)Lorg/lwjgl/util/vector/Vector2f;", 2));
-        int changed = replaceAllocationGroup(node.name, method, specs, scopeInstalled,
+
+        PatchState scopeState = scratchScopeState(node.name, method, "Z.o00000");
+        PatchState allocationState = scratchAllocationGroupState(node.name, method, specs,
                 "Z arrow vectors");
+        List<MethodInsnNode> originalCallbacks = calls(method, Opcodes.INVOKEINTERFACE,
+                "com/fs/starfarer/api/campaign/comm/IntelInfoPlugin",
+                "getArrowData", originalDesc);
+        List<MethodInsnNode> callbackHooks = calls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "getArrowDataCached", hookDesc);
+
+        boolean originalState = originalCallbacks.size() == 1 && callbackHooks.isEmpty()
+                && allocationState == PatchState.ORIGINAL
+                && scopeState == PatchState.ORIGINAL;
+        boolean patchedState = originalCallbacks.isEmpty() && callbackHooks.size() == 1
+                && allocationState == PatchState.PATCHED
+                && scopeState == PatchState.PATCHED;
+
+        if (patchedState) {
+            validateArrowDataCallback(callbackHooks.get(0));
+            throw already("Z Intel-arrow callback, vectors, and scratch scope are already present");
+        }
+        if (!originalState) {
+            throw mismatch("Z.o00000 Intel-arrow rendering has mixed, missing, ambiguous, or "
+                    + "foreign callback/vector/scope state");
+        }
+
+        MethodInsnNode callback = originalCallbacks.get(0);
+        validateArrowDataCallback(callback);
+        installScratchScope(node.name, method, "Z.o00000");
+        makeStatic(callback, HOOKS, "getArrowDataCached", hookDesc);
+        int vectors = replaceAllocationGroup(node.name, method, specs, true,
+                "Z arrow vectors");
+
+        requireCount("Z arrow-data callback postcondition",
+                countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                        "getArrowDataCached", hookDesc), 1);
+        requireCount("Z arrow-vector postcondition",
+                countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                        "borrowArrowVector", "(FF)Lorg/lwjgl/util/vector/Vector2f;"), 2);
+        if (scratchScopeState(node.name, method, "Z.o00000") != PatchState.PATCHED) {
+            throw mismatch("Z.o00000 scratch-scope installation postcondition failed");
+        }
+
         PatchReport report = new PatchReport();
-        report.add("Intel arrow vector pool", changed);
+        report.add("Intel arrow-data callback cache", 1);
+        report.add("Intel arrow vector pool", vectors);
         return report;
     }
 
-    private PatchReport patchIntelFastContains(ClassNode node) {
+    private static void validateArrowDataCallback(MethodInsnNode call) {
+        if (nextMeaningful(call) != null && nextMeaningful(call).getOpcode() == Opcodes.POP) {
+            throw mismatch("getArrowData result is discarded");
+        }
+    }
+
+    /**
+     * Atomically installs the EventsPanel reconciliation surface: the missing-plugin
+     * membership accelerator, direct existing-icon candidate lookup, and the single
+     * reentrant scratch scope required by fastContains(). Partial or foreign hook-shaped
+     * states reject the whole group.
+     */
+    private PatchReport patchIntelReconciliation(ClassNode node) {
         MethodNode method = requireMethod(node, "addMissingIconsAndRows", "()V");
-        boolean scopeInstalled = ensureScratchScope(node.name, method,
+        String containsDesc = "(Ljava/util/Collection;Ljava/lang/Object;)Z";
+        String candidatesDesc =
+                "(Ljava/util/LinkedHashMap;Ljava/lang/Object;)Ljava/util/Collection;";
+        PatchState scopeState = scratchScopeState(node.name, method,
                 "EventsPanel.addMissingIconsAndRows");
-        String hookDesc = "(Ljava/util/Collection;Ljava/lang/Object;)Z";
-        List<MethodInsnNode> original = calls(method, Opcodes.INVOKEINTERFACE,
-                "java/util/List", "contains", "(Ljava/lang/Object;)Z");
-        int hooks = countCalls(method, Opcodes.INVOKESTATIC, HOOKS, "fastContains", hookDesc);
-        if (scopeInstalled && original.isEmpty() && hooks == 1) {
-            throw mismatch("EventsPanel fastContains hook exists without its required scratch scope");
-        }
-        requireUnpatchedOrAlready("EventsPanel missing-list contains", original.size(), 1, hooks, 1);
 
-        MethodInsnNode call = only(original, "EventsPanel missing-list contains");
-        Frame<SourceValue>[] frames = sourceFrames(node.name, method);
-        int listLocal = requireLoadedLocal(receiverSource(method, call, frames),
-                Opcodes.ALOAD, "missing Intel list");
-        int pluginLocal = requireLoadedLocal(argumentSource(method, call, frames, 0),
-                Opcodes.ALOAD, "current Intel plugin");
-        requireLocalConstructor(method, listLocal, "java/util/ArrayList", "()V", "missing Intel list");
-        requireStoredCallResult(method, pluginLocal, -1,
-                null, "getInfo", "()" + INTEL_DESC, "row Intel plugin");
-        if (hasMutatorAfter(node.name, method, call, listLocal)) {
-            throw mismatch("missing Intel list is mutated after the contains site");
+        List<MethodInsnNode> originalContains = calls(method, Opcodes.INVOKEINTERFACE,
+                "java/util/List", "contains", "(Ljava/lang/Object;)Z");
+        List<MethodInsnNode> containsHooks = calls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "fastContains", containsDesc);
+        List<MethodInsnNode> originalValues = calls(method, Opcodes.INVOKEVIRTUAL,
+                "java/util/LinkedHashMap", "values", "()Ljava/util/Collection;");
+        List<MethodInsnNode> candidateHooks = calls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "existingIntelIconCandidates", candidatesDesc);
+
+        boolean originalState = originalContains.size() == 1 && containsHooks.isEmpty()
+                && originalValues.size() == 1 && candidateHooks.isEmpty()
+                && scopeState == PatchState.ORIGINAL;
+        boolean patchedState = originalContains.isEmpty() && containsHooks.size() == 1
+                && originalValues.isEmpty() && candidateHooks.size() == 1
+                && scopeState == PatchState.PATCHED;
+
+        if (patchedState) {
+            validateEventsPanelContainsSite(node, method, containsHooks.get(0), true);
+            validateEventsPanelExistingIconSite(node, method, candidateHooks.get(0), true);
+            throw already("EventsPanel reconciliation hooks and scratch scope are already present");
         }
-        makeStatic(call, HOOKS, "fastContains", hookDesc);
+        if (!originalState) {
+            throw mismatch("EventsPanel reconciliation has mixed, missing, ambiguous, or foreign "
+                    + "contains/icon-candidate/scope state");
+        }
+
+        MethodInsnNode contains = originalContains.get(0);
+        MethodInsnNode values = originalValues.get(0);
+        validateEventsPanelContainsSite(node, method, contains, false);
+        int entityLocal = validateEventsPanelExistingIconSite(node, method, values, false);
+
+        installScratchScope(node.name, method, "EventsPanel.addMissingIconsAndRows");
+        makeStatic(contains, HOOKS, "fastContains", containsDesc);
+        method.instructions.insertBefore(values, new VarInsnNode(Opcodes.ALOAD, entityLocal));
+        makeStatic(values, HOOKS, "existingIntelIconCandidates", candidatesDesc);
+
         PatchReport report = new PatchReport();
-        report.add("Intel missing-list hash contains", 1);
+        report.add("Intel missing-list hash membership", 1);
+        report.add("Intel direct existing-icon candidates", 1);
         return report;
     }
 
-    private PatchReport patchExistingIntelIconLookup(ClassNode node) {
-        MethodNode method = requireMethod(node, "addMissingIconsAndRows", "()V");
-        String hookDesc = "(Ljava/util/LinkedHashMap;Ljava/lang/Object;)Ljava/util/Collection;";
-        List<MethodInsnNode> original = calls(method, Opcodes.INVOKEVIRTUAL,
-                "java/util/LinkedHashMap", "values", "()Ljava/util/Collection;");
-        int hooks = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
-                "existingIntelIconCandidates", hookDesc);
-        requireUnpatchedOrAlready("EventsPanel existing icon values", original.size(), 1, hooks, 1);
-
-        MethodInsnNode values = only(original, "EventsPanel existing icon values");
+    private static void validateEventsPanelContainsSite(ClassNode node, MethodNode method,
+                                                        MethodInsnNode call, boolean patched) {
         Frame<SourceValue>[] frames = sourceFrames(node.name, method);
-        requireSourceMethod(receiverSource(method, values, frames), Opcodes.INVOKEVIRTUAL,
-                H, "getIcons", "()Ljava/util/LinkedHashMap;", "existing icon map receiver");
+        SourceValue collectionSource = patched
+                ? argumentSource(method, call, frames, 0)
+                : receiverSource(method, call, frames);
+        SourceValue pluginSource = patched
+                ? argumentSource(method, call, frames, 1)
+                : argumentSource(method, call, frames, 0);
+        int listLocal = requireLoadedLocal(collectionSource, Opcodes.ALOAD,
+                "missing Intel list");
+        int pluginLocal = requireLoadedLocal(pluginSource, Opcodes.ALOAD,
+                "current Intel plugin");
+        requireLocalConstructor(method, listLocal, "java/util/ArrayList", "()V",
+                "missing Intel list");
+        requireStoredCallResult(method, pluginLocal, -1, null, "getInfo",
+                "()" + INTEL_DESC, "row Intel plugin");
+        if (hasMutatorAfter(node.name, method, call, listLocal)) {
+            throw mismatch("missing Intel list is mutated after the reconciliation membership site");
+        }
+    }
+
+    private static int validateEventsPanelExistingIconSite(ClassNode node, MethodNode method,
+                                                            MethodInsnNode call, boolean patched) {
+        Frame<SourceValue>[] frames = sourceFrames(node.name, method);
+        SourceValue mapSource = patched
+                ? argumentSource(method, call, frames, 0)
+                : receiverSource(method, call, frames);
+        requireSourceMethod(mapSource, Opcodes.INVOKEVIRTUAL, H, "getIcons",
+                "()Ljava/util/LinkedHashMap;", "existing icon map receiver");
         MethodInsnNode entityLookup = only(calls(method, Opcodes.INVOKEVIRTUAL, H,
-                "getIntelIconEntity", "(" + INTEL_DESC + ")Lcom/fs/starfarer/campaign/CustomCampaignEntity;"),
+                "getIntelIconEntity", "(" + INTEL_DESC
+                        + ")Lcom/fs/starfarer/campaign/CustomCampaignEntity;"),
                 "H.getIntelIconEntity in addMissingIconsAndRows");
         AbstractInsnNode storeInsn = nextMeaningful(entityLookup);
         if (!(storeInsn instanceof VarInsnNode store) || store.getOpcode() != Opcodes.ASTORE) {
             throw mismatch("Intel entity lookup result is not stored in a local");
         }
         int entityLocal = store.var;
-        if (!hasNullGuard(method, store, values, entityLocal)) {
-            throw mismatch("Intel entity values scan is not guarded by an entity null check");
+        if (!hasNullGuard(method, store, call, entityLocal)) {
+            throw mismatch("Intel entity candidate scan is not guarded by an entity null check");
         }
-        int comparisons = countIdentityComparisons(method, frames, values, entityLocal,
+        if (patched) {
+            int hookEntityLocal = requireLoadedLocal(argumentSource(method, call, frames, 1),
+                    Opcodes.ALOAD, "existing icon entity argument");
+            if (hookEntityLocal != entityLocal) {
+                throw mismatch("existing icon hook is wired to the wrong entity local");
+            }
+        }
+        int comparisons = countIdentityComparisons(method, frames, call, entityLocal,
                 "com/fs/starfarer/coreui/A/ooOO", "int", "()" + ENTITY_TOKEN_DESC);
         requireCount("existing icon entity identity comparison", comparisons, 1);
-
-        method.instructions.insertBefore(values, new VarInsnNode(Opcodes.ALOAD, entityLocal));
-        makeStatic(values, HOOKS, "existingIntelIconCandidates", hookDesc);
-        PatchReport report = new PatchReport();
-        report.add("Intel direct existing-icon lookup", 1);
-        return report;
+        return entityLocal;
     }
 
     // ---------------------------------------------------------------------
@@ -1624,6 +2392,9 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         String completeDesc = "(Ljava/lang/Object;J)V";
         MethodNode reset = requireMethod(node, "resetInstance", "()V");
         MethodNode set = requireMethod(node, "setInstance", "(" + engineDesc + ")V");
+        MethodNode advance = requireMethod(node, "advance", "(FLcom/fs/starfarer/util/A/new;)V");
+        int maintenanceHooks = countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
+                "campaignCacheMaintenanceTick", "()V");
         if ((reset.access & Opcodes.ACC_STATIC) == 0 || (set.access & Opcodes.ACC_STATIC) == 0) {
             throw mismatch("CampaignEngine lifecycle methods are not static");
         }
@@ -1668,7 +2439,8 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         int setCompletes = countCalls(set, Opcodes.INVOKESTATIC, HOOKS,
                 "completeCampaignEngineChange", completeDesc);
         if (resetBegins == 1 && setBegins == 1
-                && resetCompletes == resetReturns.size() && setCompletes == setReturns.size()) {
+                && resetCompletes == resetReturns.size() && setCompletes == setReturns.size()
+                && maintenanceHooks == 1) {
             int resetToken = requireCampaignBeginPlacement(
                     reset, resetWrite, false, beginDesc);
             int setToken = requireCampaignBeginPlacement(set, setWrite, true, beginDesc);
@@ -1680,11 +2452,16 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             requireCampaignTokenInitializer(set, setToken);
             throw already("CampaignEngine lifecycle cache hooks are already present");
         }
-        if (resetBegins != 0 || setBegins != 0 || resetCompletes != 0 || setCompletes != 0) {
-            throw mismatch("CampaignEngine lifecycle hooks are partial or ambiguous: resetBegin="
+        if (resetBegins != 0 || setBegins != 0 || resetCompletes != 0 || setCompletes != 0
+                || maintenanceHooks != 0) {
+            throw mismatch("CampaignEngine lifecycle/maintenance hooks are partial or ambiguous: resetBegin="
                     + resetBegins + ", setBegin=" + setBegins + ", resetComplete="
-                    + resetCompletes + ", setComplete=" + setCompletes);
+                    + resetCompletes + ", setComplete=" + setCompletes
+                    + ", maintenance=" + maintenanceHooks);
         }
+
+        advance.instructions.insert(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                HOOKS, "campaignCacheMaintenanceTick", "()V", false));
 
         int resetToken = reset.maxLocals;
         reset.maxLocals += 2;
@@ -1736,9 +2513,13 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 set, setReturns, true, setToken, completeDesc);
         requireCampaignTokenInitializer(reset, resetToken);
         requireCampaignTokenInitializer(set, setToken);
+        requireCount("CampaignEngine campaign maintenance hooks",
+                countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
+                        "campaignCacheMaintenanceTick", "()V"), 1);
         PatchReport report = new PatchReport();
         report.add("campaign cache two-phase boundaries",
                 2 + resetReturns.size() + setReturns.size());
+        report.add("campaign-thread cache maintenance tick", 1);
         return report;
     }
 
@@ -1820,6 +2601,132 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         }
         if (result == null) throw mismatch(label + " singleton write was not found");
         return result;
+    }
+
+    private PatchReport patchMarketSchedulerBatchProtocol(ClassNode node) {
+        MethodNode advance = requireMethod(node, "advance", "(FLcom/fs/starfarer/util/A/new;)V");
+        List<MethodInsnNode> setters = calls(advance, Opcodes.INVOKEVIRTUAL,
+                CAMPAIGN_ENGINE, "setFastForwardIteration", "(Z)V");
+        List<MethodInsnNode> engineAdvances = calls(advance, Opcodes.INVOKEVIRTUAL,
+                CAMPAIGN_ENGINE, "advance", "(FLcom/fs/starfarer/util/A/new;)V");
+        requireCount("CampaignState render-batch setter calls", setters.size(), 3);
+        requireCount("CampaignState simulation advance calls", engineAdvances.size(), 1);
+
+        MethodInsnNode initialFalse = setters.get(0);
+        MethodInsnNode continuationTrue = setters.get(1);
+        MethodInsnNode finalFalse = setters.get(2);
+        MethodInsnNode engineAdvance = engineAdvances.get(0);
+        Frame<SourceValue>[] frames = sourceFrames(node.name, advance);
+        if (!sourceIsIntegerConstant(argumentSource(advance, initialFalse, frames, 0), 0)
+                || !sourceIsIntegerConstant(
+                argumentSource(advance, continuationTrue, frames, 0), 1)
+                || !sourceIsIntegerConstant(argumentSource(advance, finalFalse, frames, 0), 0)) {
+            throw mismatch("CampaignState render-batch boolean protocol changed");
+        }
+
+        int initialIndex = advance.instructions.indexOf(initialFalse);
+        int advanceIndex = advance.instructions.indexOf(engineAdvance);
+        int continuationIndex = advance.instructions.indexOf(continuationTrue);
+        int finalIndex = advance.instructions.indexOf(finalFalse);
+        if (!(initialIndex < advanceIndex && advanceIndex < continuationIndex
+                && continuationIndex < finalIndex)) {
+            throw mismatch("CampaignState render-batch call order changed");
+        }
+
+        boolean loopBack = false;
+        for (AbstractInsnNode insn : advance.instructions.toArray()) {
+            if (!(insn instanceof JumpInsnNode jump)) continue;
+            int sourceIndex = advance.instructions.indexOf(jump);
+            int targetIndex = advance.instructions.indexOf(jump.label);
+            if (sourceIndex > continuationIndex && sourceIndex < finalIndex
+                    && targetIndex > initialIndex && targetIndex <= advanceIndex) {
+                loopBack = true;
+                break;
+            }
+        }
+        if (!loopBack) {
+            throw mismatch("CampaignState simulation advance is no longer enclosed by the"
+                    + " false/true render-batch loop protocol");
+        }
+
+        PatchState registration = marketSchedulerRegistrationState(node,
+                MARKET_SCHEDULER_COMPONENT_BATCH_PROTOCOL,
+                "CampaignState market scheduler batch protocol");
+        if (registration == PatchState.PATCHED) {
+            throw already("CampaignState render-batch protocol and component registration match");
+        }
+        installMarketSchedulerRegistration(node, MARKET_SCHEDULER_COMPONENT_BATCH_PROTOCOL,
+                "CampaignState market scheduler batch protocol");
+        if (marketSchedulerRegistrationState(node, MARKET_SCHEDULER_COMPONENT_BATCH_PROTOCOL,
+                "CampaignState market scheduler batch protocol") != PatchState.PATCHED) {
+            throw mismatch("CampaignState market scheduler protocol registration is absent");
+        }
+
+        PatchReport report = new PatchReport();
+        report.add("validated CampaignState false/tick-true/final-false batch protocol", 1);
+        report.add("market scheduler batch-protocol component registration", 1);
+        return report;
+    }
+
+    private PatchReport patchMarketSchedulerEngineTick(ClassNode node) {
+        requireCampaignLifecycleForMarketScheduler(node);
+        MethodNode advance = requireMethod(node, "advance", "(FLcom/fs/starfarer/util/A/new;)V");
+        MethodNode fastForwardSetter = requireMethod(node, "setFastForwardIteration", "(Z)V");
+        PatchState scope = marketSchedulerTickScopeState(node.name, advance,
+                "CampaignEngine.advance market scheduler");
+        PatchState batchBoundary = marketSchedulerBatchBoundaryState(fastForwardSetter,
+                "CampaignEngine.setFastForwardIteration market scheduler");
+        PatchState registration = marketSchedulerRegistrationState(node,
+                MARKET_SCHEDULER_COMPONENT_ENGINE, "CampaignEngine market scheduler");
+        if (scope == PatchState.PATCHED && batchBoundary == PatchState.PATCHED) {
+            if (registration != PatchState.PATCHED) {
+                throw mismatch("CampaignEngine market scheduler boundary lacks component registration");
+            }
+            throw already("CampaignEngine market scheduler tick/render-batch postcondition matches");
+        }
+        if (scope != batchBoundary || registration == PatchState.PATCHED) {
+            throw mismatch("CampaignEngine market scheduler tick/render-batch boundary is partial");
+        }
+        installMarketSchedulerTickScope(node.name, advance,
+                "CampaignEngine.advance market scheduler");
+        installMarketSchedulerBatchBoundary(fastForwardSetter,
+                "CampaignEngine.setFastForwardIteration market scheduler");
+        installMarketSchedulerRegistration(node, MARKET_SCHEDULER_COMPONENT_ENGINE,
+                "CampaignEngine market scheduler");
+        if (marketSchedulerTickScopeState(node.name, advance,
+                "CampaignEngine.advance market scheduler") != PatchState.PATCHED
+                || marketSchedulerBatchBoundaryState(fastForwardSetter,
+                "CampaignEngine.setFastForwardIteration market scheduler") != PatchState.PATCHED
+                || marketSchedulerRegistrationState(node, MARKET_SCHEDULER_COMPONENT_ENGINE,
+                "CampaignEngine market scheduler") != PatchState.PATCHED) {
+            throw mismatch("CampaignEngine market scheduler boundary postcondition is incomplete");
+        }
+        PatchReport report = new PatchReport();
+        report.add("full CampaignEngine scheduler simulation-tick boundary", 1);
+        report.add("CampaignEngine render-batch boundary", 1);
+        report.add("market scheduler engine/lifecycle component registration", 1);
+        return report;
+    }
+
+    private static void requireCampaignLifecycleForMarketScheduler(ClassNode node) {
+        String engineDesc = "L" + CAMPAIGN_ENGINE + ";";
+        String beginDesc = "(Ljava/lang/Object;)J";
+        String completeDesc = "(Ljava/lang/Object;J)V";
+        MethodNode reset = requireMethod(node, "resetInstance", "()V");
+        MethodNode set = requireMethod(node, "setInstance", "(" + engineDesc + ")V");
+        int resetBegins = countCalls(reset, Opcodes.INVOKESTATIC, HOOKS,
+                "beginCampaignEngineChange", beginDesc);
+        int setBegins = countCalls(set, Opcodes.INVOKESTATIC, HOOKS,
+                "beginCampaignEngineChange", beginDesc);
+        int resetCompletes = countCalls(reset, Opcodes.INVOKESTATIC, HOOKS,
+                "completeCampaignEngineChange", completeDesc);
+        int setCompletes = countCalls(set, Opcodes.INVOKESTATIC, HOOKS,
+                "completeCampaignEngineChange", completeDesc);
+        if (resetBegins != 1 || setBegins != 1
+                || resetCompletes != campaignReturns(reset).size()
+                || setCompletes != campaignReturns(set).size()) {
+            throw mismatch("market scheduler requires the complete CampaignEngine lifecycle boundary");
+        }
     }
 
     private PatchReport patchCampaignListenerThrottle(ClassNode node) {
@@ -2478,6 +3385,254 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         }
     }
 
+
+    /**
+     * Replaces the terminal vanilla core-worlds recomputation only after the
+     * SectorAPI local and adjacent RouteManager/RETURN protocol are proven.
+     */
+    private PatchReport patchCoreWorldsExtentCache(ClassNode node) {
+        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        String sectorDesc = "Lcom/fs/starfarer/api/campaign/SectorAPI;";
+        MethodInsnNode getSector = only(calls(advance, Opcodes.INVOKESTATIC,
+                "com/fs/starfarer/api/Global", "getSector", "()" + sectorDesc),
+                "CoreScript.advance Global.getSector");
+        AbstractInsnNode stored = nextMeaningful(getSector);
+        if (!(stored instanceof VarInsnNode sectorStore)
+                || sectorStore.getOpcode() != Opcodes.ASTORE) {
+            throw mismatch("CoreScript.advance sector result is not stored in an object local");
+        }
+        int sectorLocal = sectorStore.var;
+        requireCount("CoreScript.advance sector local stores",
+                countStores(advance, sectorLocal), 1);
+        requireSectorReceiver(advance, sectorLocal, "isPaused", "()Z");
+        requireSectorReceiver(advance, sectorLocal, "getClock",
+                "()Lcom/fs/starfarer/api/campaign/CampaignClockAPI;");
+
+        List<MethodInsnNode> originals = calls(advance, Opcodes.INVOKESTATIC,
+                "com/fs/starfarer/api/util/Misc", "computeCoreWorldsExtent", "()V");
+        List<MethodInsnNode> hooks = calls(advance, Opcodes.INVOKESTATIC,
+                CORE_WORLDS_RUNTIME, "update", "(" + sectorDesc + ")V");
+
+        if (originals.isEmpty() && hooks.size() == 1) {
+            validateCoreWorldsHookShape(advance, hooks.get(0), sectorLocal);
+            throw already("CoreScript core-worlds hook postcondition matches");
+        }
+        if (originals.size() != 1 || !hooks.isEmpty()) {
+            throw mismatch("CoreScript core-worlds call state: expected original=1, hook=0; "
+                    + "found original=" + originals.size() + ", hook=" + hooks.size());
+        }
+
+        MethodInsnNode original = originals.get(0);
+        MethodInsnNode routeAdvance = asMethod(previousMeaningful(original),
+                "CoreScript core-worlds predecessor");
+        requireCall(routeAdvance, Opcodes.INVOKEVIRTUAL,
+                "com/fs/starfarer/api/impl/campaign/fleets/RouteManager",
+                "advance", "(F)V", "CoreScript RouteManager.advance predecessor");
+        AbstractInsnNode after = nextMeaningful(original);
+        if (after == null || after.getOpcode() != Opcodes.RETURN) {
+            throw mismatch("CoreScript core-worlds call is not the terminal action");
+        }
+
+        advance.instructions.insertBefore(original,
+                new VarInsnNode(Opcodes.ALOAD, sectorLocal));
+        makeStatic(original, CORE_WORLDS_RUNTIME, "update", "(" + sectorDesc + ")V");
+        PatchReport report = new PatchReport();
+        report.add("coreWorldsExtentCache", 1);
+        return report;
+    }
+
+    private static void requireSectorReceiver(MethodNode method, int sectorLocal,
+                                              String name, String desc) {
+        MethodInsnNode call = only(calls(method, Opcodes.INVOKEINTERFACE,
+                "com/fs/starfarer/api/campaign/SectorAPI", name, desc),
+                "CoreScript.advance SectorAPI." + name);
+        AbstractInsnNode receiver = previousMeaningful(call);
+        if (!(receiver instanceof VarInsnNode load)
+                || load.getOpcode() != Opcodes.ALOAD || load.var != sectorLocal) {
+            throw mismatch("CoreScript.advance SectorAPI." + name
+                    + " does not use the stored sector local");
+        }
+    }
+
+    private static void validateCoreWorldsHookShape(MethodNode method, MethodInsnNode hook,
+                                                     int sectorLocal) {
+        AbstractInsnNode receiver = previousMeaningful(hook);
+        if (!(receiver instanceof VarInsnNode load)
+                || load.getOpcode() != Opcodes.ALOAD || load.var != sectorLocal) {
+            throw mismatch("CoreScript core-worlds hook does not load the proven sector local");
+        }
+        MethodInsnNode routeAdvance = asMethod(previousMeaningful(receiver),
+                "CoreScript core-worlds hook predecessor");
+        requireCall(routeAdvance, Opcodes.INVOKEVIRTUAL,
+                "com/fs/starfarer/api/impl/campaign/fleets/RouteManager",
+                "advance", "(F)V", "CoreScript RouteManager.advance before hook");
+        AbstractInsnNode after = nextMeaningful(hook);
+        if (after == null || after.getOpcode() != Opcodes.RETURN) {
+            throw mismatch("CoreScript core-worlds hook is not the terminal action");
+        }
+        requireCount("CoreScript vanilla core-worlds calls after patch",
+                countCalls(method, Opcodes.INVOKESTATIC,
+                        "com/fs/starfarer/api/util/Misc",
+                        "computeCoreWorldsExtent", "()V"), 0);
+    }
+
+    /**
+     * Owns the complete Economy.advance(F)V transformation surface and its
+     * owner-local support state. The independently configurable snapshot,
+     * location-cache, and scheduler-source components are inspected against
+     * the same incoming class, built on one isolated candidate, and committed
+     * in one transaction with a combined postcondition.
+     */
+    private PatchReport patchEconomyAdvancePlan(ClassNode node) {
+        int requestedMask = requestedEconomyAdvanceFeatureMask();
+        if (requestedMask == 0) {
+            throw mismatch("Economy.advance patch plan has an empty feature mask");
+        }
+        rejectLegacyEconomyAdvanceMarkers(node);
+
+        boolean owned = hasPatchMarker(node, ECONOMY_ADVANCE_PLAN_PATCH_ID);
+        if (owned) {
+            requireEconomyAdvancePlanMask(node, requestedMask);
+            requireEconomyAdvancePlanPostcondition(node, requestedMask);
+            throw already("Economy.advance unified plan postcondition matches mask="
+                    + requestedMask);
+        }
+        if (findField(node, ECONOMY_ADVANCE_PLAN_MASK_FIELD) != null) {
+            throw mismatch("Economy.advance plan mask exists without the ownership marker");
+        }
+
+        EconomyAdvancePatchPlan plan = inspectEconomyAdvancePatchPlan(node, requestedMask);
+        if (plan.featureMask() != requestedMask) {
+            throw mismatch("Economy.advance plan feature mask changed during inspection");
+        }
+        PatchReport report = applyEconomyAdvancePatchPlan(node, plan);
+        node.fields.add(new FieldNode(Opcodes.ASM8, economyAdvancePlanMaskAccess(),
+                ECONOMY_ADVANCE_PLAN_MASK_FIELD, "I", null, requestedMask));
+        requireEconomyAdvancePlanMask(node, requestedMask);
+        requireEconomyAdvancePlanPostcondition(node, requestedMask);
+        report.add("unified Economy.advance plan", 1);
+        return report;
+    }
+
+    private EconomyAdvancePatchPlan inspectEconomyAdvancePatchPlan(
+            ClassNode incoming, int requestedMask) {
+        // Disabled components must also remain vanilla. This prevents the new
+        // owner from adopting old split markers, foreign hooks, or a partial
+        // combination left by another transformer.
+        requireEconomyAdvanceComponentVanilla(incoming,
+                this::patchEconomyPersistentSnapshots, "persistent snapshots");
+        requireEconomyAdvanceComponentVanilla(incoming,
+                this::patchEconomyLocationCache, "location cache");
+        requireEconomyAdvanceComponentVanilla(incoming,
+                this::patchMarketSchedulerEconomySource, "market scheduler source");
+
+        ClassNode planned = readClass(writeClass(incoming));
+        PatchReport combined = new PatchReport();
+        // Explicit dependency order: location-cache selection observes whether
+        // the persistent snapshot state was installed, and the scheduler source
+        // is applied last to the final advance-method data flow.
+        if ((requestedMask & ECONOMY_ADVANCE_FEATURE_PERSISTENT_SNAPSHOTS) != 0) {
+            PatchReport component = patchEconomyPersistentSnapshots(planned);
+            combined.add("persistent snapshots", component.total);
+        }
+        if ((requestedMask & ECONOMY_ADVANCE_FEATURE_LOCATION_CACHE) != 0) {
+            PatchReport component = patchEconomyLocationCache(planned);
+            combined.add("location cache", component.total);
+        }
+        if ((requestedMask & ECONOMY_ADVANCE_FEATURE_MARKET_SCHEDULER) != 0) {
+            PatchReport component = patchMarketSchedulerEconomySource(planned);
+            combined.add("market scheduler source", component.total);
+        }
+        return new EconomyAdvancePatchPlan(requestedMask, writeClass(planned), combined);
+    }
+
+    private static PatchReport applyEconomyAdvancePatchPlan(
+            ClassNode node, EconomyAdvancePatchPlan plan) {
+        ClassNode planned = readClass(plan.plannedBytes());
+        if (!node.name.equals(planned.name)) {
+            throw mismatch("Economy.advance plan candidate owner changed");
+        }
+        node.fields.clear();
+        node.fields.addAll(planned.fields);
+        node.methods.clear();
+        node.methods.addAll(planned.methods);
+        return plan.report();
+    }
+
+    private void requireEconomyAdvancePlanPostcondition(ClassNode node, int mask) {
+        requireEconomyAdvanceComponentState(node,
+                (mask & ECONOMY_ADVANCE_FEATURE_PERSISTENT_SNAPSHOTS) != 0,
+                this::patchEconomyPersistentSnapshots, "persistent snapshots");
+        requireEconomyAdvanceComponentState(node,
+                (mask & ECONOMY_ADVANCE_FEATURE_LOCATION_CACHE) != 0,
+                this::patchEconomyLocationCache, "location cache");
+        requireEconomyAdvanceComponentState(node,
+                (mask & ECONOMY_ADVANCE_FEATURE_MARKET_SCHEDULER) != 0,
+                this::patchMarketSchedulerEconomySource, "market scheduler source");
+    }
+
+    private static void requireEconomyAdvanceComponentVanilla(
+            ClassNode incoming, PatchAction component, String label) {
+        ClassNode probe = readClass(writeClass(incoming));
+        try {
+            PatchReport report = component.apply(probe);
+            if (report.total <= 0) {
+                throw mismatch("Economy.advance " + label + " probe reported no sites");
+            }
+        } catch (AlreadyPatchedException ex) {
+            throw mismatch("Economy.advance " + label
+                    + " is already hook-shaped without unified ownership");
+        }
+    }
+
+    private static void requireEconomyAdvanceComponentState(
+            ClassNode node, boolean enabled, PatchAction component, String label) {
+        ClassNode probe = readClass(writeClass(node));
+        try {
+            PatchReport report = component.apply(probe);
+            if (enabled) {
+                throw mismatch("enabled Economy.advance " + label
+                        + " remains patchable after unified commit: " + report);
+            }
+            if (report.total <= 0) {
+                throw mismatch("disabled Economy.advance " + label
+                        + " vanilla probe reported no sites");
+            }
+        } catch (AlreadyPatchedException ex) {
+            if (!enabled) {
+                throw mismatch("disabled Economy.advance " + label
+                        + " is present in the unified post-state");
+            }
+        }
+    }
+
+    private static void rejectLegacyEconomyAdvanceMarkers(ClassNode node) {
+        for (String legacy : List.of("economyPersistentSnapshots",
+                "economyLocationCache", "marketScheduler")) {
+            if (hasPatchMarker(node, legacy)) {
+                throw mismatch("legacy split Economy.advance ownership marker is present: "
+                        + legacy);
+            }
+        }
+    }
+
+    private static int economyAdvancePlanMaskAccess() {
+        return Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL
+                | Opcodes.ACC_SYNTHETIC;
+    }
+
+    private static void requireEconomyAdvancePlanMask(ClassNode node, int expectedMask) {
+        FieldNode mask = findField(node, ECONOMY_ADVANCE_PLAN_MASK_FIELD);
+        if (mask == null || !"I".equals(mask.desc)
+                || mask.access != economyAdvancePlanMaskAccess()
+                || mask.signature != null
+                || !(mask.value instanceof Integer value)
+                || value != expectedMask) {
+            throw mismatch("Economy.advance plan feature mask changed; expected="
+                    + expectedMask);
+        }
+    }
+
     private PatchReport patchEconomyLocationCache(ClassNode node) {
         MethodNode advance = requireMethod(node, "advance", "(F)V");
         String reach = "com/fs/starfarer/campaign/econ/reach/ReachEconomy";
@@ -2568,7 +3723,7 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     }
 
     /**
-     * Replaces per-frame clear/addAll scratch snapshots with owner-local,
+     * Replaces hot per-frame defensive copies with owner-local,
      * copy-on-write snapshots. A transformed mutator increments the structure
      * epoch immediately; direct live-list edits are detected by a periodic
      * identity/order audit. Old snapshots are never cleared, so a nested advance
@@ -2637,16 +3792,6 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             requireCount("Economy setEcon epoch mark",
                     countPersistentMarks(setEcon, node.name,
                             ECONOMY_PERSISTENT_STATE_FIELD), 1);
-            PatchState pausedSnapshotState = uniformPatchState(
-                    "Economy persistent paused condition snapshot",
-                    scratchScopeState(node.name, paused,
-                            "Economy.advanceMarketConditionsWhenPaused"),
-                    immediateArrayListIteratorSnapshotState(paused, 1,
-                            "borrowEconomyCollectionSnapshot",
-                            "Economy paused condition snapshot"));
-            if (pausedSnapshotState != PatchState.PATCHED) {
-                throw mismatch("Economy persistent paused condition snapshot is not patched");
-            }
             throw already("Economy persistent snapshot/epoch postcondition matches");
         }
 
@@ -2663,12 +3808,6 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 "Economy.advance market snapshot");
         replaceEconomyMarketSnapshotWithPersistentAccessor(paused, node.name,
                 "Economy paused market snapshot");
-        boolean pausedScopeInstalled = ensureScratchScope(node.name, paused,
-                "Economy.advanceMarketConditionsWhenPaused");
-        int pausedConditionSnapshots = replaceImmediateArrayListIteratorSnapshots(
-                node.name, paused, 1, "borrowEconomyCollectionSnapshot",
-                pausedScopeInstalled, "Economy paused condition snapshot");
-
         insertPersistentMarkAfterUniqueCall(addMarket, Opcodes.INVOKEVIRTUAL,
                 "com/fs/starfarer/campaign/econ/reach/ReachEconomy", "addMarket",
                 "(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;)V",
@@ -2684,13 +3823,676 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 ECONOMY_PERSISTENT_STATE_FIELD);
 
         PatchReport report = new PatchReport();
-        report.add("persistent Economy market snapshots, paused condition scratch, and structure epoch",
-                8 + pausedConditionSnapshots);
+        report.add("persistent Economy market snapshots and structure epoch", 8);
         return report;
     }
 
-    private PatchReport patchMarketPersistentSnapshots(ClassNode node) {
+
+    private static final String MARKET_ADVANCE_PLAN_BODY = "smo$marketAdvancePlanBody";
+    private static final String MARKET_STEP_REPLAY_BODY = "smo$advanceSingleStep";
+    private static final String CONSTRUCTION_QUEUE_DESC =
+            "Lcom/fs/starfarer/api/impl/campaign/econ/impl/ConstructionQueue;";
+    private static final String MARKET_API =
+            "com/fs/starfarer/api/campaign/econ/MarketAPI";
+    private static final String MARKET_API_DESC = "L" + MARKET_API + ";";
+
+    /**
+     * Adds the invocation context and exact construction-mutation barriers as
+     * the scheduler-semantics component of the unified Market.advance plan.
+     */
+    private PatchReport patchMarketSchedulerSemanticBoundary(ClassNode node) {
+        MethodNode body = optionalMethod(node, MARKET_ADVANCE_PLAN_BODY, "(F)V");
+        int beginCalls = countCallsInClass(node, HOOKS,
+                "beginMarketAdvanceInvocation", "(" + MARKET_API_DESC + ")V");
+        int endCalls = countCallsInClass(node, HOOKS,
+                "endMarketAdvanceInvocation", "()V");
+        int queueOwnerCalls = countCallsInClass(node, HOOKS,
+                "registerConstructionQueueOwner",
+                "(" + CONSTRUCTION_QUEUE_DESC + MARKET_API_DESC + ")"
+                        + CONSTRUCTION_QUEUE_DESC);
+        int mutationCalls = countCallsInClass(node, HOOKS,
+                "flushPendingMarketBeforeMutation", "(" + MARKET_API_DESC + ")V");
+        PatchState registration = marketSchedulerRegistrationState(node,
+                MARKET_SCHEDULER_COMPONENT_MARKET_SEMANTICS,
+                "Market scheduler semantic boundary");
+        if (body != null || beginCalls != 0 || endCalls != 0
+                || queueOwnerCalls != 0 || mutationCalls != 0
+                || registration != PatchState.ORIGINAL) {
+            requireMarketSchedulerSemanticBoundaryShape(node);
+            throw already("Market scheduler semantic-boundary postcondition matches");
+        }
+
         MethodNode advance = requireMethod(node, "advance", "(F)V");
+        MethodNode wrapper = renameForPrivateOriginal(node, advance,
+                MARKET_ADVANCE_PLAN_BODY);
+        installMarketAdvanceInvocationWrapper(node.name, wrapper);
+
+        MethodNode getQueue = requireMethod(node, "getConstructionQueue",
+                "()" + CONSTRUCTION_QUEUE_DESC);
+        List<AbstractInsnNode> returns = new ArrayList<>();
+        for (AbstractInsnNode insn : getQueue.instructions.toArray()) {
+            if (insn.getOpcode() == Opcodes.ARETURN) returns.add(insn);
+        }
+        requireCount("Market.getConstructionQueue returns", returns.size(), 1);
+        InsnList register = new InsnList();
+        register.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        register.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "registerConstructionQueueOwner",
+                "(" + CONSTRUCTION_QUEUE_DESC + MARKET_API_DESC + ")"
+                        + CONSTRUCTION_QUEUE_DESC, false));
+        getQueue.instructions.insertBefore(returns.get(0), register);
+
+        insertMarketMutationBarrier(node, "addIndustry", "(Ljava/lang/String;)V");
+        insertMarketMutationBarrier(node, "addIndustry",
+                "(Ljava/lang/String;Ljava/util/List;)V");
+        insertMarketMutationBarrier(node, "removeIndustry",
+                "(Ljava/lang/String;Lcom/fs/starfarer/api/campaign/econ/MarketAPI$MarketInteractionMode;Z)V");
+        installMarketSchedulerRegistration(node,
+                MARKET_SCHEDULER_COMPONENT_MARKET_SEMANTICS,
+                "Market scheduler semantic boundary");
+
+        requireMarketSchedulerSemanticBoundaryShape(node);
+        PatchReport report = new PatchReport();
+        report.add("Market.advance batch invocation context", 1);
+        report.add("construction queue owner registration", 1);
+        report.add("Market construction mutation barriers", 3);
+        return report;
+    }
+
+    private static void installMarketAdvanceInvocationWrapper(String owner,
+                                                                MethodNode wrapper) {
+        LabelNode start = new LabelNode();
+        LabelNode end = new LabelNode();
+        LabelNode handler = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "beginMarketAdvanceInvocation", "(" + MARKET_API_DESC + ")V", false));
+        code.add(start);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.FLOAD, 1));
+        code.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, owner,
+                MARKET_ADVANCE_PLAN_BODY, "(F)V", false));
+        code.add(end);
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "endMarketAdvanceInvocation", "()V", false));
+        code.add(new InsnNode(Opcodes.RETURN));
+        code.add(handler);
+        code.add(new FrameNode(Opcodes.F_FULL, 2,
+                new Object[] {owner, Opcodes.FLOAT}, 1,
+                new Object[] {"java/lang/Throwable"}));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "endMarketAdvanceInvocation", "()V", false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new InsnNode(Opcodes.ATHROW));
+        replaceMethodBody(wrapper, code, 3);
+        wrapper.tryCatchBlocks.add(new TryCatchBlockNode(start, end, handler, null));
+    }
+
+    private static void insertMarketMutationBarrier(ClassNode node, String name, String desc) {
+        MethodNode method = requireMethod(node, name, desc);
+        AbstractInsnNode first = firstMeaningful(method);
+        if (first == null) throw mismatch("Market." + name + desc + " has no code");
+        InsnList barrier = new InsnList();
+        barrier.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        barrier.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "flushPendingMarketBeforeMutation", "(" + MARKET_API_DESC + ")V", false));
+        method.instructions.insertBefore(first, barrier);
+    }
+
+    private static void requireMarketSchedulerSemanticBoundaryShape(ClassNode node) {
+        MethodNode wrapper = requireMethod(node, "advance", "(F)V");
+        MethodNode body = requireMethod(node, MARKET_ADVANCE_PLAN_BODY, "(F)V");
+        if ((body.access & Opcodes.ACC_PRIVATE) == 0
+                || (body.access & Opcodes.ACC_SYNTHETIC) == 0) {
+            throw mismatch("Market scheduler semantic body is not private synthetic");
+        }
+        requireCount("Market invocation begin",
+                countCalls(wrapper, Opcodes.INVOKESTATIC, HOOKS,
+                        "beginMarketAdvanceInvocation", "(" + MARKET_API_DESC + ")V"), 1);
+        requireCount("Market invocation end",
+                countCalls(wrapper, Opcodes.INVOKESTATIC, HOOKS,
+                        "endMarketAdvanceInvocation", "()V"), 2);
+        requireCount("Market invocation body call",
+                countCalls(wrapper, Opcodes.INVOKESPECIAL, node.name,
+                        MARKET_ADVANCE_PLAN_BODY, "(F)V"), 1);
+        requireCount("Market wrapper self recursion",
+                countCalls(wrapper, -1, node.name, "advance", "(F)V"), 0);
+        requireCount("Market invocation try/finally", wrapper.tryCatchBlocks.size(), 1);
+        MethodNode getQueue = requireMethod(node, "getConstructionQueue",
+                "()" + CONSTRUCTION_QUEUE_DESC);
+        requireCount("construction queue owner registration",
+                countCalls(getQueue, Opcodes.INVOKESTATIC, HOOKS,
+                        "registerConstructionQueueOwner",
+                        "(" + CONSTRUCTION_QUEUE_DESC + MARKET_API_DESC + ")"
+                                + CONSTRUCTION_QUEUE_DESC), 1);
+        requireState("Market scheduler semantic registration",
+                marketSchedulerRegistrationState(node,
+                        MARKET_SCHEDULER_COMPONENT_MARKET_SEMANTICS,
+                        "Market scheduler semantic boundary"), PatchState.PATCHED);
+        for (String[] method : new String[][]{
+                {"addIndustry", "(Ljava/lang/String;)V"},
+                {"addIndustry", "(Ljava/lang/String;Ljava/util/List;)V"},
+                {"removeIndustry", "(Ljava/lang/String;Lcom/fs/starfarer/api/campaign/econ/MarketAPI$MarketInteractionMode;Z)V"}}) {
+            MethodNode mutator = requireMethod(node, method[0], method[1]);
+            requireCount("Market mutation barrier " + method[0] + method[1],
+                    countCalls(mutator, Opcodes.INVOKESTATIC, HOOKS,
+                            "flushPendingMarketBeforeMutation",
+                            "(" + MARKET_API_DESC + ")V"), 1);
+        }
+    }
+
+    private PatchReport patchBaseIndustryConstructionMutationBarriers(ClassNode node) {
+        String[][] methods = {
+                {"startBuilding", "()V"},
+                {"startUpgrading", "()V"},
+                {"cancelUpgrade", "()V"},
+                {"downgrade", "()V"}
+        };
+        PatchState registration = marketSchedulerRegistrationState(node,
+                MARKET_SCHEDULER_COMPONENT_BASE_INDUSTRY,
+                "BaseIndustry construction barriers");
+        int present = 0;
+        for (String[] spec : methods) {
+            MethodNode method = requireMethod(node, spec[0], spec[1]);
+            int calls = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                    "flushPendingMarketBeforeMutation", "(" + MARKET_API_DESC + ")V");
+            if (calls != 0) present++;
+            if (calls > 1) throw mismatch("duplicate BaseIndustry construction barrier "
+                    + spec[0]);
+        }
+        if (present != 0 || registration != PatchState.ORIGINAL) {
+            requireCount("complete BaseIndustry construction barrier group", present,
+                    methods.length);
+            requireState("BaseIndustry construction capability registration",
+                    registration, PatchState.PATCHED);
+            throw already("BaseIndustry construction mutation barriers match");
+        }
+        for (String[] spec : methods) {
+            MethodNode method = requireMethod(node, spec[0], spec[1]);
+            AbstractInsnNode first = firstMeaningful(method);
+            if (first == null) throw mismatch("BaseIndustry." + spec[0] + " has no code");
+            InsnList barrier = new InsnList();
+            barrier.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            barrier.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, "market",
+                    MARKET_API_DESC));
+            barrier.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                    "flushPendingMarketBeforeMutation", "(" + MARKET_API_DESC + ")V", false));
+            method.instructions.insertBefore(first, barrier);
+        }
+        installMarketSchedulerRegistration(node,
+                MARKET_SCHEDULER_COMPONENT_BASE_INDUSTRY,
+                "BaseIndustry construction barriers");
+        requireState("BaseIndustry construction capability registration",
+                marketSchedulerRegistrationState(node,
+                        MARKET_SCHEDULER_COMPONENT_BASE_INDUSTRY,
+                        "BaseIndustry construction barriers"), PatchState.PATCHED);
+        PatchReport report = new PatchReport();
+        report.add("BaseIndustry construction mutation barriers", methods.length);
+        report.add("BaseIndustry scheduler semantic capability", 1);
+        return report;
+    }
+
+    private PatchReport patchConstructionQueueMutationBarriers(ClassNode node) {
+        String[][] methods = {
+                {"setItems", "(Ljava/util/List;)V"},
+                {"addToEnd", "(Ljava/lang/String;I)V"},
+                {"moveUp", "(Ljava/lang/String;)V"},
+                {"moveDown", "(Ljava/lang/String;)V"},
+                {"moveToFront", "(Ljava/lang/String;)V"},
+                {"moveToBack", "(Ljava/lang/String;)V"},
+                {"removeItem", "(Ljava/lang/String;)V"}
+        };
+        PatchState registration = marketSchedulerRegistrationState(node,
+                MARKET_SCHEDULER_COMPONENT_CONSTRUCTION_QUEUE,
+                "ConstructionQueue mutation barriers");
+        int present = 0;
+        String desc = "(" + CONSTRUCTION_QUEUE_DESC + ")V";
+        for (String[] spec : methods) {
+            MethodNode method = requireMethod(node, spec[0], spec[1]);
+            int calls = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                    "flushPendingConstructionQueueBeforeMutation", desc);
+            if (calls != 0) present++;
+            if (calls > 1) throw mismatch("duplicate ConstructionQueue mutation barrier "
+                    + spec[0]);
+        }
+        if (present != 0 || registration != PatchState.ORIGINAL) {
+            requireCount("complete ConstructionQueue mutation barrier group", present,
+                    methods.length);
+            requireState("ConstructionQueue capability registration",
+                    registration, PatchState.PATCHED);
+            throw already("ConstructionQueue mutation barriers match");
+        }
+        for (String[] spec : methods) {
+            MethodNode method = requireMethod(node, spec[0], spec[1]);
+            AbstractInsnNode first = firstMeaningful(method);
+            if (first == null) throw mismatch("ConstructionQueue." + spec[0] + " has no code");
+            InsnList barrier = new InsnList();
+            barrier.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            barrier.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                    "flushPendingConstructionQueueBeforeMutation", desc, false));
+            method.instructions.insertBefore(first, barrier);
+        }
+        installMarketSchedulerRegistration(node,
+                MARKET_SCHEDULER_COMPONENT_CONSTRUCTION_QUEUE,
+                "ConstructionQueue mutation barriers");
+        requireState("ConstructionQueue capability registration",
+                marketSchedulerRegistrationState(node,
+                        MARKET_SCHEDULER_COMPONENT_CONSTRUCTION_QUEUE,
+                        "ConstructionQueue mutation barriers"), PatchState.PATCHED);
+        PatchReport report = new PatchReport();
+        report.add("ConstructionQueue mutation barriers", methods.length);
+        report.add("ConstructionQueue scheduler semantic capability", 1);
+        return report;
+    }
+
+    private PatchReport patchMarketComponentStepReplay(ClassNode node, int componentId) {
+        if (componentId < 1 || componentId > 3) {
+            throw mismatch("invalid market component replay id " + componentId);
+        }
+        int schedulerComponent = marketReplaySchedulerComponent(componentId);
+        PatchState registration = marketSchedulerRegistrationState(node, schedulerComponent,
+                node.name + " market-step replay");
+        MethodNode raw = optionalMethod(node, MARKET_STEP_REPLAY_BODY, "(F)V");
+        int batchCalls = countCallsInClass(node, HOOKS,
+                "hasCurrentMarketAdvanceBatch", "(" + MARKET_API_DESC + ")Z");
+        if (raw != null || batchCalls != 0 || registration != PatchState.ORIGINAL) {
+            requireMarketComponentStepReplayShape(node, componentId);
+            throw already("market component step-replay wrapper matches");
+        }
+        requireMarketComponentReplayVanillaAnchors(node, componentId);
+        MethodNode original = requireMethod(node, "advance", "(F)V");
+        MethodNode wrapper = renameForPrivateOriginal(node, original,
+                MARKET_STEP_REPLAY_BODY);
+        installMarketComponentReplayWrapper(node, wrapper, componentId);
+        installMarketSchedulerRegistration(node, schedulerComponent,
+                node.name + " market-step replay");
+        requireMarketComponentStepReplayShape(node, componentId);
+        PatchReport report = new PatchReport();
+        report.add("exact market component step replay", 1);
+        report.add("market-step replay scheduler capability", 1);
+        return report;
+    }
+
+    private static int marketReplaySchedulerComponent(int componentId) {
+        return switch (componentId) {
+            case 1 -> MARKET_SCHEDULER_COMPONENT_MILITARY_BASE;
+            case 2 -> MARKET_SCHEDULER_COMPONENT_LIONS_GUARD;
+            case 3 -> MARKET_SCHEDULER_COMPONENT_RECENT_UNREST;
+            default -> throw mismatch("invalid market component replay id " + componentId);
+        };
+    }
+
+    private static void requireMarketComponentReplayVanillaAnchors(ClassNode node,
+                                                                    int componentId) {
+        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        if (componentId == 1 || componentId == 2) {
+            requireCount(node.name + " BaseIndustry.advance anchor",
+                    countCalls(advance, Opcodes.INVOKESPECIAL, BASE_INDUSTRY,
+                            "advance", "(F)V"), 1);
+            requireCount(node.name + " IntervalUtil.advance anchor",
+                    countCalls(advance, Opcodes.INVOKEVIRTUAL,
+                            "com/fs/starfarer/api/util/IntervalUtil", "advance", "(F)V"),
+                    componentId == 1 ? 2 : 1);
+            requireCount(node.name + " IntervalUtil.intervalElapsed anchor",
+                    countCalls(advance, Opcodes.INVOKEVIRTUAL,
+                            "com/fs/starfarer/api/util/IntervalUtil", "intervalElapsed", "()Z"), 1);
+        } else {
+            requireField(node, "penalty", "I");
+            requireField(node, "untilDecrease", "F");
+            int removals = 0;
+            for (AbstractInsnNode insn : advance.instructions.toArray()) {
+                if (insn instanceof MethodInsnNode call
+                        && call.name.equals("removeSpecificCondition")) removals++;
+            }
+            requireCount("RecentUnrest removeSpecificCondition anchor", removals, 1);
+        }
+    }
+
+    private static void installMarketComponentReplayWrapper(ClassNode node,
+                                                              MethodNode wrapper,
+                                                              int componentId) {
+        final boolean recent = componentId == 3;
+        final String marketOwner = recent
+                ? "com/fs/starfarer/api/impl/campaign/econ/BaseMarketConditionPlugin"
+                : BASE_INDUSTRY;
+        InsnList code = new InsnList();
+        LabelNode noBatch = new LabelNode();
+        LabelNode outerCheck = new LabelNode();
+        LabelNode outerBody = new LabelNode();
+        LabelNode innerCheck = new LabelNode();
+        LabelNode innerBody = new LabelNode();
+        LabelNode nextRun = new LabelNode();
+        LabelNode done = new LabelNode();
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        if (recent) {
+            code.add(new FieldInsnNode(Opcodes.GETFIELD, marketOwner, "market", MARKET_API_DESC));
+        } else {
+            code.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, node.name,
+                    "getMarket", "()" + MARKET_API_DESC, false));
+        }
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "hasCurrentMarketAdvanceBatch", "(" + MARKET_API_DESC + ")Z", false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, noBatch));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "currentMarketAdvanceBatchRunCount", "(" + MARKET_API_DESC + ")I", false));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 3));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        code.add(new JumpInsnNode(Opcodes.IFLE, noBatch));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 4));
+        code.add(outerCheck);
+        code.add(new FrameNode(Opcodes.F_FULL, 5,
+                new Object[] {node.name, Opcodes.FLOAT, MARKET_API, Opcodes.INTEGER,
+                        Opcodes.INTEGER}, 0, null));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPLT, outerBody));
+        code.add(new JumpInsnNode(Opcodes.GOTO, done));
+        code.add(outerBody);
+        code.add(new FrameNode(Opcodes.F_FULL, 5,
+                new Object[] {node.name, Opcodes.FLOAT, MARKET_API, Opcodes.INTEGER,
+                        Opcodes.INTEGER}, 0, null));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "currentMarketAdvanceBatchRunAmount", "(" + MARKET_API_DESC + "I)F", false));
+        code.add(new VarInsnNode(Opcodes.FSTORE, 5));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "currentMarketAdvanceBatchRunRepeats", "(" + MARKET_API_DESC + "I)I", false));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 6));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 7));
+        code.add(innerCheck);
+        code.add(new FrameNode(Opcodes.F_FULL, 8,
+                new Object[] {node.name, Opcodes.FLOAT, MARKET_API, Opcodes.INTEGER,
+                        Opcodes.INTEGER, Opcodes.FLOAT, Opcodes.INTEGER, Opcodes.INTEGER},
+                0, null));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 7));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 6));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPLT, innerBody));
+        code.add(new JumpInsnNode(Opcodes.GOTO, nextRun));
+        code.add(innerBody);
+        code.add(new FrameNode(Opcodes.F_FULL, 8,
+                new Object[] {node.name, Opcodes.FLOAT, MARKET_API, Opcodes.INTEGER,
+                        Opcodes.INTEGER, Opcodes.FLOAT, Opcodes.INTEGER, Opcodes.INTEGER},
+                0, null));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.FLOAD, 5));
+        code.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, node.name,
+                MARKET_STEP_REPLAY_BODY, "(F)V", false));
+        code.add(pushInt(componentId));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "recordMarketComponentReplayedStep", "(I)V", false));
+        if (recent) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+            code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                    "shouldContinueRecentUnrestReplay", "(" + MARKET_API_DESC + ")Z", false));
+            code.add(new JumpInsnNode(Opcodes.IFEQ, done));
+        }
+        code.add(new IincInsnNode(7, 1));
+        code.add(new JumpInsnNode(Opcodes.GOTO, innerCheck));
+        code.add(nextRun);
+        code.add(new FrameNode(Opcodes.F_FULL, 8,
+                new Object[] {node.name, Opcodes.FLOAT, MARKET_API, Opcodes.INTEGER,
+                        Opcodes.INTEGER, Opcodes.FLOAT, Opcodes.INTEGER, Opcodes.INTEGER},
+                0, null));
+        code.add(new IincInsnNode(4, 1));
+        code.add(new JumpInsnNode(Opcodes.GOTO, outerCheck));
+        code.add(noBatch);
+        code.add(new FrameNode(Opcodes.F_FULL, 3,
+                new Object[] {node.name, Opcodes.FLOAT, MARKET_API}, 0, null));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.FLOAD, 1));
+        code.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, node.name,
+                MARKET_STEP_REPLAY_BODY, "(F)V", false));
+        code.add(done);
+        code.add(new FrameNode(Opcodes.F_FULL, 3,
+                new Object[] {node.name, Opcodes.FLOAT, MARKET_API}, 0, null));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replaceMethodBody(wrapper, code, 8);
+    }
+
+    private static void requireMarketComponentStepReplayShape(ClassNode node,
+                                                                int componentId) {
+        MethodNode wrapper = requireMethod(node, "advance", "(F)V");
+        MethodNode raw = requireMethod(node, MARKET_STEP_REPLAY_BODY, "(F)V");
+        if ((raw.access & Opcodes.ACC_PRIVATE) == 0
+                || (raw.access & Opcodes.ACC_SYNTHETIC) == 0) {
+            throw mismatch(node.name + " replay body is not private synthetic");
+        }
+        requireCount(node.name + " replay batch check",
+                countCalls(wrapper, Opcodes.INVOKESTATIC, HOOKS,
+                        "hasCurrentMarketAdvanceBatch", "(" + MARKET_API_DESC + ")Z"), 1);
+        requireCount(node.name + " replay run count",
+                countCalls(wrapper, Opcodes.INVOKESTATIC, HOOKS,
+                        "currentMarketAdvanceBatchRunCount", "(" + MARKET_API_DESC + ")I"), 1);
+        requireCount(node.name + " replay run amount",
+                countCalls(wrapper, Opcodes.INVOKESTATIC, HOOKS,
+                        "currentMarketAdvanceBatchRunAmount", "(" + MARKET_API_DESC + "I)F"), 1);
+        requireCount(node.name + " replay run repeats",
+                countCalls(wrapper, Opcodes.INVOKESTATIC, HOOKS,
+                        "currentMarketAdvanceBatchRunRepeats", "(" + MARKET_API_DESC + "I)I"), 1);
+        requireCount(node.name + " replay raw calls",
+                countCalls(wrapper, Opcodes.INVOKESPECIAL, node.name,
+                        MARKET_STEP_REPLAY_BODY, "(F)V"), 2);
+        requireCount(node.name + " replay metric",
+                countCalls(wrapper, Opcodes.INVOKESTATIC, HOOKS,
+                        "recordMarketComponentReplayedStep", "(I)V"), 1);
+        requireCount(node.name + " wrapper recursion",
+                countCalls(wrapper, -1, node.name, "advance", "(F)V"), 0);
+        requireState(node.name + " scheduler semantic registration",
+                marketSchedulerRegistrationState(node,
+                        marketReplaySchedulerComponent(componentId),
+                        node.name + " market-step replay"), PatchState.PATCHED);
+        if (componentId == 3) {
+            requireCount("RecentUnrest replay removal break",
+                    countCalls(wrapper, Opcodes.INVOKESTATIC, HOOKS,
+                            "shouldContinueRecentUnrestReplay",
+                            "(" + MARKET_API_DESC + ")Z"), 1);
+        }
+    }
+
+    /**
+     * Owns the complete Market.advance(F)V transformation surface. The four
+     * independently configurable components are inspected against the same
+     * incoming class, then committed in one explicit order and validated by one
+     * combined postcondition. No component marker is emitted.
+     */
+    private PatchReport patchMarketAdvancePlan(ClassNode node) {
+        int requestedMask = requestedMarketAdvanceFeatureMask();
+        if (requestedMask == 0) {
+            throw mismatch("Market.advance patch plan has an empty feature mask");
+        }
+        rejectLegacyMarketAdvanceMarkers(node);
+
+        boolean owned = hasPatchMarker(node, MARKET_ADVANCE_PLAN_PATCH_ID);
+        if (owned) {
+            requireMarketAdvancePlanMask(node, requestedMask);
+            requireMarketAdvancePlanPostcondition(node, requestedMask);
+            throw already("Market.advance unified patch-plan postcondition matches mask="
+                    + requestedMask);
+        }
+        if (findField(node, MARKET_ADVANCE_PLAN_MASK_FIELD) != null) {
+            throw mismatch("Market.advance plan mask exists without the ownership marker");
+        }
+
+        // Build the plan from independent copies of the same incoming state. A
+        // component that is already hook-shaped, partial, or structurally
+        // incompatible aborts the whole plan before the candidate ClassNode is
+        // modified.
+        MarketAdvancePatchPlan plan = inspectMarketAdvancePatchPlan(node, requestedMask);
+        if (plan.featureMask() != requestedMask) {
+            throw mismatch("Market.advance plan feature mask changed during inspection");
+        }
+        PatchReport report = applyMarketAdvancePatchPlan(node, plan);
+        node.fields.add(new FieldNode(Opcodes.ASM8, marketAdvancePlanMaskAccess(),
+                MARKET_ADVANCE_PLAN_MASK_FIELD, "I", null, requestedMask));
+        requireMarketAdvancePlanMask(node, requestedMask);
+        requireMarketAdvancePlanPostcondition(node, requestedMask);
+        report.add("unified Market.advance plan", 1);
+        return report;
+    }
+
+    private MarketAdvancePatchPlan inspectMarketAdvancePatchPlan(
+            ClassNode incoming, int requestedMask) {
+        // Every component must be in its vanilla state, including disabled
+        // components. This prevents the unified owner from adopting legacy,
+        // foreign, or mixed split-patch state.
+        requireMarketAdvanceComponentVanilla(incoming,
+                this::patchMarketPersistentSnapshots, "persistent snapshots");
+        requireMarketAdvanceComponentVanilla(incoming,
+                this::patchMarketCommodityTemporalFastPath, "commodity temporal loop");
+        requireMarketAdvanceComponentVanilla(incoming,
+                this::patchDirectMarketObservationEntry, "entry observation");
+        requireMarketAdvanceComponentVanilla(incoming,
+                this::patchMarketSchedulerSemanticBoundary,
+                "scheduler semantic boundary");
+
+        // Build the complete candidate on an isolated ClassNode. The live
+        // candidate supplied to apply() remains read-only throughout planning.
+        // The resulting fields/methods are committed together only after every
+        // requested component has succeeded.
+        ClassNode planned = readClass(writeClass(incoming));
+        PatchReport combined = new PatchReport();
+        if ((requestedMask & MARKET_ADVANCE_FEATURE_PERSISTENT_SNAPSHOTS) != 0) {
+            PatchReport component = patchMarketPersistentSnapshots(planned);
+            combined.add("persistent snapshots", component.total);
+        }
+        if ((requestedMask & MARKET_ADVANCE_FEATURE_COMMODITY_TEMPORAL) != 0) {
+            PatchReport component = patchMarketCommodityTemporalFastPath(planned);
+            combined.add("commodity temporal loop", component.total);
+        }
+        if ((requestedMask & MARKET_ADVANCE_FEATURE_ENTRY_OBSERVATION) != 0) {
+            PatchReport component = patchDirectMarketObservationEntry(planned);
+            combined.add("entry observation", component.total);
+        }
+        if ((requestedMask & MARKET_ADVANCE_FEATURE_SCHEDULER_SEMANTICS) != 0) {
+            PatchReport component = patchMarketSchedulerSemanticBoundary(planned);
+            combined.add("scheduler semantic boundary", component.total);
+        }
+        return new MarketAdvancePatchPlan(requestedMask, writeClass(planned), combined);
+    }
+
+    private static PatchReport applyMarketAdvancePatchPlan(
+            ClassNode node, MarketAdvancePatchPlan plan) {
+        ClassNode planned = readClass(plan.plannedBytes());
+        if (!node.name.equals(planned.name)) {
+            throw mismatch("Market.advance plan candidate owner changed");
+        }
+        // Components in this plan add or modify only fields and methods. Commit
+        // those two class sections together; all other class metadata remains
+        // exactly as supplied by the JVM.
+        node.fields.clear();
+        node.fields.addAll(planned.fields);
+        node.methods.clear();
+        node.methods.addAll(planned.methods);
+        return plan.report();
+    }
+
+    private void requireMarketAdvancePlanPostcondition(ClassNode node, int mask) {
+        requireMarketAdvanceComponentState(node,
+                (mask & MARKET_ADVANCE_FEATURE_PERSISTENT_SNAPSHOTS) != 0,
+                this::patchMarketPersistentSnapshots, "persistent snapshots");
+        requireMarketAdvanceComponentState(node,
+                (mask & MARKET_ADVANCE_FEATURE_COMMODITY_TEMPORAL) != 0,
+                this::patchMarketCommodityTemporalFastPath, "commodity temporal loop");
+        requireMarketAdvanceComponentState(node,
+                (mask & MARKET_ADVANCE_FEATURE_ENTRY_OBSERVATION) != 0,
+                this::patchDirectMarketObservationEntry, "entry observation");
+        requireMarketAdvanceComponentState(node,
+                (mask & MARKET_ADVANCE_FEATURE_SCHEDULER_SEMANTICS) != 0,
+                this::patchMarketSchedulerSemanticBoundary,
+                "scheduler semantic boundary");
+    }
+
+    private static void requireMarketAdvanceComponentVanilla(
+            ClassNode incoming, PatchAction component, String label) {
+        ClassNode probe = readClass(writeClass(incoming));
+        try {
+            PatchReport report = component.apply(probe);
+            if (report.total <= 0) {
+                throw mismatch("Market.advance " + label + " probe reported no sites");
+            }
+        } catch (AlreadyPatchedException ex) {
+            throw mismatch("Market.advance " + label
+                    + " is already hook-shaped without unified ownership");
+        }
+    }
+
+    private static void requireMarketAdvanceComponentState(
+            ClassNode node, boolean enabled, PatchAction component, String label) {
+        ClassNode probe = readClass(writeClass(node));
+        try {
+            PatchReport report = component.apply(probe);
+            if (enabled) {
+                throw mismatch("enabled Market.advance " + label
+                        + " remains patchable after unified commit: " + report);
+            }
+            if (report.total <= 0) {
+                throw mismatch("disabled Market.advance " + label
+                        + " vanilla probe reported no sites");
+            }
+        } catch (AlreadyPatchedException ex) {
+            if (!enabled) {
+                throw mismatch("disabled Market.advance " + label
+                        + " is present in the unified post-state");
+            }
+        }
+    }
+
+    private static void rejectLegacyMarketAdvanceMarkers(ClassNode node) {
+        for (String legacy : List.of("economyPersistentSnapshots",
+                "commodityTemporalFastPath", "directMarketObservation",
+                "marketScheduler")) {
+            if (hasPatchMarker(node, legacy)) {
+                throw mismatch("legacy split Market.advance ownership marker is present: "
+                        + legacy);
+            }
+        }
+    }
+
+    private static int marketAdvancePlanMaskAccess() {
+        return Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL
+                | Opcodes.ACC_SYNTHETIC;
+    }
+
+    private static FieldNode findField(ClassNode node, String name) {
+        FieldNode found = null;
+        for (FieldNode field : node.fields) {
+            if (!field.name.equals(name)) continue;
+            if (found != null) throw mismatch("duplicate field " + node.name + "." + name);
+            found = field;
+        }
+        return found;
+    }
+
+    private static void requireMarketAdvancePlanMask(ClassNode node, int expectedMask) {
+        FieldNode mask = findField(node, MARKET_ADVANCE_PLAN_MASK_FIELD);
+        if (mask == null || !"I".equals(mask.desc)
+                || mask.access != marketAdvancePlanMaskAccess()
+                || mask.signature != null
+                || !(mask.value instanceof Integer value)
+                || value != expectedMask) {
+            throw mismatch("Market.advance plan feature mask changed; expected="
+                    + expectedMask);
+        }
+    }
+
+    private static MethodNode marketAdvanceSemanticBody(ClassNode node) {
+        MethodNode body = optionalMethod(node, MARKET_ADVANCE_PLAN_BODY, "(F)V");
+        return body != null ? body : requireMethod(node, "advance", "(F)V");
+    }
+
+    private PatchReport patchMarketPersistentSnapshots(ClassNode node) {
+        MethodNode advance = marketAdvanceSemanticBody(node);
         MethodNode constructor = requireMethod(node, "<init>",
                 "(Ljava/lang/String;Ljava/lang/String;ILcom/fs/starfarer/campaign/econ/Economy;)V");
         MethodNode readResolve = requireMethod(node, "readResolve", "()Ljava/lang/Object;");
@@ -3173,59 +4975,29 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     }
 
 
-    private PatchReport patchEconomySnapshots(ClassNode node) {
+    private PatchReport patchMarketSchedulerEntitySource(ClassNode node) {
         MethodNode advance = requireMethod(node, "advance", "(F)V");
-        MethodNode paused = requireMethod(node, "advanceMarketConditionsWhenPaused", "(F)V");
-
-        PatchState state = uniformPatchState("Economy snapshot reuse",
-                scratchScopeState(node.name, advance, "Economy.advance"),
-                economyMarketsSnapshotState(advance, "Economy.advance market snapshot"),
-                scratchScopeState(node.name, paused,
-                        "Economy.advanceMarketConditionsWhenPaused"),
-                economyMarketsSnapshotState(paused, "Economy paused market snapshot"),
-                immediateArrayListIteratorSnapshotState(paused, 1,
-                        "borrowEconomyCollectionSnapshot",
-                        "Economy paused condition snapshot"));
-        if (state == PatchState.PATCHED) {
-            throw already("all Economy snapshot hooks and scopes satisfy their postconditions");
-        }
-
-        boolean advanceScopeInstalled = ensureScratchScope(node.name, advance, "Economy.advance");
-        int changed = replaceEconomyMarketsSnapshot(advance, advanceScopeInstalled,
-                "Economy.advance market snapshot");
-        boolean pausedScopeInstalled = ensureScratchScope(node.name, paused,
-                "Economy.advanceMarketConditionsWhenPaused");
-        changed += replaceEconomyMarketsSnapshot(paused, pausedScopeInstalled,
-                "Economy paused market snapshot");
-        changed += replaceImmediateArrayListIteratorSnapshots(node.name, paused, 1,
-                "borrowEconomyCollectionSnapshot", pausedScopeInstalled,
-                "Economy paused condition snapshot");
-
-        PatchReport report = new PatchReport();
-        report.add("reusable Economy market/condition snapshots", changed);
-        return report;
-    }
-
-    private PatchReport patchPlanetConditionMarketAdvanceBridge(ClassNode node) {
-        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        PatchState registration = marketSchedulerRegistrationState(node,
+                MARKET_SCHEDULER_COMPONENT_ENTITY, "BaseCampaignEntity market scheduler");
         String market = "com/fs/starfarer/api/campaign/econ/MarketAPI";
-        String hookDesc = "(L" + market + ";F)V";
+        String hookDesc = "(L" + market + ";FI)V";
         List<MethodInsnNode> originals = calls(advance, Opcodes.INVOKEINTERFACE,
                 market, "advance", "(F)V");
         List<MethodInsnNode> hooks = calls(advance, Opcodes.INVOKESTATIC, HOOKS,
-                "advancePlanetConditionMarketScheduled", hookDesc);
+                "advanceMarketScheduled", hookDesc);
         boolean originalState = originals.size() == 1 && hooks.isEmpty();
         boolean patchedState = originals.isEmpty() && hooks.size() == 1;
         if (!originalState && !patchedState) {
-            throw mismatch("BaseCampaignEntity planet-condition Market.advance call is missing, "
-                    + "duplicated, or partially patched");
+            throw mismatch("BaseCampaignEntity market scheduler bridge is missing, duplicated, "
+                    + "or partially patched");
         }
         requireCount("BaseCampaignEntity planet-condition predicate",
                 countCalls(advance, Opcodes.INVOKEINTERFACE, market,
                         "isPlanetConditionMarketOnly", "()Z"), 1);
 
         MethodInsnNode target = originalState ? originals.get(0) : hooks.get(0);
-        AbstractInsnNode amount = previousMeaningful(target);
+        AbstractInsnNode source = patchedState ? previousMeaningful(target) : null;
+        AbstractInsnNode amount = patchedState ? previousMeaningful(source) : previousMeaningful(target);
         AbstractInsnNode fieldInsn = previousMeaningful(amount);
         AbstractInsnNode owner = previousMeaningful(fieldInsn);
         if (!(amount instanceof VarInsnNode amountLoad)
@@ -3236,8 +5008,10 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 || !field.desc.equals("L" + market + ";")
                 || !(owner instanceof VarInsnNode ownerLoad)
                 || ownerLoad.getOpcode() != Opcodes.ALOAD || ownerLoad.var != 0) {
-            throw mismatch("BaseCampaignEntity planet-condition Market.advance receiver/amount "
-                    + "shape changed structurally");
+            throw mismatch("BaseCampaignEntity market scheduler receiver/amount shape changed");
+        }
+        if (patchedState && !isIntegerLdc(source, 1)) {
+            throw mismatch("BaseCampaignEntity market scheduler source is not PLANET_CONDITION");
         }
 
         AbstractInsnNode predicateBranchInsn = previousMeaningful(owner);
@@ -3273,155 +5047,276 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 || nextMeaningful(predicateBranch.label) != join
                 || nextMeaningful(nullBranch.label) != join
                 || hasExternalControlFlowEntry(advance, nullOwnerInsn, target)) {
-            throw mismatch("BaseCampaignEntity planet-condition predicate/null guards are not "
-                    + "the exact control-flow owner of the Market.advance call");
+            throw mismatch("BaseCampaignEntity planet-condition guards no longer own the market call");
         }
 
         if (patchedState) {
-            throw already("planet-condition Market.advance bridge postcondition matches");
+            if (registration != PatchState.PATCHED) {
+                throw mismatch("BaseCampaignEntity market scheduler source lacks component registration");
+            }
+            throw already("BaseCampaignEntity market scheduler source postcondition matches");
+        }
+        if (registration == PatchState.PATCHED) {
+            throw mismatch("BaseCampaignEntity market scheduler registration exists without its source bridge");
         }
 
+        advance.instructions.insertBefore(target, new InsnNode(Opcodes.ICONST_1));
         advance.instructions.set(target, new MethodInsnNode(Opcodes.INVOKESTATIC,
-                HOOKS, "advancePlanetConditionMarketScheduled", hookDesc, false));
-        requireCount("planet-condition market bridge",
+                HOOKS, "advanceMarketScheduled", hookDesc, false));
+        requireCount("BaseCampaignEntity market scheduler bridge",
                 countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
-                        "advancePlanetConditionMarketScheduled", hookDesc), 1);
+                        "advanceMarketScheduled", hookDesc), 1);
         requireCount("retired direct planet-condition Market.advance",
                 countCalls(advance, Opcodes.INVOKEINTERFACE, market,
                         "advance", "(F)V"), 0);
-
-        PatchReport report = new PatchReport();
-        report.add("planet-condition market scheduler/observer bridge", 1);
-        return report;
-    }
-
-    /**
-     * Supplies the shared once-per-Economy-frame clock when the planet-condition
-     * scheduler is enabled without the central remote-market scheduler.
-     */
-    private PatchReport patchPlanetConditionMarketFrameClock(ClassNode node) {
-        MethodNode advance = requireMethod(node, "advance", "(F)V");
-        PatchState scopeState = scratchScopeState(node.name, advance,
-                "Economy.advance planet-condition frame clock");
-        int hooks = countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
-                "beginRemoteMarketFrame", "()V");
-        if (hooks == 1) {
-            if (scopeState != PatchState.PATCHED) {
-                throw mismatch("planet-condition frame clock exists without its scratch scope");
-            }
-            AbstractInsnNode first = firstMeaningful(advance);
-            AbstractInsnNode expected = first;
-            if (first instanceof MethodInsnNode scratch
-                    && callMatches(scratch, Opcodes.INVOKESTATIC, HOOKS,
-                    "beginScratchScope", "()V")) {
-                expected = nextMeaningful(first);
-            }
-            if (!(expected instanceof MethodInsnNode begin)
-                    || !callMatches(begin, Opcodes.INVOKESTATIC, HOOKS,
-                    "beginRemoteMarketFrame", "()V")) {
-                throw mismatch("planet-condition frame clock is not at Economy.advance entry");
-            }
-            throw already("planet-condition frame clock postcondition matches");
-        }
-        requireCount("planet-condition frame clock hooks", hooks, 0);
-        boolean scopeInstalled = ensureScratchScope(node.name, advance,
-                "Economy.advance planet-condition frame clock");
-
-        MethodInsnNode beginHook = new MethodInsnNode(Opcodes.INVOKESTATIC,
-                HOOKS, "beginRemoteMarketFrame", "()V", false);
-        AbstractInsnNode entry = firstMeaningful(advance);
-        if (entry instanceof MethodInsnNode scratch
-                && callMatches(scratch, Opcodes.INVOKESTATIC, HOOKS,
-                "beginScratchScope", "()V")) {
-            advance.instructions.insert(entry, beginHook);
-        } else {
-            advance.instructions.insertBefore(entry, beginHook);
+        installMarketSchedulerRegistration(node, MARKET_SCHEDULER_COMPONENT_ENTITY,
+                "BaseCampaignEntity market scheduler");
+        if (marketSchedulerRegistrationState(node, MARKET_SCHEDULER_COMPONENT_ENTITY,
+                "BaseCampaignEntity market scheduler") != PatchState.PATCHED) {
+            throw mismatch("BaseCampaignEntity market scheduler component registration is absent");
         }
 
         PatchReport report = new PatchReport();
-        report.add("planet-condition scheduler frame clock", 1);
-        report.add("planet-condition scheduler reentrancy scope", scopeInstalled ? 1 : 0);
+        report.add("planet-condition source routed through common market scheduler", 1);
+        report.add("market scheduler entity component registration", 1);
         return report;
     }
 
-    private PatchReport patchRemoteMarketScheduler(ClassNode node) {
+    /** Routes the central Economy market call through the shared CampaignEngine tick. */
+    private PatchReport patchMarketSchedulerEconomySource(ClassNode node) {
         MethodNode advance = requireMethod(node, "advance", "(F)V");
-        // The scheduler uses the existing re-entrant scratch-scope depth as its
-        // central-loop ownership guard. Install it even when economy snapshot
-        // reuse is disabled so nested Economy.advance() calls fail open without
-        // overwriting the outer scheduling frame.
-        PatchState scopeState = scratchScopeState(node.name, advance,
-                "Economy.advance remote-market scheduler");
+        PatchState registration = marketSchedulerRegistrationState(node,
+                MARKET_SCHEDULER_COMPONENT_ECONOMY, "Economy market scheduler");
         String market = "com/fs/starfarer/api/campaign/econ/MarketAPI";
-        String scheduledDesc = "(L" + market + ";F)V";
+        String scheduledDesc = "(L" + market + ";FI)V";
         List<MethodInsnNode> originals = calls(advance, Opcodes.INVOKEINTERFACE,
                 market, "advance", "(F)V");
-        int beginHooks = countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
-                "beginRemoteMarketFrame", "()V");
-        int scheduleHooks = countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
+        List<MethodInsnNode> hooks = calls(advance, Opcodes.INVOKESTATIC, HOOKS,
                 "advanceMarketScheduled", scheduledDesc);
 
-        boolean patched = originals.isEmpty() && beginHooks == 1 && scheduleHooks == 1;
+        boolean patched = originals.isEmpty() && hooks.size() == 1;
         if (patched) {
-            if (scopeState != PatchState.PATCHED) {
-                throw mismatch("Economy remote-market scheduler hooks exist without their "
-                        + "scratch scope");
+            requireEconomyMarketAdvanceOperands(hooks.get(0), true, 0);
+            if (registration != PatchState.PATCHED) {
+                throw mismatch("Economy market scheduler source lacks component registration");
             }
-            AbstractInsnNode first = firstMeaningful(advance);
-            AbstractInsnNode expected = first;
-            if (first instanceof MethodInsnNode scratch
-                    && callMatches(scratch, Opcodes.INVOKESTATIC, HOOKS,
-                    "beginScratchScope", "()V")) {
-                expected = nextMeaningful(first);
-            }
-            if (!(expected instanceof MethodInsnNode begin)
-                    || !callMatches(begin, Opcodes.INVOKESTATIC, HOOKS,
-                    "beginRemoteMarketFrame", "()V")) {
-                throw mismatch("Economy remote-market frame hook is not at the verified entry point");
-            }
-            requireEconomyMarketAdvanceOperands(only(calls(advance, Opcodes.INVOKESTATIC,
-                    HOOKS, "advanceMarketScheduled", scheduledDesc),
-                    "Economy scheduled market call"));
-            throw already("Economy remote-market scheduler hooks and call-site postcondition match");
+            throw already("Economy market scheduler source postcondition matches");
         }
-
-        if (originals.size() != 1 || beginHooks != 0 || scheduleHooks != 0) {
-            throw mismatch("Economy market-advance call is missing, duplicated, or partially patched");
-        }
-        requireEconomyMarketAdvanceOperands(originals.get(0));
-        boolean scopeInstalled = ensureScratchScope(node.name, advance,
-                "Economy.advance remote-market scheduler");
-
-        MethodInsnNode beginHook = new MethodInsnNode(Opcodes.INVOKESTATIC,
-                HOOKS, "beginRemoteMarketFrame", "()V", false);
-        AbstractInsnNode entry = firstMeaningful(advance);
-        if (entry instanceof MethodInsnNode scratch
-                && callMatches(scratch, Opcodes.INVOKESTATIC, HOOKS,
-                "beginScratchScope", "()V")) {
-            advance.instructions.insert(entry, beginHook);
-        } else {
-            advance.instructions.insertBefore(entry, beginHook);
+        if (originals.size() != 1 || !hooks.isEmpty()
+                || registration == PatchState.PATCHED) {
+            throw mismatch("Economy market scheduler source is missing, duplicated, or partially patched");
         }
         MethodInsnNode original = originals.get(0);
+        requireEconomyMarketAdvanceOperands(original, false, 0);
+        advance.instructions.insertBefore(original, new InsnNode(Opcodes.ICONST_0));
         advance.instructions.set(original, new MethodInsnNode(Opcodes.INVOKESTATIC,
                 HOOKS, "advanceMarketScheduled", scheduledDesc, false));
 
-        requireCount("remote-market frame hooks",
-                countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
-                        "beginRemoteMarketFrame", "()V"), 1);
-        requireCount("remote-market scheduled calls",
+        requireCount("Economy common market scheduler calls",
                 countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
                         "advanceMarketScheduled", scheduledDesc), 1);
+        requireCount("Economy vanilla central calls",
+                countCalls(advance, Opcodes.INVOKEINTERFACE, market,
+                        "advance", "(F)V"), 0);
+        installMarketSchedulerRegistration(node, MARKET_SCHEDULER_COMPONENT_ECONOMY,
+                "Economy market scheduler");
+        if (marketSchedulerRegistrationState(node, MARKET_SCHEDULER_COMPONENT_ECONOMY,
+                "Economy market scheduler") != PatchState.PATCHED) {
+            throw mismatch("Economy market scheduler component registration is absent");
+        }
 
         PatchReport report = new PatchReport();
-        report.add("staggered central market loop", 1);
-        report.add("remote-market reentrancy scope", scopeInstalled ? 1 : 0);
+        report.add("central economy source routed through common market scheduler", 1);
+        report.add("market scheduler economy component registration", 1);
         return report;
     }
 
-    private static void requireEconomyMarketAdvanceOperands(MethodInsnNode call) {
-        AbstractInsnNode amount = previousMeaningful(call);
+
+    /**
+     * Routes rare core create/remove event calls through the immediate debt synchronizer. These
+     * sites are not periodic scheduler sources: they retain their original callback count and only
+     * consume any older pending scheduler amount before the original zero-amount callback.
+     */
+    private PatchReport patchMarketSchedulerCoreEventCalls(ClassNode node) {
+        List<CoreMarketCallSpec> specs = switch (node.name) {
+            case PLANET_SURVEY_PANEL -> List.of(new CoreMarketCallSpec(
+                    "new", "(Ljava/lang/String;Z)V", ReceiverShape.LOCAL, 4));
+            case LUDDIC_PATH_BASE_INTEL, PIRATE_BASE_INTEL -> List.of(
+                    new CoreMarketCallSpec("notifyEnding", "()V", ReceiverShape.THIS_FIELD, -1));
+            case DECIV_TRACKER -> List.of(
+                    new CoreMarketCallSpec("decivilize",
+                            "(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;ZZ)V",
+                            ReceiverShape.LOCAL, 0),
+                    new CoreMarketCallSpec("removeColony",
+                            "(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;Z)V",
+                            ReceiverShape.LOCAL, 0));
+            case PK_CMD -> List.of(new CoreMarketCallSpec(
+                    "convertSentinelToColony",
+                    "(Lcom/fs/starfarer/api/campaign/TextPanelAPI;"
+                            + "Lcom/fs/starfarer/api/campaign/CargoAPI;)Z",
+                    ReceiverShape.LOCAL, 4));
+            default -> throw mismatch("unsupported core market event owner " + node.name);
+        };
+
+        String market = "com/fs/starfarer/api/campaign/econ/MarketAPI";
+        String hookDesc = "(L" + market + ";FI)V";
+        int originalTotal = 0;
+        int hookTotal = 0;
+        for (CoreMarketCallSpec spec : specs) {
+            MethodNode method = requireMethod(node, spec.methodName, spec.methodDesc);
+            List<MethodInsnNode> originals = calls(method, Opcodes.INVOKEINTERFACE,
+                    market, "advance", "(F)V");
+            List<MethodInsnNode> hooks = calls(method, Opcodes.INVOKESTATIC,
+                    HOOKS, "advanceMarketSynchronized", hookDesc);
+            originalTotal += originals.size();
+            hookTotal += hooks.size();
+        }
+
+        boolean originalState = originalTotal == specs.size() && hookTotal == 0;
+        boolean patchedState = originalTotal == 0 && hookTotal == specs.size();
+        if (!originalState && !patchedState) {
+            throw mismatch(node.name + " core market event calls are missing, duplicated, or partial");
+        }
+
+        for (CoreMarketCallSpec spec : specs) {
+            MethodNode method = requireMethod(node, spec.methodName, spec.methodDesc);
+            MethodInsnNode call = (patchedState
+                    ? calls(method, Opcodes.INVOKESTATIC, HOOKS,
+                    "advanceMarketSynchronized", hookDesc)
+                    : calls(method, Opcodes.INVOKEINTERFACE, market,
+                    "advance", "(F)V")).get(0);
+            requireCoreMarketEventOperands(node, call, spec, patchedState);
+            if (!patchedState) {
+                method.instructions.insertBefore(call, new InsnNode(Opcodes.ICONST_2));
+                method.instructions.set(call, new MethodInsnNode(Opcodes.INVOKESTATIC,
+                        HOOKS, "advanceMarketSynchronized", hookDesc, false));
+            }
+        }
+
+        if (patchedState) {
+            throw already(node.name + " core market event synchronization postcondition matches");
+        }
+        requireCount(node.name + " synchronized core event calls",
+                countCalls(node, Opcodes.INVOKESTATIC, HOOKS,
+                        "advanceMarketSynchronized", hookDesc), specs.size());
+        requireCount(node.name + " retired direct core Market.advance calls",
+                countCalls(node, Opcodes.INVOKEINTERFACE, market, "advance", "(F)V"), 0);
+
+        PatchReport report = new PatchReport();
+        report.add("core market event calls synchronized with scheduler debt", specs.size());
+        return report;
+    }
+
+    private static void requireCoreMarketEventOperands(
+            ClassNode node, MethodInsnNode call, CoreMarketCallSpec spec, boolean patched) {
+        AbstractInsnNode source = patched ? previousMeaningful(call) : null;
+        if (patched && !isIntegerLdc(source, 2)) {
+            throw mismatch(node.name + "." + spec.methodName
+                    + " synchronized source is not CORE_EVENT");
+        }
+        AbstractInsnNode amount = previousMeaningful(patched ? source : call);
+        if (amount == null || amount.getOpcode() != Opcodes.FCONST_0) {
+            throw mismatch(node.name + "." + spec.methodName
+                    + " core market event amount is no longer constant zero");
+        }
+        AbstractInsnNode receiver = previousMeaningful(amount);
+        if (spec.receiverShape == ReceiverShape.LOCAL) {
+            if (!(receiver instanceof VarInsnNode load)
+                    || load.getOpcode() != Opcodes.ALOAD || load.var != spec.receiverLocal) {
+                throw mismatch(node.name + "." + spec.methodName
+                        + " core market event receiver local changed");
+            }
+            return;
+        }
+        if (!(receiver instanceof FieldInsnNode field)
+                || field.getOpcode() != Opcodes.GETFIELD
+                || !field.owner.equals(node.name)
+                || !field.desc.equals("Lcom/fs/starfarer/api/campaign/econ/MarketAPI;")) {
+            throw mismatch(node.name + "." + spec.methodName
+                    + " core market event receiver field changed");
+        }
+        AbstractInsnNode owner = previousMeaningful(field);
+        if (!(owner instanceof VarInsnNode load)
+                || load.getOpcode() != Opcodes.ALOAD || load.var != 0) {
+            throw mismatch(node.name + "." + spec.methodName
+                    + " core market event receiver owner changed");
+        }
+    }
+
+    private enum ReceiverShape { LOCAL, THIS_FIELD }
+
+    private record CoreMarketCallSpec(
+            String methodName, String methodDesc, ReceiverShape receiverShape, int receiverLocal) {}
+
+    private static PatchState marketSchedulerRegistrationState(
+            ClassNode node, int component, String label) {
+        List<MethodNode> initializers = methods(node, "<clinit>", "()V");
+        if (initializers.size() > 1) {
+            throw mismatch(label + " has duplicate class initializers");
+        }
+        if (initializers.isEmpty()) return PatchState.ORIGINAL;
+        MethodNode initializer = initializers.get(0);
+        int returns = 0;
+        int matching = 0;
+        int totalHooks = countCalls(initializer, Opcodes.INVOKESTATIC, HOOKS,
+                "registerMarketSchedulerComponent", "(I)V");
+        for (AbstractInsnNode insn : initializer.instructions.toArray()) {
+            if (insn.getOpcode() != Opcodes.RETURN) continue;
+            returns++;
+            AbstractInsnNode callInsn = previousMeaningful(insn);
+            if (!(callInsn instanceof MethodInsnNode call)
+                    || !callMatches(call, Opcodes.INVOKESTATIC, HOOKS,
+                    "registerMarketSchedulerComponent", "(I)V")) continue;
+            AbstractInsnNode source = previousMeaningful(call);
+            if (!isIntegerLdc(source, component)) {
+                throw mismatch(label + " registration component changed");
+            }
+            matching++;
+        }
+        if (totalHooks == 0) return PatchState.ORIGINAL;
+        if (returns > 0 && totalHooks == returns && matching == returns) {
+            return PatchState.PATCHED;
+        }
+        throw mismatch(label + " registration is partial or not on every normal class-init exit");
+    }
+
+    private static void installMarketSchedulerRegistration(
+            ClassNode node, int component, String label) {
+        if (marketSchedulerRegistrationState(node, component, label) != PatchState.ORIGINAL) {
+            throw mismatch(label + " registration is not original");
+        }
+        List<MethodNode> initializers = methods(node, "<clinit>", "()V");
+        MethodNode initializer;
+        if (initializers.isEmpty()) {
+            initializer = new MethodNode(Opcodes.ASM8, Opcodes.ACC_STATIC,
+                    "<clinit>", "()V", null, null);
+            initializer.instructions.add(new InsnNode(Opcodes.RETURN));
+            node.methods.add(initializer);
+        } else {
+            initializer = initializers.get(0);
+        }
+        List<AbstractInsnNode> returns = new ArrayList<>();
+        for (AbstractInsnNode insn : initializer.instructions.toArray()) {
+            if (insn.getOpcode() == Opcodes.RETURN) returns.add(insn);
+        }
+        if (returns.isEmpty()) throw mismatch(label + " class initializer has no normal return");
+        for (AbstractInsnNode exit : returns) {
+            InsnList registration = new InsnList();
+            registration.add(pushInt(component));
+            registration.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                    "registerMarketSchedulerComponent", "(I)V", false));
+            initializer.instructions.insertBefore(exit, registration);
+        }
+    }
+
+    private static void requireEconomyMarketAdvanceOperands(
+            MethodInsnNode call, boolean patched, int expectedSource) {
+        AbstractInsnNode source = patched ? previousMeaningful(call) : null;
+        AbstractInsnNode amount = patched ? previousMeaningful(source) : previousMeaningful(call);
         AbstractInsnNode market = previousMeaningful(amount);
+        if (patched && !isIntegerLdc(source, expectedSource)) {
+            throw mismatch("Economy market scheduler source operand changed structurally");
+        }
         if (!(amount instanceof VarInsnNode amountLoad)
                 || amountLoad.getOpcode() != Opcodes.FLOAD || amountLoad.var != 1
                 || !(market instanceof VarInsnNode marketLoad)
@@ -3431,7 +5326,7 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     }
 
     private PatchReport patchDirectMarketObservationEntry(ClassNode node) {
-        MethodNode method = requireMethod(node, "advance", "(F)V");
+        MethodNode method = marketAdvanceSemanticBody(node);
         String descriptor = "(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;F)V";
         int existing = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
                 "observeMarketAdvanceEntry", descriptor);
@@ -3474,25 +5369,6 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         return report;
     }
 
-    private PatchReport patchMarketSnapshots(ClassNode node) {
-        MethodNode advance = requireMethod(node, "advance", "(F)V");
-        PatchState state = uniformPatchState("Market snapshot reuse",
-                scratchScopeState(node.name, advance, "Market.advance"),
-                immediateArrayListIteratorSnapshotState(advance, 2,
-                        "borrowEconomyCollectionSnapshot",
-                        "Market condition/industry snapshots"));
-        if (state == PatchState.PATCHED) {
-            throw already("all Market snapshot hooks and scopes satisfy their postconditions");
-        }
-        boolean scopeInstalled = ensureScratchScope(node.name, advance, "Market.advance");
-        int changed = replaceImmediateArrayListIteratorSnapshots(node.name, advance, 2,
-                "borrowEconomyCollectionSnapshot", scopeInstalled,
-                "Market condition/industry snapshots");
-        PatchReport report = new PatchReport();
-        report.add("reusable Market condition/industry snapshots", changed);
-        return report;
-    }
-
 
     /**
      * Replaces Market.advance()'s unconditional full commodity-maintenance loop
@@ -3504,7 +5380,7 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         final int stateAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT
                 | Opcodes.ACC_SYNTHETIC;
         final String hookDesc = "(Ljava/lang/Object;Ljava/lang/Object;F)Ljava/lang/Object;";
-        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        MethodNode advance = marketAdvanceSemanticBody(node);
 
         FieldNode existing = null;
         for (FieldNode field : node.fields) {
@@ -5000,75 +6876,6 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         }
     }
 
-    private static int replaceEconomyMarketsSnapshot(MethodNode method, boolean scopeInstalled,
-                                                       String label) {
-        String hookDesc = "(L" + ECONOMY + ";)Ljava/util/List;";
-        List<MethodInsnNode> originals = calls(method, Opcodes.INVOKEVIRTUAL,
-                ECONOMY, "getMarketsCopy", "()Ljava/util/List;");
-        int hooks = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
-                "borrowEconomyMarketsSnapshot", hookDesc);
-        boolean original = originals.size() == 1 && hooks == 0;
-        boolean patched = originals.isEmpty() && hooks == 1;
-        if (patched) {
-            if (scopeInstalled) throw mismatch(label + " hook exists without its scratch scope");
-            throw already(label + " hook is already present");
-        }
-        if (!original) throw mismatch(label + " is missing, duplicated, or partially patched");
-        MethodInsnNode call = originals.get(0);
-        Frame<SourceValue>[] frames = sourceFrames(ECONOMY, method);
-        if (!sourceIsLocal(receiverSource(method, call, frames), Opcodes.ALOAD, 0)) {
-            throw mismatch(label + " receiver is not this");
-        }
-        MethodInsnNode iterator = asMethod(nextMeaningful(call), label + " iterator");
-        requireCall(iterator, Opcodes.INVOKEINTERFACE, "java/util/List", "iterator",
-                "()Ljava/util/Iterator;", label + " iterator");
-        makeStatic(call, HOOKS, "borrowEconomyMarketsSnapshot", hookDesc);
-        return 1;
-    }
-
-    private static int replaceImmediateArrayListIteratorSnapshots(String owner, MethodNode method,
-                                                                   int expected, String hookName,
-                                                                   boolean scopeInstalled,
-                                                                   String label) {
-        String hookDesc = "(Ljava/util/Collection;)Ljava/util/ArrayList;";
-        List<MethodInsnNode> originals = new ArrayList<>();
-        for (MethodInsnNode constructor : calls(method, Opcodes.INVOKESPECIAL,
-                "java/util/ArrayList", "<init>", "(Ljava/util/Collection;)V")) {
-            AbstractInsnNode next = nextMeaningful(constructor);
-            if (next instanceof MethodInsnNode iterator
-                    && callMatches(iterator, Opcodes.INVOKEVIRTUAL,
-                    "java/util/ArrayList", "iterator", "()Ljava/util/Iterator;")) {
-                originals.add(constructor);
-            }
-        }
-        List<MethodInsnNode> hooks = calls(method, Opcodes.INVOKESTATIC,
-                HOOKS, hookName, hookDesc);
-        for (MethodInsnNode hook : hooks) {
-            MethodInsnNode iterator = asMethod(nextMeaningful(hook), label + " patched iterator");
-            requireCall(iterator, Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "iterator",
-                    "()Ljava/util/Iterator;", label + " patched iterator");
-        }
-        boolean original = originals.size() == expected && hooks.isEmpty();
-        boolean patched = originals.isEmpty() && hooks.size() == expected;
-        if (patched) {
-            if (scopeInstalled) throw mismatch(label + " hooks exist without their scratch scope");
-            throw already(label + " hooks are already present");
-        }
-        if (!original) throw mismatch(label + " has mixed, missing, or ambiguous sites");
-
-        Frame<SourceValue>[] frames = sourceFrames(owner, method);
-        for (MethodInsnNode constructor : originals) {
-            AllocationPair pair = allocationPair(method, constructor, frames,
-                    "java/util/ArrayList", label);
-            method.instructions.remove(pair.allocation);
-            method.instructions.remove(pair.duplicate);
-            makeStatic(constructor, HOOKS, hookName, hookDesc);
-        }
-        requireCount(label + " hook count",
-                countCalls(method, Opcodes.INVOKESTATIC, HOOKS, hookName, hookDesc), expected);
-        return expected;
-    }
-
     private PatchReport patchShipAdvanceScratch(ClassNode node) {
         MethodNode advance = requireMethod(node, "advance", "(F)V");
         PatchState state = uniformPatchState("Ship.advance scratch reuse",
@@ -5081,7 +6888,8 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                         "java/util/HashSet", "()V", "borrowShipSet",
                         "()Ljava/util/HashSet;", 2,
                         "Ship.advance command/weapon sets"),
-                shipCommandSnapshotState(node.name, advance));
+                shipCommandSnapshotState(node.name, advance),
+                shipScratchMutationState(advance));
         if (state == PatchState.PATCHED) {
             throw already("all Ship.advance scratch hooks and scopes satisfy their postconditions");
         }
@@ -5094,10 +6902,76 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 "java/util/HashSet", "()V", "borrowShipSet", "()Ljava/util/HashSet;",
                 2, false, "Ship.advance command/weapon sets");
         changed += replaceShipCommandSnapshot(node.name, advance);
+        changed += replaceShipScratchMutations(node.name, advance);
 
         PatchReport report = new PatchReport();
         report.add("reusable Ship.advance command/group collections", changed);
         return report;
+    }
+
+    private static PatchState shipScratchMutationState(MethodNode method) {
+        int rawList = countCalls(method, Opcodes.INVOKEINTERFACE,
+                "java/util/List", "add", "(Ljava/lang/Object;)Z");
+        int rawSet = countCalls(method, Opcodes.INVOKEINTERFACE,
+                "java/util/Set", "add", "(Ljava/lang/Object;)Z");
+        int rawSetAll = countCalls(method, Opcodes.INVOKEINTERFACE,
+                "java/util/Set", "addAll", "(Ljava/util/Collection;)Z");
+        int listHooks = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "scratchListAdd", "(Ljava/util/List;Ljava/lang/Object;)Z");
+        int setHooks = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "scratchSetAdd", "(Ljava/util/Set;Ljava/lang/Object;)Z");
+        int setAllHooks = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "scratchSetAddAll", "(Ljava/util/Set;Ljava/util/Collection;)Z");
+        boolean original = rawList == 4 && rawSet == 1 && rawSetAll == 1
+                && listHooks == 0 && setHooks == 0 && setAllHooks == 0;
+        boolean patched = rawList == 1 && rawSet == 0 && rawSetAll == 0
+                && listHooks == 3 && setHooks == 1 && setAllHooks == 1;
+        if (!original && !patched) {
+            throw mismatch("Ship.advance scratch mutation hooks are partial or changed");
+        }
+        return original ? PatchState.ORIGINAL : PatchState.PATCHED;
+    }
+
+    private static int replaceShipScratchMutations(String owner, MethodNode method) {
+        AllocationSpec listSpec = new AllocationSpec("java/util/ArrayList", "()V",
+                "borrowShipList", "()Ljava/util/ArrayList;", 3);
+        AllocationSpec setSpec = new AllocationSpec("java/util/HashSet", "()V",
+                "borrowShipSet", "()Ljava/util/HashSet;", 2);
+        List<VarInsnNode> listStores = storedHookResultStoresRelaxed(method, listSpec);
+        List<VarInsnNode> setStores = storedHookResultStoresRelaxed(method, setSpec);
+        if (listStores.size() != 3 || setStores.size() != 2) {
+            throw mismatch("Ship.advance scratch mutation locals are ambiguous");
+        }
+        Frame<SourceValue>[] frames = sourceFrames(owner, method);
+        int changed = 0;
+        for (MethodInsnNode call : new ArrayList<>(calls(method, Opcodes.INVOKEINTERFACE,
+                "java/util/List", "add", "(Ljava/lang/Object;)Z"))) {
+            SourceValue receiver = receiverSource(method, call, frames);
+            if (!sourceIsActiveHookLocal(method, call, receiver, listStores)) continue;
+            makeStatic(call, HOOKS, "scratchListAdd",
+                    "(Ljava/util/List;Ljava/lang/Object;)Z");
+            changed++;
+        }
+        for (MethodInsnNode call : new ArrayList<>(calls(method, Opcodes.INVOKEINTERFACE,
+                "java/util/Set", "add", "(Ljava/lang/Object;)Z"))) {
+            SourceValue receiver = receiverSource(method, call, frames);
+            if (!sourceIsActiveHookLocal(method, call, receiver, setStores)) continue;
+            makeStatic(call, HOOKS, "scratchSetAdd",
+                    "(Ljava/util/Set;Ljava/lang/Object;)Z");
+            changed++;
+        }
+        for (MethodInsnNode call : new ArrayList<>(calls(method, Opcodes.INVOKEINTERFACE,
+                "java/util/Set", "addAll", "(Ljava/util/Collection;)Z"))) {
+            SourceValue receiver = receiverSource(method, call, frames);
+            if (!sourceIsActiveHookLocal(method, call, receiver, setStores)) continue;
+            makeStatic(call, HOOKS, "scratchSetAddAll",
+                    "(Ljava/util/Set;Ljava/util/Collection;)Z");
+            changed++;
+        }
+        if (changed != 5 || shipScratchMutationState(method) != PatchState.PATCHED) {
+            throw mismatch("Ship.advance scratch mutation hook postcondition failed");
+        }
+        return changed;
     }
 
     private static int replaceStoredSimpleAllocations(String owner, MethodNode method,
@@ -5189,7 +7063,8 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                         "java/util/ArrayList", "()V", "borrowParticleRemovalList",
                         "()Ljava/util/ArrayList;", 1,
                         "DynamicParticleGroup expired list"),
-                particleCleanupState(advance));
+                particleCleanupState(advance),
+                particleScratchMutationState(advance));
         if (state == PatchState.PATCHED) {
             throw already("all DynamicParticleGroup cleanup hooks and scope postconditions match");
         }
@@ -5199,6 +7074,7 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 "java/util/ArrayList", "()V", "borrowParticleRemovalList",
                 "()Ljava/util/ArrayList;", 1, scopeInstalled,
                 "DynamicParticleGroup expired list");
+        changed += replaceParticleScratchMutation(node.name, advance);
 
         String hookDesc = "(Ljava/util/LinkedList;Ljava/util/Collection;)Z";
         List<MethodInsnNode> raw = calls(advance, Opcodes.INVOKEVIRTUAL,
@@ -5224,60 +7100,37 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         return report;
     }
 
-    private static PatchState economyMarketsSnapshotState(MethodNode method, String label) {
-        String hookDesc = "(L" + ECONOMY + ";)Ljava/util/List;";
-        List<MethodInsnNode> originals = calls(method, Opcodes.INVOKEVIRTUAL,
-                ECONOMY, "getMarketsCopy", "()Ljava/util/List;");
-        List<MethodInsnNode> hooks = calls(method, Opcodes.INVOKESTATIC, HOOKS,
-                "borrowEconomyMarketsSnapshot", hookDesc);
-        boolean original = originals.size() == 1 && hooks.isEmpty();
-        boolean patched = originals.isEmpty() && hooks.size() == 1;
+    private static PatchState particleScratchMutationState(MethodNode method) {
+        int raw = countCalls(method, Opcodes.INVOKEINTERFACE,
+                "java/util/List", "add", "(Ljava/lang/Object;)Z");
+        int hooks = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "scratchListAdd", "(Ljava/util/List;Ljava/lang/Object;)Z");
+        boolean original = raw == 1 && hooks == 0;
+        boolean patched = raw == 0 && hooks == 1;
         if (!original && !patched) {
-            throw mismatch(label + " is missing, duplicated, or partially patched");
+            throw mismatch("DynamicParticleGroup scratch mutation hook is partial or changed");
         }
-
-        Frame<SourceValue>[] frames = sourceFrames(ECONOMY, method);
-        MethodInsnNode snapshot = original ? originals.get(0) : hooks.get(0);
-        SourceValue economy = original
-                ? receiverSource(method, snapshot, frames)
-                : argumentSource(method, snapshot, frames, 0);
-        if (!sourceIsLocal(economy, Opcodes.ALOAD, 0)) {
-            throw mismatch(label + " Economy source is not this");
-        }
-        MethodInsnNode iterator = asMethod(nextMeaningful(snapshot), label + " iterator");
-        requireCall(iterator, Opcodes.INVOKEINTERFACE, "java/util/List", "iterator",
-                "()Ljava/util/Iterator;", label + " iterator");
         return original ? PatchState.ORIGINAL : PatchState.PATCHED;
     }
 
-    private static PatchState immediateArrayListIteratorSnapshotState(MethodNode method,
-                                                                        int expected,
-                                                                        String hookName,
-                                                                        String label) {
-        String hookDesc = "(Ljava/util/Collection;)Ljava/util/ArrayList;";
-        List<MethodInsnNode> originals = new ArrayList<>();
-        for (MethodInsnNode constructor : calls(method, Opcodes.INVOKESPECIAL,
-                "java/util/ArrayList", "<init>", "(Ljava/util/Collection;)V")) {
-            AbstractInsnNode next = nextMeaningful(constructor);
-            if (next instanceof MethodInsnNode iterator
-                    && callMatches(iterator, Opcodes.INVOKEVIRTUAL,
-                    "java/util/ArrayList", "iterator", "()Ljava/util/Iterator;")) {
-                originals.add(constructor);
-            }
+    private static int replaceParticleScratchMutation(String owner, MethodNode method) {
+        AllocationSpec spec = new AllocationSpec("java/util/ArrayList", "()V",
+                "borrowParticleRemovalList", "()Ljava/util/ArrayList;", 1);
+        List<VarInsnNode> stores = storedHookResultStoresRelaxed(method, spec);
+        if (stores.size() != 1) throw mismatch("particle scratch local is ambiguous");
+        Frame<SourceValue>[] frames = sourceFrames(owner, method);
+        List<MethodInsnNode> raw = calls(method, Opcodes.INVOKEINTERFACE,
+                "java/util/List", "add", "(Ljava/lang/Object;)Z");
+        if (raw.size() != 1 || !sourceIsActiveHookLocal(method, raw.get(0),
+                receiverSource(method, raw.get(0), frames), stores)) {
+            throw mismatch("particle scratch List.add receiver changed");
         }
-        List<MethodInsnNode> hooks = calls(method, Opcodes.INVOKESTATIC,
-                HOOKS, hookName, hookDesc);
-        for (MethodInsnNode hook : hooks) {
-            MethodInsnNode iterator = asMethod(nextMeaningful(hook), label + " patched iterator");
-            requireCall(iterator, Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "iterator",
-                    "()Ljava/util/Iterator;", label + " patched iterator");
+        makeStatic(raw.get(0), HOOKS, "scratchListAdd",
+                "(Ljava/util/List;Ljava/lang/Object;)Z");
+        if (particleScratchMutationState(method) != PatchState.PATCHED) {
+            throw mismatch("particle scratch peak hook postcondition failed");
         }
-        boolean original = originals.size() == expected && hooks.isEmpty();
-        boolean patched = originals.isEmpty() && hooks.size() == expected;
-        if (!original && !patched) {
-            throw mismatch(label + " has mixed, missing, or ambiguous sites");
-        }
-        return original ? PatchState.ORIGINAL : PatchState.PATCHED;
+        return 1;
     }
 
     private static PatchState storedSimpleAllocationState(MethodNode method,
@@ -5505,6 +7358,125 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     // ---------------------------------------------------------------------
     // Structural matcher and verifier helpers
     // ---------------------------------------------------------------------
+
+    private static PatchState marketSchedulerBatchBoundaryState(
+            MethodNode method, String label) {
+        String desc = "(Z)V";
+        List<MethodInsnNode> hooks = calls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "marketSchedulerFastForwardIterationChanged", desc);
+        if (hooks.isEmpty()) return PatchState.ORIGINAL;
+        requireCount(label + " hooks", hooks.size(), 1);
+        MethodInsnNode hook = hooks.get(0);
+        AbstractInsnNode source = previousMeaningful(hook);
+        AbstractInsnNode next = nextMeaningful(hook);
+        if (!(source instanceof VarInsnNode load) || load.getOpcode() != Opcodes.ILOAD
+                || load.var != 1 || next == null || next.getOpcode() != Opcodes.RETURN) {
+            throw mismatch(label + " hook is not the final use of the boolean argument");
+        }
+        requireCount(label + " returns", countReturnOpcodes(method), 1);
+        return PatchState.PATCHED;
+    }
+
+    private static void installMarketSchedulerBatchBoundary(MethodNode method, String label) {
+        if (marketSchedulerBatchBoundaryState(method, label) != PatchState.ORIGINAL) {
+            throw mismatch(label + " is not original");
+        }
+        AbstractInsnNode returnInsn = null;
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn.getOpcode() != Opcodes.RETURN) continue;
+            if (returnInsn != null) throw mismatch(label + " has multiple returns");
+            returnInsn = insn;
+        }
+        if (returnInsn == null) throw mismatch(label + " has no return");
+        InsnList hook = new InsnList();
+        hook.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        hook.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "marketSchedulerFastForwardIterationChanged", "(Z)V", false));
+        method.instructions.insertBefore(returnInsn, hook);
+        if (marketSchedulerBatchBoundaryState(method, label) != PatchState.PATCHED) {
+            throw mismatch(label + " installation postcondition failed");
+        }
+    }
+
+    private static PatchState marketSchedulerTickScopeState(
+            String owner, MethodNode method, String label) {
+        int begins = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "beginMarketSchedulerTick", "()V");
+        int ends = countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "endMarketSchedulerTick", "()V");
+        if (begins == 0 && ends == 0) return PatchState.ORIGINAL;
+        requireCount(label + " begin hooks", begins, 1);
+        requireCount(label + " end hooks", ends, countReturnOpcodes(method) + 1);
+        MethodInsnNode begin = only(calls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "beginMarketSchedulerTick", "()V"), label + " begin hook");
+        if (firstMeaningful(method) != begin) {
+            throw mismatch(label + " does not begin at method entry");
+        }
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (!isReturnOpcode(insn.getOpcode())) continue;
+            AbstractInsnNode previous = previousMeaningful(insn);
+            if (!(previous instanceof MethodInsnNode call)
+                    || !callMatches(call, Opcodes.INVOKESTATIC, HOOKS,
+                    "endMarketSchedulerTick", "()V")) {
+                throw mismatch(label + " return is not protected by endMarketSchedulerTick");
+            }
+        }
+        int handlers = 0;
+        for (TryCatchBlockNode block : method.tryCatchBlocks) {
+            if (block.type != null) continue;
+            AbstractInsnNode handlerStart = nextMeaningful(block.handler);
+            if (!(handlerStart instanceof MethodInsnNode call)
+                    || !callMatches(call, Opcodes.INVOKESTATIC, HOOKS,
+                    "endMarketSchedulerTick", "()V")) continue;
+            AbstractInsnNode rethrow = nextMeaningful(call);
+            if (rethrow != null && rethrow.getOpcode() == Opcodes.ATHROW) handlers++;
+        }
+        requireCount(label + " catch-all", handlers, 1);
+        return PatchState.PATCHED;
+    }
+
+    private static void installMarketSchedulerTickScope(
+            String owner, MethodNode method, String label) {
+        if (marketSchedulerTickScopeState(owner, method, label) != PatchState.ORIGINAL) {
+            throw mismatch(label + " is not original");
+        }
+        if (method.instructions == null || method.instructions.getFirst() == null
+                || method.name.equals("<init>")) {
+            throw mismatch(label + " has no patchable code");
+        }
+        AbstractInsnNode oldFirst = method.instructions.getFirst();
+        LabelNode entry = new LabelNode();
+        LabelNode start = new LabelNode();
+        method.instructions.insertBefore(oldFirst, entry);
+        MethodInsnNode begin = new MethodInsnNode(Opcodes.INVOKESTATIC,
+                HOOKS, "beginMarketSchedulerTick", "()V", false);
+        method.instructions.insert(entry, begin);
+        method.instructions.insert(begin, start);
+
+        int returns = 0;
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (!isReturnOpcode(insn.getOpcode())) continue;
+            method.instructions.insertBefore(insn, new MethodInsnNode(Opcodes.INVOKESTATIC,
+                    HOOKS, "endMarketSchedulerTick", "()V", false));
+            returns++;
+        }
+        if (returns == 0) throw mismatch(label + " has no normal return");
+
+        LabelNode end = new LabelNode();
+        LabelNode handler = new LabelNode();
+        method.instructions.add(end);
+        method.instructions.add(handler);
+        Object[] initialLocals = initialFrameLocals(owner, method);
+        method.instructions.add(new FrameNode(Opcodes.F_FULL, initialLocals.length, initialLocals,
+                1, new Object[] {"java/lang/Throwable"}));
+        method.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                HOOKS, "endMarketSchedulerTick", "()V", false));
+        method.instructions.add(new InsnNode(Opcodes.ATHROW));
+        method.tryCatchBlocks.add(new TryCatchBlockNode(start, end, handler, null));
+        if (marketSchedulerTickScopeState(owner, method, label) != PatchState.PATCHED) {
+            throw mismatch(label + " installation postcondition failed");
+        }
+    }
 
     private static boolean ensureScratchScope(String owner, MethodNode method, String label) {
         if (scratchScopeState(owner, method, label) == PatchState.ORIGINAL) {
@@ -5847,6 +7819,40 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         return fromAssignment;
     }
 
+    private static PatchState scratchAllocationGroupState(
+            String owner, MethodNode method, List<AllocationSpec> specs, String label) {
+        boolean allOriginal = true;
+        boolean allPatched = true;
+        List<List<AllocationPlan>> plans = new ArrayList<>();
+        List<List<Integer>> hookedLocals = new ArrayList<>();
+        for (AllocationSpec spec : specs) {
+            List<AllocationPlan> found = allocationPlans(owner, method, spec);
+            List<Integer> locals = storedHookResultLocals(method, spec);
+            allOriginal &= found.size() == spec.expected && locals.isEmpty();
+            allPatched &= found.isEmpty() && locals.size() == spec.expected;
+            plans.add(found);
+            hookedLocals.add(locals);
+        }
+        if (!allOriginal && !allPatched) {
+            throw mismatch(label + " has mixed, missing, or ambiguous allocation/hook sites");
+        }
+        for (int i = 0; i < specs.size(); i++) {
+            AllocationSpec spec = specs.get(i);
+            if (allOriginal) {
+                for (int j = 0; j < plans.get(i).size(); j++) {
+                    requireScratchUseContract(owner, method, plans.get(i).get(j).local,
+                            spec, j, label);
+                }
+            } else {
+                for (int j = 0; j < hookedLocals.get(i).size(); j++) {
+                    requireScratchUseContract(owner, method, hookedLocals.get(i).get(j),
+                            spec, j, label);
+                }
+            }
+        }
+        return allOriginal ? PatchState.ORIGINAL : PatchState.PATCHED;
+    }
+
     private static int replaceAllocationGroup(String owner, MethodNode method,
                                               List<AllocationSpec> specs, boolean scopeInstalled,
                                               String label) {
@@ -5956,6 +7962,64 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         return result;
     }
 
+    /**
+     * Returns the immediate stores for scratch-borrow hooks without requiring the JVM local
+     * slot to remain single-assignment for the entire method. Large vanilla methods such as
+     * Ship.advance reuse local slots after the scratch collection's lifetime. Mutation hooks
+     * therefore use {@link #sourceIsActiveHookLocal} to prove that a call is still inside the
+     * borrow-to-reassignment lease instead of rejecting safe slot reuse.
+     */
+    private static List<VarInsnNode> storedHookResultStoresRelaxed(MethodNode method,
+                                                                    AllocationSpec spec) {
+        List<MethodInsnNode> hooks = calls(method, Opcodes.INVOKESTATIC,
+                HOOKS, spec.hookName, spec.hookDesc);
+        if (hooks.size() != spec.expected) {
+            throw mismatch(spec.hookName + " expected " + spec.expected
+                    + " stored results but found " + hooks.size());
+        }
+        List<VarInsnNode> result = new ArrayList<>();
+        Set<Integer> locals = new HashSet<>();
+        for (MethodInsnNode hook : hooks) {
+            AbstractInsnNode next = nextMeaningful(hook);
+            if (!(next instanceof VarInsnNode store) || store.getOpcode() != Opcodes.ASTORE) {
+                throw mismatch(spec.hookName + " result is not stored directly in one local");
+            }
+            if (!locals.add(store.var)) {
+                throw mismatch(spec.hookName + " stores multiple borrowed values in local "
+                        + store.var);
+            }
+            result.add(store);
+        }
+        return result;
+    }
+
+    /**
+     * Proves that the receiver comes from one of the borrowed scratch locals and that no later
+     * ASTORE to that local occurs between the borrow and this call. This keeps observation hooks
+     * inside the exact lifetime of the borrowed collection even when vanilla reuses the slot.
+     */
+    private static boolean sourceIsActiveHookLocal(MethodNode method, MethodInsnNode call,
+                                                    SourceValue receiver,
+                                                    List<VarInsnNode> hookStores) {
+        int callIndex = method.instructions.indexOf(call);
+        for (VarInsnNode store : hookStores) {
+            if (!sourceIsLocal(receiver, Opcodes.ALOAD, store.var)) continue;
+            int storeIndex = method.instructions.indexOf(store);
+            if (storeIndex < 0 || storeIndex >= callIndex) continue;
+            boolean reassigned = false;
+            for (AbstractInsnNode cursor = store.getNext(); cursor != null && cursor != call;
+                 cursor = cursor.getNext()) {
+                if (cursor instanceof VarInsnNode var
+                        && var.getOpcode() == Opcodes.ASTORE && var.var == store.var) {
+                    reassigned = true;
+                    break;
+                }
+            }
+            if (!reassigned) return true;
+        }
+        return false;
+    }
+
     private static void requireScratchUseContract(String owner, MethodNode method, int local,
                                                   AllocationSpec spec, int ordinal, String label) {
         Frame<SourceValue>[] frames = sourceFrames(owner, method);
@@ -6028,6 +8092,24 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                     && call.desc.equals("(Ljava/util/Set;Ljava/util/Collection;Ljava/lang/Object;)Z")
                     && position == 1;
             if (collectionOperation || optimizedOperation) return "safe-collection-membership-consumer";
+        }
+        if (call.getOpcode() == Opcodes.INVOKESTATIC && call.owner.equals(HOOKS)
+                && position == 0) {
+            if (call.name.equals("scratchListAdd")
+                    && call.desc.equals("(Ljava/util/List;Ljava/lang/Object;)Z")) {
+                return Opcodes.INVOKEINTERFACE + "|java/util/List|add|"
+                        + "(Ljava/lang/Object;)Z|receiver";
+            }
+            if (call.name.equals("scratchSetAdd")
+                    && call.desc.equals("(Ljava/util/Set;Ljava/lang/Object;)Z")) {
+                return Opcodes.INVOKEINTERFACE + "|java/util/Set|add|"
+                        + "(Ljava/lang/Object;)Z|receiver";
+            }
+            if (call.name.equals("scratchSetAddAll")
+                    && call.desc.equals("(Ljava/util/Set;Ljava/util/Collection;)Z")) {
+                return Opcodes.INVOKEINTERFACE + "|java/util/Set|addAll|"
+                        + "(Ljava/util/Collection;)Z|receiver";
+            }
         }
         String name = call.name;
         String vectorDesc = "(Lorg/lwjgl/util/vector/Vector2f;Lorg/lwjgl/util/vector/Vector2f;)F";
@@ -6750,6 +8832,16 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         return value != null && value.insns != null && value.insns.contains(source);
     }
 
+    private static MethodNode optionalMethod(ClassNode node, String name, String desc) {
+        MethodNode found = null;
+        for (MethodNode method : node.methods) {
+            if (!method.name.equals(name) || !method.desc.equals(desc)) continue;
+            if (found != null) throw mismatch("duplicate method " + name + desc);
+            found = method;
+        }
+        return found;
+    }
+
     private static MethodNode requireMethod(ClassNode node, String name, String desc) {
         List<MethodNode> found = methods(node, name, desc);
         if (found.size() != 1) {
@@ -6857,6 +8949,12 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         if (actual != expected) throw mismatch(label + ": expected " + expected + ", found " + actual);
     }
 
+    private static void requireState(String label, PatchState actual, PatchState expected) {
+        if (actual != expected) {
+            throw mismatch(label + ": expected " + expected + ", found " + actual);
+        }
+    }
+
     private static void requireCountAtLeast(String label, int actual, int minimum) {
         if (actual < minimum) throw mismatch(label + ": expected at least " + minimum + ", found " + actual);
     }
@@ -6959,6 +9057,10 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         return new AlreadyPatchedException(message);
     }
 
+    private static CompositionMismatchException composition(String message) {
+        return new CompositionMismatchException(message);
+    }
+
     @FunctionalInterface
     private interface PatchAction {
         PatchReport apply(ClassNode node);
@@ -6969,17 +9071,32 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         int apply(ClassNode node);
     }
 
+    @FunctionalInterface
+    private interface PatchPostcondition {
+        void validate(byte[] bytes);
+    }
+
     private static final class TransformState {
         final String className;
+        final byte[] incomingBytes;
         byte[] bytes;
         boolean changed;
+        boolean compositionFailed;
         final List<String> appliedDetails = new ArrayList<>();
+        final List<AppliedPatch> applied = new ArrayList<>();
+        final PresentationStructuralContract.State presentationComposition;
 
-        TransformState(String className, byte[] bytes) {
+        TransformState(String className, byte[] bytes,
+                       PresentationStructuralContract.State presentationComposition) {
             this.className = className;
+            this.incomingBytes = bytes;
             this.bytes = bytes;
+            this.presentationComposition = presentationComposition;
         }
     }
+
+    private record AppliedPatch(String patchId, PatchPostcondition postcondition,
+                                String detail, boolean newlyApplied) {}
 
     private record LogBlock(MethodNode method, AbstractInsnNode start, AbstractInsnNode end) {}
 
@@ -6998,6 +9115,15 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     private record AllocationPair(TypeInsnNode allocation, AbstractInsnNode duplicate) {}
     private record PersistentSnapshotPlan(MethodInsnNode constructor, AllocationPair allocation,
                                           AbstractInsnNode sourceReceiver, String accessor) {}
+
+    private record EconomyAdvancePatchPlan(
+            int featureMask, byte[] plannedBytes, PatchReport report) {}
+
+    private record MarketAdvancePatchPlan(
+            int featureMask, byte[] plannedBytes, PatchReport report) {}
+
+    private record SaveMethodPatchPlan(
+            int featureMask, byte[] plannedBytes, PatchReport report) {}
 
     private enum PatchState { ORIGINAL, PATCHED }
 
@@ -7023,5 +9149,9 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
 
     private static final class AlreadyPatchedException extends RuntimeException {
         AlreadyPatchedException(String message) { super(message); }
+    }
+
+    private static final class CompositionMismatchException extends RuntimeException {
+        CompositionMismatchException(String message) { super(message); }
     }
 }

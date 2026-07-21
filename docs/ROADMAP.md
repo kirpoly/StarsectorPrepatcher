@@ -1,6 +1,6 @@
 # Технический roadmap
 
-Статус: план работ после dormant-industry выпуска `0.9.5`. Persistent economy snapshots, ordered
+Статус: план работ после выпуска `0.10.0`. Persistent economy snapshots, ordered
 commodity active set, direct expiry-aware temp-mod scheduler и direct dormant `BaseIndustry` fast
 path выпущены в одном unified agent;
 рабочая цель следующего архитектурного milestone — `0.10.0`. Срок выпуска этим документом не

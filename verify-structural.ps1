@@ -86,6 +86,7 @@ foreach ($key in @('patch.loadingTextReader', 'patch.startupLogAggregation')) {
         $pattern,
         { param($match) "$key=true" + $match.Groups[1].Value })
 }
+$verificationText += "`npatch.directMarketObservation=true`nlogging.statsIntervalSeconds=1`n"
 [IO.File]::WriteAllText(
     $verificationConfig,
     "# Generated for structural coverage only; never shipped or used by startup smoke.`n" +
@@ -105,6 +106,68 @@ $structuralLines = @($structuralOutput | ForEach-Object { $_.ToString() })
 $structuralLines
 [IO.File]::WriteAllLines($structuralReport, [string[]] $structuralLines, $utf8)
 if ($structuralExitCode -ne 0) { throw 'Structural compatibility verification failed.' }
+
+$coreWorldsStructuralReport = Join-Path $reportDir 'core-worlds-structural-matcher.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $coreWorldsStructuralOutput = @(& java @exports -cp $classPath `
+        com.starsector.prepatcher.agent.CoreWorldsStructuralMatcherTest `
+        $verificationConfig (Join-Path $core 'starfarer.api.jar') 2>&1)
+    $coreWorldsStructuralExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$coreWorldsStructuralLines = @(
+    $coreWorldsStructuralOutput | ForEach-Object { $_.ToString() })
+$coreWorldsStructuralLines
+[IO.File]::WriteAllLines(
+    $coreWorldsStructuralReport,
+    [string[]] $coreWorldsStructuralLines,
+    $utf8)
+if ($coreWorldsStructuralExitCode -ne 0) {
+    throw 'Core-worlds structural matcher verification failed.'
+}
+
+$presentationStructuralPlanReport =
+    Join-Path $reportDir 'fast-forward-presentation-structural-plan.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $presentationStructuralPlanOutput = @(& java @exports -cp $classPath `
+        com.starsector.prepatcher.agent.FastForwardPresentationStructuralPlanTest 2>&1)
+    $presentationStructuralPlanExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$presentationStructuralPlanLines = @(
+    $presentationStructuralPlanOutput | ForEach-Object { $_.ToString() })
+$presentationStructuralPlanLines
+[IO.File]::WriteAllLines(
+    $presentationStructuralPlanReport,
+    [string[]] $presentationStructuralPlanLines,
+    $utf8)
+if ($presentationStructuralPlanExitCode -ne 0) {
+    throw 'Fast-forward presentation structural-plan verification failed.'
+}
+
+$presentationCompatibilityReport = Join-Path $reportDir 'fast-forward-presentation-compatibility.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $presentationCompatibilityOutput = @(& java @exports -cp $classPath `
+        com.starsector.prepatcher.agent.FastForwardPresentationCompatibilityTest `
+        (Join-Path $core 'starfarer_obf.jar') `
+        (Join-Path $core 'starfarer.api.jar') 2>&1)
+    $presentationCompatibilityExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$presentationCompatibilityLines = @(
+    $presentationCompatibilityOutput | ForEach-Object { $_.ToString() })
+$presentationCompatibilityLines
+[IO.File]::WriteAllLines(
+    $presentationCompatibilityReport, [string[]] $presentationCompatibilityLines, $utf8)
+if ($presentationCompatibilityExitCode -ne 0) {
+    throw 'Fast-forward presentation compatibility verification failed.'
+}
 
 $directMarketTransformerReport = Join-Path $reportDir 'direct-market-transformer.txt'
 $ErrorActionPreference = 'Continue'
@@ -141,9 +204,11 @@ $runtimeReport = Join-Path $reportDir 'runtime-regression.txt'
 $runtimeLines = [System.Collections.Generic.List[string]]::new()
 foreach ($test in @(
     'com.starsector.prepatcher.runtime.LifecycleGcRegressionTest',
+    'com.starsector.prepatcher.runtime.CacheMaintenanceRuntimeTest',
+    'com.starsector.prepatcher.runtime.CoreWorldsRuntimeRegressionTest',
     'com.starsector.prepatcher.runtime.Exp6RuntimeRegressionTest',
     'com.starsector.prepatcher.runtime.Exp8RuntimeRegressionTest',
-    'com.starsector.prepatcher.runtime.RemoteMarketSchedulerRuntimeTest',
+    'com.starsector.prepatcher.runtime.MarketSchedulerRuntimeTest',
     'com.starsector.prepatcher.runtime.DirectMarketObservationRuntimeTest',
     'com.starsector.prepatcher.runtime.PersistentEconomyRuntimeRegressionTest',
     'com.starsector.prepatcher.runtime.MarketNoOpRuntimeRegressionTest',
@@ -167,7 +232,71 @@ foreach ($test in @(
 $runtimeLines
 [IO.File]::WriteAllLines($runtimeReport, $runtimeLines, $utf8)
 
+$presentationRuntimeReport = Join-Path $reportDir 'fast-forward-presentation-runtime.txt'
+$presentationRuntimeLines = [System.Collections.Generic.List[string]]::new()
+foreach ($test in @(
+    'com.fs.starfarer.api.FastForwardPresentationRuntimeTest',
+    'com.starsector.prepatcher.agent.FastForwardPresentationLoadedTargetPolicyTest'
+)) {
+    $presentationRuntimeLines.Add("== $test ==")
+    $ErrorActionPreference = 'Continue'
+    try {
+        $presentationRuntimeOutput = @(& java -noverify -cp $runtimeCp $test 2>&1)
+        $presentationRuntimeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
+    $presentationRuntimeLines.AddRange([string[]] @(
+        $presentationRuntimeOutput | ForEach-Object { $_.ToString() }))
+    if ($presentationRuntimeExitCode -ne 0) {
+        [IO.File]::WriteAllLines(
+            $presentationRuntimeReport, $presentationRuntimeLines, $utf8)
+        throw "Fast-forward presentation runtime test failed: $test"
+    }
+}
+$presentationRuntimeLines
+[IO.File]::WriteAllLines(
+    $presentationRuntimeReport, $presentationRuntimeLines, $utf8)
+
 $mainAgentJar = Join-Path $modRoot 'agent\StarsectorPrepatcherAgent.jar'
+$coreWorldsAgentReport = Join-Path $reportDir 'core-worlds-actual-agent.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $coreWorldsAgentOutput = @(& java `
+        "-javaagent:$mainAgentJar=config=$(Join-Path $modRoot 'profiles\aggressive.properties')" `
+        -cp $runtimeCp `
+        com.starsector.prepatcher.runtime.CoreWorldsActualAgentSmokeTest 2>&1)
+    $coreWorldsAgentExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$coreWorldsAgentLines = @($coreWorldsAgentOutput | ForEach-Object { $_.ToString() })
+$coreWorldsAgentLines
+[IO.File]::WriteAllLines(
+    $coreWorldsAgentReport, [string[]] $coreWorldsAgentLines, $utf8)
+if ($coreWorldsAgentExitCode -ne 0) {
+    throw 'Core-worlds actual-agent smoke failed.'
+}
+
+$presentationAgentReport = Join-Path $reportDir 'fast-forward-presentation-actual-agent.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $presentationAgentOutput = @(& java -noverify `
+        "-javaagent:$mainAgentJar=config=$(Join-Path $modRoot 'profiles\aggressive.properties')" `
+        -cp $runtimeCp `
+        com.starsector.prepatcher.runtime.FastForwardPresentationActualAgentSmokeTest 2>&1)
+    $presentationAgentExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$presentationAgentLines = @($presentationAgentOutput | ForEach-Object { $_.ToString() })
+$presentationAgentLines
+[IO.File]::WriteAllLines(
+    $presentationAgentReport, [string[]] $presentationAgentLines, $utf8)
+if ($presentationAgentExitCode -ne 0) {
+    throw 'Fast-forward presentation actual-agent smoke failed.'
+}
+
 $tempModAgentReport = Join-Path $reportDir 'temp-mod-actual-agent-smoke.txt'
 $ErrorActionPreference = 'Continue'
 try {
@@ -183,6 +312,25 @@ $tempModAgentLines = @($tempModAgentOutput | ForEach-Object { $_.ToString() })
 $tempModAgentLines
 [IO.File]::WriteAllLines($tempModAgentReport, [string[]] $tempModAgentLines, $utf8)
 if ($tempModAgentExitCode -ne 0) { throw 'Temp-mod actual-agent smoke failed.' }
+
+$marketStepReplayReport = Join-Path $reportDir 'market-step-replay-actual-agent-smoke.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $marketStepReplayOutput = @(& java `
+        '-Dstarsector.prepatcher.sessionOrigin=market-step-replay-smoke' `
+        "-javaagent:$mainAgentJar" -cp $runtimeCp `
+        com.starsector.prepatcher.runtime.MarketStepReplayActualAgentSmokeTest 2>&1)
+    $marketStepReplayExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$marketStepReplayLines = @($marketStepReplayOutput | ForEach-Object { $_.ToString() })
+$marketStepReplayLines
+[IO.File]::WriteAllLines(
+    $marketStepReplayReport, [string[]] $marketStepReplayLines, $utf8)
+if ($marketStepReplayExitCode -ne 0) {
+    throw 'Market step-replay actual-agent smoke failed.'
+}
 
 $commoditySmokeConfig = Join-Path $build 'commodity-temporal-agent-smoke.properties'
 $commoditySmokeText = [IO.File]::ReadAllText((Join-Path $modRoot 'prepatcher.properties'))

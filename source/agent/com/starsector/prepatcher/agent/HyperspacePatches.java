@@ -22,127 +22,138 @@ final class HyperspacePatches {
     static AbstractInsnNode nextReal(AbstractInsnNode n){for(n=n.getNext();n!=null && (n instanceof LabelNode||n instanceof LineNumberNode||n instanceof FrameNode);n=n.getNext());return n;}
     static AbstractInsnNode prevReal(AbstractInsnNode n){for(n=n.getPrevious();n!=null && (n instanceof LabelNode||n instanceof LineNumberNode||n instanceof FrameNode);n=n.getPrevious());return n;}
     /**
-     * Fix the decompiled-source-equivalent yEnd expression which loads viewport
-     * width for the vertical range. The base implementation is patched directly,
-     * so every subclass inherits the corrected behavior as requested.
+     * Atomically correct the two coupled defects in BaseTiledTerrain's vertical viewport bounds:
+     * yEnd must use visible height, and the yEnd clamp must use the inner tile-array dimension.
+     *
+     * The two changes share one semantic expression and therefore one transformation surface. All
+     * expected methods are analyzed before either instruction is changed. A partial or ambiguous
+     * input returns zero and leaves the ClassNode untouched.
      */
-    static int patchCull(ClassNode cn){
-        int total=0;
-        for(MethodNode m:cn.methods){
-            int w=-1,h=-1; AbstractInsnNode afterHeight=null;
-            for(AbstractInsnNode n=m.instructions.getFirst();n!=null;n=n.getNext()){
-                if(!(n instanceof MethodInsnNode q)) continue;
-                if(q.name.equals("getVisibleWidth") && q.desc.equals("()F")){
-                    AbstractInsnNode store=nextReal(q);
-                    if(store instanceof VarInsnNode v && v.getOpcode()==Opcodes.FSTORE) w=v.var;
-                } else if(q.name.equals("getVisibleHeight") && q.desc.equals("()F")){
-                    AbstractInsnNode store=nextReal(q);
-                    if(store instanceof VarInsnNode v && v.getOpcode()==Opcodes.FSTORE){h=v.var;afterHeight=store;}
-                }
-            }
-            if(w<0 || h<0 || afterHeight==null) continue;
-            ArrayList<VarInsnNode> widthLoads=new ArrayList<>();
-            for(AbstractInsnNode n=afterHeight.getNext();n!=null;n=n.getNext())
-                if(n instanceof VarInsnNode v && v.getOpcode()==Opcodes.FLOAD && v.var==w) widthLoads.add(v);
-            // In BaseTiledTerrain.render()/isTileVisible(): viewport intersection,
-            // xEnd, then the erroneous yEnd. Refuse fuzzy matches.
-            if(widthLoads.size()!=3) continue;
-            widthLoads.get(2).var=h;
-            total++;
+    static int patchViewportBounds(ClassNode cn){
+        ArrayList<ViewportBoundsCandidate> candidates=new ArrayList<>();
+        for(MethodNode method:cn.methods){
+            ViewportBoundsCandidate candidate=originalViewportBoundsCandidate(method);
+            if(candidate!=null)candidates.add(candidate);
         }
-        return total;
-    }
-
-    static int countPatchedCull(ClassNode cn){
-        int total=0;
-        for(MethodNode m:cn.methods){
-            int w=-1,h=-1;AbstractInsnNode afterHeight=null;
-            for(AbstractInsnNode n=m.instructions.getFirst();n!=null;n=n.getNext()){
-                if(!(n instanceof MethodInsnNode q))continue;
-                AbstractInsnNode store=nextReal(q);
-                if(!(store instanceof VarInsnNode v)||v.getOpcode()!=Opcodes.FSTORE)continue;
-                if(q.name.equals("getVisibleWidth")&&q.desc.equals("()F"))w=v.var;
-                else if(q.name.equals("getVisibleHeight")&&q.desc.equals("()F")){h=v.var;afterHeight=store;}
-            }
-            if(w<0||h<0||afterHeight==null)continue;
-            int widthLoads=0,heightLoads=0;
-            for(AbstractInsnNode n=afterHeight.getNext();n!=null;n=n.getNext()){
-                if(!(n instanceof VarInsnNode v)||v.getOpcode()!=Opcodes.FLOAD)continue;
-                if(v.var==w)widthLoads++;else if(v.var==h)heightLoads++;
-            }
-            if(widthLoads==2&&heightLoads==2)total++;
-        }
-        return total;
-    }
-
-    /**
-     * Fix only the second end-index comparison in viewport methods:
-     * yEnd must be compared with tiles[0].length, not tiles.length.
-     * The replacement is direct bytecode (AALOAD/ARRAYLENGTH), with no
-     * per-frame reflection/helper overhead.
-     */
-    static int patchClamp(ClassNode cn){
-        int total=0;
-        for(MethodNode m:cn.methods){
-            boolean viewportMethod=false;
-            for(AbstractInsnNode n=m.instructions.getFirst();n!=null;n=n.getNext()){
-                if(n instanceof MethodInsnNode q && q.name.equals("getVisibleHeight") && q.desc.equals("()F")){
-                    viewportMethod=true; break;
-                }
-            }
-            if(!viewportMethod) continue;
-            ArrayList<InsnNode> endComparisons=new ArrayList<>();
-            for(AbstractInsnNode n=m.instructions.getFirst();n!=null;n=n.getNext()){
-                if(!(n instanceof InsnNode a) || a.getOpcode()!=Opcodes.ARRAYLENGTH) continue;
-                AbstractInsnNode p=prevReal(a);
-                AbstractInsnNode n1=nextReal(a);
-                AbstractInsnNode n2=n1==null?null:nextReal(n1);
-                AbstractInsnNode n3=n2==null?null:nextReal(n2);
-                if(!(p instanceof FieldInsnNode f) || f.getOpcode()!=Opcodes.GETFIELD || !f.desc.startsWith("[[")) continue;
-                if(n1==null || n1.getOpcode()!=Opcodes.I2F || n2==null || n2.getOpcode()!=Opcodes.FCMPL || !(n3 instanceof JumpInsnNode)) continue;
-                endComparisons.add(a);
-            }
-            // xEnd comparison first, yEnd comparison second. Refuse fuzzy matches.
-            if(endComparisons.size()!=2) continue;
-            InsnNode victim=endComparisons.get(1);
+        if(candidates.size()!=2)return 0;
+        for(ViewportBoundsCandidate candidate:candidates){
+            candidate.verticalRangeLoad.var=candidate.heightLocal;
             InsnList replacement=new InsnList();
             replacement.add(new InsnNode(Opcodes.ICONST_0));
             replacement.add(new InsnNode(Opcodes.AALOAD));
             replacement.add(new InsnNode(Opcodes.ARRAYLENGTH));
-            m.instructions.insertBefore(victim,replacement);
-            m.instructions.remove(victim);
-            total++;
+            candidate.method.instructions.insertBefore(candidate.verticalClampLength,replacement);
+            candidate.method.instructions.remove(candidate.verticalClampLength);
         }
+        return candidates.size();
+    }
+
+    static int countPatchedViewportBounds(ClassNode cn){
+        int total=0;
+        for(MethodNode method:cn.methods)if(hasPatchedViewportBounds(method))total++;
         return total;
     }
-    static int countPatchedClamp(ClassNode cn){
-        int total=0;
-        for(MethodNode m:cn.methods){
-            boolean viewportMethod=false;
-            for(AbstractInsnNode n=m.instructions.getFirst();n!=null;n=n.getNext()){
-                if(n instanceof MethodInsnNode q&&q.name.equals("getVisibleHeight")&&q.desc.equals("()F")){
-                    viewportMethod=true;break;
-                }
-            }
-            if(!viewportMethod)continue;
-            int direct=0,nested=0;
-            for(AbstractInsnNode n=m.instructions.getFirst();n!=null;n=n.getNext()){
-                if(!(n instanceof InsnNode a)||a.getOpcode()!=Opcodes.ARRAYLENGTH)continue;
-                AbstractInsnNode n1=nextReal(a),n2=n1==null?null:nextReal(n1),n3=n2==null?null:nextReal(n2);
-                if(n1==null||n1.getOpcode()!=Opcodes.I2F||n2==null||n2.getOpcode()!=Opcodes.FCMPL
-                        ||!(n3 instanceof JumpInsnNode))continue;
-                AbstractInsnNode p=prevReal(a);
-                if(p instanceof FieldInsnNode f&&f.getOpcode()==Opcodes.GETFIELD&&f.desc.startsWith("[[")){
-                    direct++;continue;
-                }
-                if(p==null||p.getOpcode()!=Opcodes.AALOAD)continue;
-                AbstractInsnNode zero=prevReal(p),field=prevReal(zero);
-                if(zero!=null&&zero.getOpcode()==Opcodes.ICONST_0&&field instanceof FieldInsnNode f
-                        &&f.getOpcode()==Opcodes.GETFIELD&&f.desc.startsWith("[["))nested++;
-            }
-            if(direct==1&&nested==1)total++;
+
+    private static ViewportBoundsCandidate originalViewportBoundsCandidate(MethodNode method){
+        ViewportLocals locals=viewportLocals(method);
+        if(locals==null)return null;
+
+        ArrayList<VarInsnNode> widthLoads=new ArrayList<>();
+        int heightLoads=0;
+        for(AbstractInsnNode n=locals.afterHeight.getNext();n!=null;n=n.getNext()){
+            if(!(n instanceof VarInsnNode load)||load.getOpcode()!=Opcodes.FLOAD)continue;
+            if(load.var==locals.widthLocal)widthLoads.add(load);
+            else if(load.var==locals.heightLocal)heightLoads++;
         }
-        return total;
+        if(widthLoads.size()!=3||heightLoads!=1)return null;
+
+        ClampShape clamp=clampShape(method);
+        if(clamp.direct.size()!=2||clamp.nested!=0)return null;
+        return new ViewportBoundsCandidate(method,locals.heightLocal,widthLoads.get(2),
+                clamp.direct.get(1));
+    }
+
+    private static boolean hasPatchedViewportBounds(MethodNode method){
+        ViewportLocals locals=viewportLocals(method);
+        if(locals==null)return false;
+        int widthLoads=0,heightLoads=0;
+        for(AbstractInsnNode n=locals.afterHeight.getNext();n!=null;n=n.getNext()){
+            if(!(n instanceof VarInsnNode load)||load.getOpcode()!=Opcodes.FLOAD)continue;
+            if(load.var==locals.widthLocal)widthLoads++;
+            else if(load.var==locals.heightLocal)heightLoads++;
+        }
+        if(widthLoads!=2||heightLoads!=2)return false;
+        ClampShape clamp=clampShape(method);
+        return clamp.direct.size()==1&&clamp.nested==1;
+    }
+
+    private static ViewportLocals viewportLocals(MethodNode method){
+        int width=-1,height=-1;
+        AbstractInsnNode afterHeight=null;
+        int widthCalls=0,heightCalls=0;
+        for(AbstractInsnNode n=method.instructions.getFirst();n!=null;n=n.getNext()){
+            if(!(n instanceof MethodInsnNode call))continue;
+            if(!call.desc.equals("()F"))continue;
+            AbstractInsnNode store=nextReal(call);
+            if(!(store instanceof VarInsnNode local)||local.getOpcode()!=Opcodes.FSTORE)continue;
+            if(call.name.equals("getVisibleWidth")){
+                widthCalls++;width=local.var;
+            }else if(call.name.equals("getVisibleHeight")){
+                heightCalls++;height=local.var;afterHeight=store;
+            }
+        }
+        if(widthCalls!=1||heightCalls!=1||width<0||height<0||afterHeight==null)return null;
+        return new ViewportLocals(width,height,afterHeight);
+    }
+
+    private static ClampShape clampShape(MethodNode method){
+        ArrayList<InsnNode> direct=new ArrayList<>();
+        int nested=0;
+        for(AbstractInsnNode n=method.instructions.getFirst();n!=null;n=n.getNext()){
+            if(!(n instanceof InsnNode length)||length.getOpcode()!=Opcodes.ARRAYLENGTH)continue;
+            AbstractInsnNode next1=nextReal(length);
+            AbstractInsnNode next2=next1==null?null:nextReal(next1);
+            AbstractInsnNode next3=next2==null?null:nextReal(next2);
+            if(next1==null||next1.getOpcode()!=Opcodes.I2F
+                    ||next2==null||next2.getOpcode()!=Opcodes.FCMPL
+                    ||!(next3 instanceof JumpInsnNode))continue;
+            AbstractInsnNode previous=prevReal(length);
+            if(previous instanceof FieldInsnNode field
+                    &&field.getOpcode()==Opcodes.GETFIELD&&field.desc.startsWith("[[")){
+                direct.add(length);continue;
+            }
+            if(previous==null||previous.getOpcode()!=Opcodes.AALOAD)continue;
+            AbstractInsnNode zero=prevReal(previous),fieldInsn=prevReal(zero);
+            if(zero!=null&&zero.getOpcode()==Opcodes.ICONST_0
+                    &&fieldInsn instanceof FieldInsnNode field
+                    &&field.getOpcode()==Opcodes.GETFIELD&&field.desc.startsWith("[["))nested++;
+        }
+        return new ClampShape(direct,nested);
+    }
+
+    private static final class ViewportLocals{
+        final int widthLocal,heightLocal;
+        final AbstractInsnNode afterHeight;
+        ViewportLocals(int widthLocal,int heightLocal,AbstractInsnNode afterHeight){
+            this.widthLocal=widthLocal;this.heightLocal=heightLocal;this.afterHeight=afterHeight;
+        }
+    }
+    private static final class ClampShape{
+        final ArrayList<InsnNode> direct;
+        final int nested;
+        ClampShape(ArrayList<InsnNode> direct,int nested){this.direct=direct;this.nested=nested;}
+    }
+    private static final class ViewportBoundsCandidate{
+        final MethodNode method;
+        final int heightLocal;
+        final VarInsnNode verticalRangeLoad;
+        final InsnNode verticalClampLength;
+        ViewportBoundsCandidate(MethodNode method,int heightLocal,VarInsnNode verticalRangeLoad,
+                                InsnNode verticalClampLength){
+            this.method=method;this.heightLocal=heightLocal;
+            this.verticalRangeLoad=verticalRangeLoad;
+            this.verticalClampLength=verticalClampLength;
+        }
     }
     static int patchLayers(ClassNode cn){
         int total=0;

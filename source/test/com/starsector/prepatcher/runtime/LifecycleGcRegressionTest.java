@@ -39,8 +39,6 @@ public final class LifecycleGcRegressionTest {
             "ROUTE_JUMP_INDEXES",
             "ROUTE_SYSTEM_INDEXES",
             "ECONOMY_LOCATION_STATES",
-            "REMOTE_MARKET_STATES",
-            "PLANET_CONDITION_MARKET_STATES",
             "COMM_RELAY_SYSTEM_INDEXES");
 
     private LifecycleGcRegressionTest() {}
@@ -265,11 +263,12 @@ public final class LifecycleGcRegressionTest {
     }
 
     private static Object[] campaignCacheRoots() throws Exception {
-        Object[] roots = new Object[MAP_CACHE_FIELDS.size() + 1];
+        Object[] roots = new Object[MAP_CACHE_FIELDS.size() + 2];
         for (int i = 0; i < MAP_CACHE_FIELDS.size(); i++) {
             roots[i] = staticField(MAP_CACHE_FIELDS.get(i)).get(null);
         }
-        roots[MAP_CACHE_FIELDS.size()] = staticField("nebulaCacheSlot").get(null);
+        roots[MAP_CACHE_FIELDS.size()] = staticField("MARKET_SCHEDULER_STATES").get(null);
+        roots[MAP_CACHE_FIELDS.size() + 1] = staticField("nebulaCacheSlot").get(null);
         return roots;
     }
 
@@ -290,9 +289,9 @@ public final class LifecycleGcRegressionTest {
     }
 
     private static String campaignRootName(int index) {
-        return index < MAP_CACHE_FIELDS.size()
-                ? MAP_CACHE_FIELDS.get(index)
-                : "nebulaCacheSlot";
+        if (index < MAP_CACHE_FIELDS.size()) return MAP_CACHE_FIELDS.get(index);
+        return index == MAP_CACHE_FIELDS.size()
+                ? "MARKET_SCHEDULER_STATES" : "nebulaCacheSlot";
     }
 
     @SuppressWarnings("rawtypes")
@@ -339,6 +338,10 @@ public final class LifecycleGcRegressionTest {
         require(actualMapFields.equals(new HashSet<>(MAP_CACHE_FIELDS)),
                 "static Map cache inventory changed; expected=" + MAP_CACHE_FIELDS
                         + " actual=" + actualMapFields);
+        Field schedulerStates = staticField("MARKET_SCHEDULER_STATES");
+        require(Modifier.isVolatile(schedulerStates.getModifiers())
+                        && schedulerStates.getType().getName().endsWith("$WeakIdentityMap"),
+                "MARKET_SCHEDULER_STATES is not a volatile weak-identity root");
 
         Field scratch = staticField("SCRATCH");
         require(Modifier.isFinal(scratch.getModifiers()) && scratch.getType() == ThreadLocal.class,

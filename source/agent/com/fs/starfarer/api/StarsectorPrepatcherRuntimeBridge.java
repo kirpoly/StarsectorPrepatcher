@@ -20,7 +20,9 @@ public final class StarsectorPrepatcherRuntimeBridge {
             throw new IllegalArgumentException("Unexpected prepatcher configuration type: " + actual);
         }
         StarsectorPrepatcherHooks.configure(config, modRoot);
+        StarsectorPrepatcherCoreWorldsRuntime.configure(config);
         StarsectorPrepatcherHyperspaceHooks.configure(config);
+        StarsectorPrepatcherPresentationHooks.configure(config);
     }
 
     /** Loader-neutral registration endpoint used by the mod call-site transformer. */

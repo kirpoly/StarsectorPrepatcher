@@ -18,14 +18,14 @@ find "$MOD_ROOT/source/bootstrap" -name '*.java' -print0 | xargs -0 javac -encod
 printf '%s\n' \
   'Manifest-Version: 1.0' \
   'Implementation-Title: StarsectorPrepatcher Agent' \
-  'Implementation-Version: 0.9.5' \
+  'Implementation-Version: 0.10.0' \
   'Premain-Class: com.starsector.prepatcher.agent.PrepatcherAgent' \
   'Can-Redefine-Classes: false' \
   'Can-Retransform-Classes: false' '' > "$BUILD/agent.mf"
 printf '%s\n' \
   'Manifest-Version: 1.0' \
   'Implementation-Title: StarsectorPrepatcher Bootstrap' \
-  'Implementation-Version: 0.9.5' '' > "$BUILD/bootstrap.mf"
+  'Implementation-Version: 0.10.0' '' > "$BUILD/bootstrap.mf"
 jar cfm "$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar" "$BUILD/agent.mf" -C "$BUILD/agent-classes" .
 jar cfm "$MOD_ROOT/jars/StarsectorPrepatcherBootstrap.jar" "$BUILD/bootstrap.mf" -C "$BUILD/bootstrap-classes" .
 
@@ -38,7 +38,9 @@ REQUIRED_RUNTIME_PAYLOAD=(
   'com/fs/starfarer/api/StarsectorPrepatcherHooks.class'
   'com/fs/starfarer/api/StarsectorPrepatcherHyperspaceHooks.class'
   'com/fs/starfarer/api/StarsectorPrepatcherRuntimeBridge.class'
+  'com/fs/starfarer/api/StarsectorPrepatcherCoreWorldsRuntime.class'
   'com/fs/starfarer/api/StarsectorPrepatcherTempModHooks.class'
+  'com/fs/starfarer/api/StarsectorPrepatcherPresentationHooks.class'
 )
 for payload_entry in "${REQUIRED_RUNTIME_PAYLOAD[@]}"; do
   if ! grep -Fqx "$payload_entry" "$AGENT_ENTRIES"; then
@@ -46,7 +48,7 @@ for payload_entry in "${REQUIRED_RUNTIME_PAYLOAD[@]}"; do
     exit 1
   fi
 done
-EXPECTED_RUNTIME_PAYLOAD_COUNT=64
+EXPECTED_RUNTIME_PAYLOAD_COUNT=84
 runtime_payload_count="$(grep -Ec '^com/fs/starfarer/api/StarsectorPrepatcher[^/]*\.class$' "$AGENT_ENTRIES" || true)"
 if [[ "$runtime_payload_count" -ne "$EXPECTED_RUNTIME_PAYLOAD_COUNT" ]]; then
   echo "Target-loader runtime payload inventory changed: expected $EXPECTED_RUNTIME_PAYLOAD_COUNT class entries, found $runtime_payload_count." >&2

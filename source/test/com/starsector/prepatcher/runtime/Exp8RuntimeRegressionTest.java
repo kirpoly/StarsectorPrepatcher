@@ -408,7 +408,6 @@ public final class Exp8RuntimeRegressionTest {
         properties.setProperty("patch.shipAdvanceScratch", Boolean.toString(enabled));
         properties.setProperty("patch.particleCleanup", Boolean.toString(enabled));
         properties.setProperty("patch.economyLocationCache", Boolean.toString(enabled));
-        properties.setProperty("patch.economySnapshotReuse", Boolean.toString(enabled));
         properties.setProperty("patch.economyPersistentSnapshots", Boolean.toString(enabled));
         properties.setProperty("patch.commRelaySystemIndex", Boolean.toString(enabled));
         properties.setProperty("logging.statsIntervalSeconds", "0");
@@ -418,7 +417,6 @@ public final class Exp8RuntimeRegressionTest {
         PrepatcherConfig config = constructor.newInstance(properties);
         require(config.shipAdvanceScratch == enabled && config.particleCleanup == enabled
                         && config.economyLocationCache == enabled
-                        && config.economySnapshotReuse == enabled
                         && config.economyPersistentSnapshots == enabled
                         && config.commRelaySystemIndex == enabled,
                 "test configuration did not select the requested exp8 mode");

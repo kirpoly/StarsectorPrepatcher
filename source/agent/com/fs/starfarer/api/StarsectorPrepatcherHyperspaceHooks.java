@@ -10,15 +10,22 @@ import java.lang.reflect.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.LongSupplier;
 
 public final class StarsectorPrepatcherHyperspaceHooks {
     private static volatile PrepatcherConfig cfg;
+    private static volatile LongSupplier NANO_CLOCK=System::nanoTime;
     private static final LongAdder randomCalls=new LongAdder();
     private static final LongAdder layerFilters=new LongAdder(), autoAlloc=new LongAdder(), autoReuse=new LongAdder();
     private static final LongAdder autoInternalReads=new LongAdder();
     private static final LongAdder listBorrows=new LongAdder(), removeCalls=new LongAdder(), linearRemoves=new LongAdder(), removedItems=new LongAdder();
+    private static final LongAdder starfieldListDrops=new LongAdder();
+    private static volatile int starfieldFreeListCount;
+    private static volatile long starfieldRetainedCapacity;
     private static WeakReference<Thread> statsThread=new WeakReference<>(null);
     private static long lastRandomApprox;
+
+    private static long nanoTime(){LongSupplier clock=NANO_CLOCK;return clock==null?System.nanoTime():clock.getAsLong();}
 
     static synchronized void configure(PrepatcherConfig c){
         cfg=c;
@@ -187,10 +194,27 @@ public final class StarsectorPrepatcherHyperspaceHooks {
         return true;
     }
 
-    private static final class ListPool { final ArrayDeque<ArrayList<Object>> free=new ArrayDeque<>(); }
+    private static final class PooledList extends ArrayList<Object> {
+        int highWater;
+        boolean oversizedTouched;
+        long oversizedLastUseNanos=Long.MIN_VALUE;
+        void observe(int size){
+            if(size>highWater)highWater=size;
+            PrepatcherConfig c=cfg;
+            if(c!=null && size>c.starfieldPoolMaxRetainedCapacity)oversizedTouched=true;
+        }
+        void finishLease(long now){
+            if(oversizedTouched){oversizedLastUseNanos=now;oversizedTouched=false;}
+        }
+        @Override public boolean add(Object value){boolean changed=super.add(value);if(changed)observe(size());return changed;}
+        @Override public void add(int index,Object value){super.add(index,value);observe(size());}
+        @Override public boolean addAll(Collection<?> values){boolean changed=super.addAll(values);if(changed)observe(size());return changed;}
+        @Override public boolean addAll(int index,Collection<?> values){boolean changed=super.addAll(index,values);if(changed)observe(size());return changed;}
+    }
+    private static final class ListPool { final ArrayDeque<PooledList> free=new ArrayDeque<>(); }
     private static final ThreadLocal<ListPool> LISTS=ThreadLocal.withInitial(ListPool::new);
     @SuppressWarnings("rawtypes") public static ArrayList borrowArrayList(){
-        ListPool p=LISTS.get(); ArrayList<Object> a=p.free.pollFirst(); if(a==null)a=new ArrayList<>(); else a.clear(); listBorrows.increment(); return a;
+        ListPool p=LISTS.get(); PooledList a=p.free.pollFirst(); if(a==null)a=new PooledList(); else a.clear(); listBorrows.increment(); return a;
     }
     @SuppressWarnings({"rawtypes","unchecked"}) public static boolean removeAllAndRelease(Collection receiver,Collection removals){
         boolean changed=false; removeCalls.increment();
@@ -204,8 +228,30 @@ public final class StarsectorPrepatcherHyperspaceHooks {
             } else if(receiver!=null) changed=receiver.removeAll(removals);
             return changed;
         } finally {
-            if(removals instanceof ArrayList a){a.clear();ListPool p=LISTS.get();if(p.free.size()<32)p.free.addFirst(a);}
+            if(removals instanceof PooledList a){
+                long now=nanoTime();a.finishLease(now);a.clear();ListPool p=LISTS.get();
+                if(p.free.size()<32)p.free.addFirst(a);else starfieldListDrops.increment();
+            }
         }
+    }
+
+    static void runPoolMaintenance(long now,boolean forced){
+        PrepatcherConfig c=cfg;if(c==null)return;ListPool p=LISTS.get();
+        long grace=Math.max(0L,(long)c.starfieldPoolOversizedGraceMs*1_000_000L);
+        for(Iterator<PooledList> it=p.free.iterator();it.hasNext();){
+            PooledList list=it.next();
+            if(list.highWater>c.starfieldPoolMaxRetainedCapacity
+                    && list.oversizedLastUseNanos!=Long.MIN_VALUE
+                    && now-list.oversizedLastUseNanos>=grace){
+                it.remove();starfieldListDrops.increment();
+            }
+        }
+        while(p.free.size()>32){p.free.removeLast();starfieldListDrops.increment();}
+        publishPoolGauges(p);
+    }
+    private static void publishPoolGauges(ListPool p){
+        long capacity=0L;for(PooledList list:p.free)capacity+=Math.max(0,list.highWater);
+        starfieldFreeListCount=p.free.size();starfieldRetainedCapacity=capacity;
     }
     @SuppressWarnings({"rawtypes","unchecked"}) private static Set membership(Collection c){
         boolean identity=true, broken=false;
@@ -241,7 +287,10 @@ public final class StarsectorPrepatcherHyperspaceHooks {
                 +" listBorrows="+listBorrows.sum()
                 +" removeCalls="+removeCalls.sum()
                 +" linearRemoves="+linearRemoves.sum()
-                +" removedItems="+removedItems.sum();
+                +" removedItems="+removedItems.sum()
+                +" starfieldFreeListCount="+starfieldFreeListCount
+                +" starfieldRetainedCapacity="+starfieldRetainedCapacity
+                +" starfieldListDrops="+starfieldListDrops.sum();
     }
     private static void statsLoop(){
         Thread current=Thread.currentThread();

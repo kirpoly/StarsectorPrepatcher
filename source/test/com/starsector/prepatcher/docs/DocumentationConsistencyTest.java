@@ -83,6 +83,7 @@ public final class DocumentationConsistencyTest {
         checkChangelog(changelog, currentVersion);
         checkVersionConsumers(root, currentVersion);
         checkKnownDisabledStartupPatches(root);
+        checkDiagnosticProfileIsolation(root);
         checkReportLayout(root);
         checkChecksums(root);
 
@@ -367,7 +368,10 @@ public final class DocumentationConsistencyTest {
                         && russianReadme.contains(languageHeader)
                         && russianReadme.contains("Текущая версия: **" + expected + "**"),
                 "README_RU.md identity/version does not match mod_info.json " + expected);
-        for (String relative : List.of("prepatcher.properties", "profiles/aggressive.properties")) {
+        for (String relative : List.of(
+                "prepatcher.properties",
+                "profiles/aggressive.properties",
+                "profiles/debug.properties")) {
             String firstLine = readUtf8(requiredFile(root.resolve(relative))).split("\\R", 2)[0];
             require(firstLine.equals("# StarsectorPrepatcher " + expected),
                     relative + " version header does not match mod_info.json " + expected);
@@ -378,11 +382,112 @@ public final class DocumentationConsistencyTest {
         for (String relative : List.of(
                 "prepatcher.properties",
                 "profiles/safe.properties",
-                "profiles/aggressive.properties")) {
+                "profiles/aggressive.properties",
+                "profiles/debug.properties")) {
             String properties = readUtf8(requiredFile(root.resolve(relative)));
             requirePropertyValue(relative, properties, "patch.loadingTextReader", "false");
             requirePropertyValue(relative, properties, "patch.startupLogAggregation", "false");
         }
+    }
+
+    private static void checkDiagnosticProfileIsolation(Path root) throws IOException {
+        List<String> debugOnlyKeys = List.of(
+                "observer.marketAdvanceSemanticRisks",
+                "observer.marketConstructionDiagnostics",
+                "observer.marketConstructionDiagnosticsMaxSamplesPerReason",
+                "patch.directMarketObservation",
+                "directMarket.timingSampleEvery",
+                "directMarket.stackSampleEvery",
+                "directMarket.maxStacksPerSite",
+                "directMarket.reportIntervalSeconds",
+                "directMarket.maxSites",
+                "directMarket.unknownStackSamples",
+                "fastForward.verbose",
+                "fastForward.metrics",
+                "logging.statsIntervalSeconds");
+        for (String relative : List.of(
+                "prepatcher.properties",
+                "profiles/safe.properties",
+                "profiles/aggressive.properties")) {
+            String properties = readUtf8(requiredFile(root.resolve(relative)));
+            for (String key : debugOnlyKeys) {
+                requireNoProperty(relative, properties, key);
+            }
+        }
+
+        String relative = "profiles/debug.properties";
+        String debug = readUtf8(requiredFile(root.resolve(relative)));
+        requirePropertyValue(relative, debug, "observer.marketAdvanceSemanticRisks", "true");
+        requirePropertyValue(relative, debug, "observer.marketConstructionDiagnostics", "true");
+        requirePropertyValue(relative, debug,
+                "observer.marketConstructionDiagnosticsMaxSamplesPerReason", "64");
+        requirePropertyValue(relative, debug, "patch.directMarketObservation", "true");
+        requirePropertyValue(relative, debug, "directMarket.timingSampleEvery", "128");
+        requirePropertyValue(relative, debug, "directMarket.stackSampleEvery", "2048");
+        requirePropertyValue(relative, debug, "directMarket.maxStacksPerSite", "8");
+        requirePropertyValue(relative, debug, "directMarket.reportIntervalSeconds", "15");
+        requirePropertyValue(relative, debug, "directMarket.maxSites", "4096");
+        requirePropertyValue(relative, debug, "directMarket.unknownStackSamples", "32");
+        requirePropertyValue(relative, debug, "fastForward.verbose", "true");
+        requirePropertyValue(relative, debug, "fastForward.metrics", "true");
+        requirePropertyValue(relative, debug, "logging.statsIntervalSeconds", "30");
+
+        String aggressiveRelative = "profiles/aggressive.properties";
+        String aggressive = readUtf8(requiredFile(root.resolve(aggressiveRelative)));
+        Map<String, String> aggressiveProperties = activeProperties(aggressiveRelative, aggressive);
+        String defaultRelative = "prepatcher.properties";
+        Map<String, String> defaultProperties = activeProperties(
+                defaultRelative, readUtf8(requiredFile(root.resolve(defaultRelative))));
+        require(defaultProperties.equals(aggressiveProperties),
+                defaultRelative + " must exactly mirror all active properties from "
+                        + aggressiveRelative);
+        Map<String, String> debugProperties = activeProperties(relative, debug);
+        for (Map.Entry<String, String> entry : aggressiveProperties.entrySet()) {
+            require(entry.getValue().equals(debugProperties.get(entry.getKey())),
+                    relative + " must inherit " + entry.getKey() + "=" + entry.getValue()
+                            + " from " + aggressiveRelative + ", found "
+                            + debugProperties.get(entry.getKey()));
+        }
+        Set<String> debugExtras = new LinkedHashSet<>(debugProperties.keySet());
+        debugExtras.removeAll(aggressiveProperties.keySet());
+        require(debugExtras.equals(new LinkedHashSet<>(debugOnlyKeys)),
+                relative + " must equal the aggressive profile plus only the approved diagnostics; "
+                        + "unexpected/missing extras=" + debugExtras);
+
+        String configSource = readUtf8(requiredFile(root.resolve(
+                "source/agent/com/starsector/prepatcher/agent/PrepatcherConfig.java")));
+        require(configSource.contains("fastForwardVerbose = bool(\"fastForward.verbose\", false)"),
+                "fastForward.verbose code default must remain false");
+        require(configSource.contains(
+                        "statsLogIntervalSeconds = integer(\"logging.statsIntervalSeconds\", 0,"),
+                "logging.statsIntervalSeconds code default must remain zero");
+    }
+
+    private static Map<String, String> activeProperties(String relative, String properties) {
+        Map<String, String> result = new LinkedHashMap<>();
+        properties.lines().forEach(line -> {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.startsWith("!")) {
+                return;
+            }
+            int separator = trimmed.indexOf('=');
+            require(separator > 0, relative + " has malformed active property: " + line);
+            String key = trimmed.substring(0, separator).trim();
+            String value = trimmed.substring(separator + 1).trim();
+            require(!key.isEmpty() && !value.isEmpty(),
+                    relative + " has malformed active property: " + line);
+            require(result.put(key, value) == null,
+                    relative + " has duplicate active " + key + " assignments");
+        });
+        return result;
+    }
+
+    private static void requireNoProperty(
+            String relative, String properties, String key) {
+        Pattern assignment = Pattern.compile(
+                "(?m)^" + Pattern.quote(key) + "[ \\t]*=[ \\t]*([^\\s#]+)[ \\t]*$");
+        require(!assignment.matcher(properties).find(),
+                relative + " must leave debug-only property " + key + " unspecified");
     }
 
     private static void requirePropertyValue(String relative, String properties,
@@ -408,6 +513,9 @@ public final class DocumentationConsistencyTest {
         List<String> reports = List.of(
                 "documentation-consistency.txt",
                 "structural-verification.txt",
+                "fast-forward-presentation-compatibility.txt",
+                "fast-forward-presentation-runtime.txt",
+                "fast-forward-presentation-actual-agent.txt",
                 "direct-market-transformer.txt",
                 "runtime-regression.txt",
                 "temp-mod-actual-agent-smoke.txt",

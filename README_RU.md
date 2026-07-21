@@ -2,7 +2,7 @@
 
 [English](README.md) | [Русский](README_RU.md)
 
-Текущая версия: **0.9.5**. Поддерживаемая версия игры: **Starsector 0.98a-RC8**.
+Текущая версия: **0.10.0**. Поддерживаемая версия игры: **Starsector 0.98a-RC8**.
 
 [![Без препатчера и с ним](media/smoothness_comparison.gif)](https://github.com/kirpoly/StarsectorPrepatcher/releases/download/v0.8.0/StarsectorPrepatcher-0.8.0-comparison.webm)
 
@@ -21,7 +21,7 @@ StarsectorPrepatcher — compatibility-first слой ранних патчей 
 - хранить зависимое от версии игры знание о bytecode внутри prepatcher, а не размножать его по
   игровым модам.
 
-Публичный API в `0.9.5` ещё не выпущен и остаётся пунктом roadmap. Планируемый namespace —
+Публичный API в `0.10.0` ещё не выпущен и остаётся пунктом roadmap. Планируемый namespace —
 `com.starsector.prepatcher.api`; типы станут поддерживаемым контрактом только после появления
 документации и compatibility-тестов.
 
@@ -33,16 +33,21 @@ StarsectorPrepatcher — compatibility-first слой ранних патчей 
 agent/StarsectorPrepatcherAgent.jar
 ```
 
-Единый agent независимо сопоставляет и проверяет каждый патч, включая hyperspace. Цельные hash
-классов не используются: проверяются файлы той установки, где находится мод — оригинальной либо
-переводной. Патч применяется, пока совпадает локальный контракт bytecode. Неизвестный,
-неоднозначный или частично изменённый участок остаётся vanilla, а причина записывается в лог.
+Единый agent независимо сопоставляет и проверяет каждый патч, включая hyperspace и fast-forward
+presentation. Все блоки используют локальные structural-контракты и принимают совместимые
+оригинальные, переводные или перепакованные game files, пока принадлежащая patch semantic surface
+не изменилась. Неизвестный, неоднозначный, частичный или foreign hook-shaped target остаётся
+vanilla, а причина записывается в лог.
 
 Control-код agent и typed runtime намеренно разделены. При запуске agent читает runtime-classfile'ы
 `com.fs.starfarer.api.StarsectorPrepatcher*` из собственного JAR и определяет их в classloader'е,
 которому принадлежит API Starsector. Поэтому типы аргументов hooks остаются loader-identical как в
 vanilla launcher, так и с custom system classloader Faster Rendering. Transformer регистрируется
 только после успешной установки runtime и пропускает target, загруженный другим loader'ом.
+
+Fast-forward presentation coalescing регистрируется внутри того же startup-agent, а его hooks входят
+в общий game-loader runtime payload. Второй javaagent не устанавливается и не нужен; исходный
+standalone-agent FastForward Presentation Patch не следует устанавливать одновременно с Prepatcher.
 
 Bootstrap plugin не меняет bytecode. Он выводит состояние агентов в обычный лог игры и предупреждает,
 если мод включён без startup-agent.
@@ -95,10 +100,12 @@ Prepatcher не изменяет формат сохранений, а его ru
   markets/conditions/industries со structure epochs и bounded audit, owner-local ReachEconomy
   fingerprint, ordered fast path неактивных commodities вместе с direct expiry-aware scheduler
   `MutableStatWithTempMods`, guarded fast path для dormant-наследников `BaseIndustry`, подавление
-  повторного удаления уже отсутствующего commodity event mod, fast paths для пустых scripts/Memory
-  и comm-relay candidates;
+  повторного удаления уже отсутствующего commodity event mod, fast paths для пустых scripts/Memory,
+  structural cache границ core worlds в `CoreScript` и comm-relay candidates;
 - routing: упорядоченные jump-point/system indexes с vanilla selection/fallback;
 - combat и particles: внутренние scratch collections и стабильная deferred cleanup;
+- fast-forward presentation: final-substep coalescing защищённых campaign visuals и continuous
+  audio; широкие animation/fader/particle группы включены в default/aggressive profile;
 - loading/save: literal parsing, progress redraw и исправления output path;
 - hyperspace: terrain culling, layer selection, seeded random reuse, owner-local automaton buffers и
   moving-starfield cleanup.
@@ -119,24 +126,69 @@ enabled=false
 профилях после подтверждённых ошибок запуска миссий. Они не будут включены снова до отдельного
 исправления и изолированного startup/mission-прогона.
 
-`patch.remoteMarketScheduler` включён в default/aggressive profile и намеренно меняет cadence
-`MarketAPI.advance()` для рынков, достигаемых через центральный цикл экономики. Текущая location,
-interaction market и player-owned рынки остаются full-rate.
+Default, safe и aggressive profiles держат дорогие observers, CSV/stack sampling, verbose-вывод
+transformer-а, presentation metrics и периодический stats worker выключенными. Копируйте
+`profiles/debug.properties` поверх `prepatcher.properties` только на ограниченное время диагностики:
+этот профиль наследует все настройки aggressive, включает перечисленные средства и пишет
+дополнительные данные в `logs/`. Соответствие контракту «aggressive плюс диагностика» закреплено
+repository consistency test-ом.
 
-`patch.planetConditionMarketScheduler` независимо покрывает vanilla-путь
-`BaseCampaignEntity.advance()` для `planetConditionMarketOnly` markets. Он сохраняет точный
-накопленный `amount`, выполняет первый tick немедленно, оставляет location игрока full-rate и
-сбрасывает pending time перед сохранением. Оба scheduler'а поддерживают memory key
-`$starsectorPrepatcher_fullRateMarket=true`. Для консервативного cadence используйте
-`profiles/safe.properties` или выключите нужные переключатели.
+Safe profile включает structurally matched master/frame marker fast-forward presentation и более
+узкие visual/audio группы. Default profile полностью совпадает с aggressive: global animations,
+sensor faders, slipstream particles и particle emitters включены, несмотря на более широкую область
+callback, lifetime, RNG и emission cadence. `fastForward.visualTime=realtime` оставляет presentation на одном
+обычном update за outer frame, а `simulation` накапливает substep time и может давать заметные
+скачки. Сама simulation продолжает выполняться на каждом substep.
 
-`patch.directMarketObservation` также включён в default/aggressive profile в 0.9.3. Он не
+`patch.marketScheduler` включён в default/aggressive profile и направляет все известные core-вызовы
+`MarketAPI.advance(float)` через единый контракт. Периодические источники Economy loop и
+planet-condition накапливают `amount` на каждом simulation tick, но cadence проверяется один раз на
+render batch. При ускорении Starsector выполняет несколько `CampaignEngine.advance()` за один
+отрисованный кадр; финальная итерация определяется через
+`CampaignEngine.setFastForwardIteration(false)`. Поэтому обычные и hot-рынки получают не более одного
+callback на render batch, а их callback count не растёт кратно ускорению. Удалённые видимые рынки
+используют `market.scheduler.batches`, скрытые удалённые — `market.scheduler.hiddenBatches`, а рынки
+текущей location, interaction market и player-owned — один callback на batch.
+
+Явный compatibility opt-out задаётся memory key
+`$starsectorPrepatcher_perSimulationTickMarket=true`. Только такие рынки сохраняют один callback на
+каждый simulation tick. В stats выводятся и текущее число таких рынков, и стоимость их вызовов. Шесть
+редких vanilla create/remove call sites, прямые mod-вызовы, fail-open ветки и pre-save flush используют
+более дешёвый synchronous hook: он сначала поглощает существующий pending debt, затем выполняет
+исходный event callback. Scheduler активируется только после инициализации lifecycle/batch компонента
+CampaignEngine, подтверждённого batch-протокола `CampaignState`, Economy source, entity source и save
+flush; до этого вызовы синхронны и debt не создают. Подробное последовательное описание:
+[docs/architecture/MARKET_SCHEDULER.md](docs/architecture/MARKET_SCHEDULER.md).
+
+Runtime stats используют одно семейство `marketScheduler*`. Метрики
+`marketSchedulerSimulationTicks` и `marketSchedulerRenderBatches` показывают фактический коэффициент
+ускорения, а `marketSchedulerMaxTicksPerBatch` — крупнейший batch. Отдельно считаются накопленные
+input calls, выполненные callbacks, per-simulation-tick opt-outs и синхронное поглощение debt. Ошибки
+разделены по конкретным причинам. Ошибка обычного callback отключает batching только для данного
+рынка; ошибка уже начатого pre-save callback отбрасывает отделённый неоднозначный debt, переводит
+рынок в immediate execution и прерывает save, чтобы частично применённый callback не запускался
+автоматически повторно. Периодические counters используют `sumThenReset()`.
+
+`patch.directMarketObservation` включён только в debug profile. Он не
 throttling-ует прямые вызовы модов: каждый вызов остаётся синхронным и немедленным. Известный
 planet-condition engine path учитывается отдельно от unknown, manifest преобразованных call sites
 пишется до первого выполнения, а лимит unknown stacks обновляется каждый отчётный интервал.
 Каталоги validation-smoke имеют заметную метку, а `session.json` содержит `sessionOrigin`.
 Результаты находятся в `logs/direct-market-observe/session-*/`; после сбора данных observer стоит
-выключить, чтобы убрать sampling overhead.
+выключить, чтобы убрать sampling overhead. `call-sites.csv` и `observations.csv` содержат отдельные
+поля `mod_id`, `mod_name`, каталог мода и имя JAR, полученные из `mod_info.json`; поле `source`
+остаётся точным code-source path и больше не является единственным способом определить мод.
+
+Причины construction full-rate всегда накапливаются в агрегированных counters/gauges; debug profile
+выводит их в периодической строке stats. `Industry.isUpgrading()` остаётся диагностическим признаком. Для наследников
+`BaseIndustry` policy использует authoritative raw-поле `building`, а не переопределённый virtual
+`isBuilding()`; для произвольных реализаций `Industry` сохраняется fallback к интерфейсному методу.
+Случаи virtual=true при raw=false учитываются отдельным reason/counter/gauge, но не включают full-rate.
+Ограниченную диагностическую выборку можно включить через
+`observer.marketConstructionDiagnostics=true`; CSV записывается в
+`logs/market-construction-diagnostics/session-*/`, раздельно фиксирует reported/effective building,
+источники building/upgrading, transition buckets и скалярное состояние `BaseIndustry`, не удерживает
+игровые объекты и не меняет поведение scheduler.
 
 Для удаления записи vanilla запустите `uninstall-agent.bat`, для FR —
 `uninstall-agent.bat -Target FasterRendering`, для обоих файлов —
@@ -149,12 +201,13 @@ Runtime-логи:
 ```text
 mods\StarsectorPrepatcher\logs\prepatcher.log
 mods\StarsectorPrepatcher\logs\direct-market-observe\session-*\
+mods\StarsectorPrepatcher\logs\market-construction-diagnostics\session-*\
 ```
 
-Agent пишет `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, `SKIPPED_LOADER` или
-`SKIPPED_ERROR` для каждого патча. Hyperspace targets используют ту же структурную модель статусов,
-что и остальные targets. `SKIPPED_LOADER` — fail-open защита от несовпадения classloader'ов; до
-разбора такого статуса соответствующий способ запуска нельзя считать совместимым.
+Agent пишет `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, `SKIPPED_COMPOSITION`,
+`SKIPPED_LOADER`, `SKIPPED_ALREADY_LOADED` или `SKIPPED_ERROR`. Presentation и hyperspace targets
+используют ту же локальную structural-модель статусов, что и остальные patches. Каждый skip работает fail-open;
+`SKIPPED_LOADER` нужно разобрать до заявления совместимости соответствующего способа запуска.
 
 Полная проверка запускается через `verify-structural.bat` на Windows или `./verify-structural.sh` на
 Linux/macOS. Suite включает документацию, structural/negative/idempotency, lifecycle/GC, runtime,
@@ -170,6 +223,6 @@ classloader Faster Rendering. Сборка описана в [`BUILDING.md`](BUI
 - [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) — structural matching и fail-open правила;
 - [`docs/VALIDATION.md`](docs/VALIDATION.md) — playbook регрессионных и performance-проверок;
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — план structural discovery, архитектуры, tooling и платформ;
-- [`docs/releases/0.9.5.md`](docs/releases/0.9.5.md) — подробный отчёт текущего выпуска.
+- [`docs/releases/0.10.0.md`](docs/releases/0.10.0.md) — подробный отчёт текущего выпуска.
 
 Условия распространения находятся в [`LICENSE`](LICENSE).

@@ -12,6 +12,7 @@ import jdk.internal.org.objectweb.asm.tree.FieldNode;
 import jdk.internal.org.objectweb.asm.tree.FrameNode;
 import jdk.internal.org.objectweb.asm.tree.InsnList;
 import jdk.internal.org.objectweb.asm.tree.InsnNode;
+import jdk.internal.org.objectweb.asm.tree.IntInsnNode;
 import jdk.internal.org.objectweb.asm.tree.JumpInsnNode;
 import jdk.internal.org.objectweb.asm.tree.LabelNode;
 import jdk.internal.org.objectweb.asm.tree.LdcInsnNode;
@@ -46,6 +47,8 @@ public final class StructuralCompatibilityTest {
             "com/fs/starfarer/api/StarsectorPrepatcherHyperspaceHooks";
     private static final String TEMP_MOD_HOOKS =
             "com/fs/starfarer/api/StarsectorPrepatcherTempModHooks";
+    private static final String CORE_WORLDS_RUNTIME =
+            "com/fs/starfarer/api/StarsectorPrepatcherCoreWorldsRuntime";
 
     private StructuralCompatibilityTest() {}
 
@@ -70,10 +73,8 @@ public final class StructuralCompatibilityTest {
                 "patch.startupLogAggregation must remain disabled when configuration is missing");
         require(!defaults.commodityEventModDirtyCache,
                 "behavior-changing commodity cache must remain disabled when configuration is missing");
-        require(!defaults.remoteMarketScheduler,
-                "remote-market scheduler must remain disabled when configuration is missing");
-        require(!defaults.planetConditionMarketScheduler,
-                "planet-condition market scheduler must remain disabled when configuration is missing");
+        require(!defaults.marketScheduler,
+                "market scheduler must remain disabled when configuration is missing");
         require(!defaults.directMarketObservation,
                 "direct-market observation must remain disabled when configuration is missing");
         require(!defaults.commodityTemporalFastPath,
@@ -84,6 +85,14 @@ public final class StructuralCompatibilityTest {
                 "behavior-changing temp-mod scheduler must remain disabled when configuration is missing");
         require(!defaults.economyPersistentSnapshots,
                 "behavior-changing persistent economy snapshots must remain disabled when configuration is missing");
+        require(!defaults.fastForwardGlobalAnimations,
+                "fast-forward global animation callbacks must remain disabled when configuration is missing");
+        require(!defaults.fastForwardSensorFaders,
+                "fast-forward sensor faders must remain disabled when configuration is missing");
+        require(!defaults.fastForwardSlipstreamParticles,
+                "fast-forward slipstream particles must remain disabled when configuration is missing");
+        require(!defaults.fastForwardParticleEmitters,
+                "fast-forward particle emitters must remain disabled when configuration is missing");
         PrepatcherConfig config = PrepatcherConfig.load(configPath);
 
         int jars = 0;
@@ -112,15 +121,24 @@ public final class StructuralCompatibilityTest {
         List<Path> suppliedJars = Arrays.stream(args).skip(1)
                 .map(value -> Path.of(value).toAbsolutePath().normalize()).toList();
         runLoaderGuardTests(config, suppliedJars);
-        runPlanetConditionOnlyStructuralTest(suppliedJars);
-        runFallbackEconomySnapshotStructuralTest(suppliedJars);
-        runNegativeRetainAllTests(config, Path.of(args[1]).toAbsolutePath().normalize());
+        runMarketSchedulerStructuralTest(suppliedJars);
+        runEconomyAdvancePlanAtomicTests(suppliedJars);
+        runMarketAdvancePlanAtomicTests(suppliedJars);
+        runSaveMethodPlanAtomicTests(suppliedJars);
+        runCoreMarketAdvanceCoverageTest(suppliedJars);
+        runConstructionMutationCoverageTest(suppliedJars);
+        runRemovedEconomyScratchSnapshotStructuralTest(suppliedJars);
+        runHyperspaceViewportBoundsAtomicTest(suppliedJars);
+        runNegativeMapRenderStuffTests(config, Path.of(args[1]).toAbsolutePath().normalize());
+        runNegativeHitTestGroupTests(config, Path.of(args[1]).toAbsolutePath().normalize());
+        runNegativeIntelArrowRenderingTests(Path.of(args[1]).toAbsolutePath().normalize());
+        runNegativeEventsPanelReconciliationTests(Path.of(args[1]).toAbsolutePath().normalize());
         runNegativeLifecycleTests(config, Path.of(args[1]).toAbsolutePath().normalize());
         runExp6OwnershipTests(config, Path.of(args[1]).toAbsolutePath().normalize());
         runInlineFastPathNegativeTests(config,
                 Path.of(args[1]).toAbsolutePath().normalize());
         runExp8OwnershipTests(config, suppliedJars);
-        System.out.println("OK negative-tests retainAll missing ambiguous unrelated-call unrelated-change"
+        System.out.println("OK negative-tests map-renderStuff missing ambiguous missing-allocation unrelated-call unrelated-change"
                 + " marker-ownership scratch-scope-tamper wrapper-tamper wrapper-metadata idempotency"
                 + " lifecycle-missing-write lifecycle-wrong-source exp6-marker-ownership"
                 + " exp6-scratch-scope-tamper exp8-marker-ownership exp8-scratch-scope-tamper"
@@ -128,234 +146,965 @@ public final class StructuralCompatibilityTest {
                 + " entity-fastpath-epilogue memory-fastpath-source"
                 + " memory-fastpath-order-placement inline-marker-receiver"
                 + " inline-marker-branch inline-marker-order loader-guard"
-                + " planet-condition-only-frame-clock scheduler-scope-tamper"
-                + " fallback-economy-snapshots fallback-snapshot-scope-tamper"
-                + " planet-condition-predicate-branch/receiver/bypass-edge/branch-entry"
-                + " remote-scheduler-operands"
-                + " safe-missing-config-defaults");
+                + " market-scheduler-complete-surface scheduler-scope-tamper"
+                + " economy-advance-plan-masks/atomicity/ownership/postcondition"
+                + " market-advance-plan-masks/atomicity/ownership/postcondition"
+                + " removed-economy-scratch-snapshots"
+                + " hyperspace-viewport-bounds-atomic-range/clamp"
+                + " market-scheduler-planet-source/predicate-branch/receiver"
+                + " market-scheduler-operands"
+                + " construction-mutator-coverage semantic-capability-registration-tamper"
+                + " map-renderStuff-config-isolation hit-test-group-atomicity"
+                + " hit-test-marker-ownership hit-test-scope-tamper hit-test-wrapper-tamper"
+                + " intel-arrow-rendering-atomicity intel-arrow-marker-ownership"
+                + " intel-arrow-scope-tamper intel-arrow-callback/vector-tamper"
+                + " events-panel-reconciliation-atomicity events-panel-marker-ownership"
+                + " events-panel-scope-tamper events-panel-hook-tamper"
+                + " safe-missing-config-defaults composition-final-validation");
         System.out.println("SUMMARY jars=" + jars + " transformedClasses=" + classes
                 + " verifiedMethods=" + methods);
     }
 
-    private static void runPlanetConditionOnlyStructuralTest(
+
+
+    private static void runEconomyAdvancePlanAtomicTests(List<Path> jarPaths)
+            throws Exception {
+        byte[] original = classBytes(jarPaths, PrepatcherTransformer.ECONOMY);
+        Constructor<PrepatcherConfig> constructor =
+                PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
+        constructor.setAccessible(true);
+
+        for (int mask = 1; mask <= 7; mask++) {
+            Properties properties = new Properties();
+            properties.setProperty("patch.economyPersistentSnapshots",
+                    Boolean.toString((mask & 1) != 0));
+            properties.setProperty("patch.economyLocationCache",
+                    Boolean.toString((mask & 2) != 0));
+            properties.setProperty("patch.marketScheduler",
+                    Boolean.toString((mask & 4) != 0));
+            PrepatcherConfig featureConfig = constructor.newInstance(properties);
+            byte[] patched = new PrepatcherTransformer(featureConfig).transform(
+                    null, PrepatcherTransformer.ECONOMY, null, null, original);
+            require(patched != null, "Economy.advance unified plan did not apply mask=" + mask);
+            ClassNode node = read(patched);
+            require(hasOwnershipMarker(node, "economyAdvancePlan"),
+                    "Economy.advance unified ownership marker missing mask=" + mask);
+            require(!hasOwnershipMarker(node, "economyPersistentSnapshots")
+                            && !hasOwnershipMarker(node, "economyLocationCache")
+                            && !hasOwnershipMarker(node, "marketScheduler"),
+                    "Economy.advance emitted legacy split markers mask=" + mask);
+            FieldNode maskField = requireField(node, "smo$economyAdvancePlanMask", "I");
+            require(maskField.value instanceof Integer value && value == mask,
+                    "Economy.advance plan mask field changed for mask=" + mask);
+
+            boolean persistent = (mask & 1) != 0;
+            boolean location = (mask & 2) != 0;
+            boolean scheduler = (mask & 4) != 0;
+            require((findFieldOrNull(node, "smo$economyMarketsSnapshotState") != null)
+                            == persistent,
+                    "Economy.advance persistent state presence changed mask=" + mask);
+            require(countHook(patched, "updateEconomyLocationMapIfNeeded")
+                            == (location && !persistent ? 1 : 0),
+                    "Economy.advance nonpersistent location hook changed mask=" + mask);
+            require(countHook(patched, "updateEconomyLocationMapIfNeededPersistent")
+                            == (location && persistent ? 1 : 0),
+                    "Economy.advance persistent location hook changed mask=" + mask);
+            require(countHook(patched, "advanceMarketScheduled") == (scheduler ? 1 : 0),
+                    "Economy.advance scheduler source count changed mask=" + mask);
+            require(countHook(patched, "registerMarketSchedulerComponent")
+                            == (scheduler ? 1 : 0),
+                    "Economy.advance scheduler registration count changed mask=" + mask);
+
+            byte[] repeated = new PrepatcherTransformer(featureConfig).transform(
+                    null, PrepatcherTransformer.ECONOMY, null, null, patched);
+            require(repeated == null,
+                    "Economy.advance unified plan was not idempotent mask=" + mask);
+        }
+
+        Properties allProperties = new Properties();
+        allProperties.setProperty("patch.economyPersistentSnapshots", "true");
+        allProperties.setProperty("patch.economyLocationCache", "true");
+        allProperties.setProperty("patch.marketScheduler", "true");
+        PrepatcherConfig all = constructor.newInstance(allProperties);
+
+        ClassNode brokenLocation = read(original);
+        MethodNode brokenAdvance = method(brokenLocation, "advance", "(F)V");
+        MethodInsnNode update = uniqueCall(brokenAdvance, Opcodes.INVOKEVIRTUAL,
+                "com/fs/starfarer/campaign/econ/reach/ReachEconomy",
+                "updateLocationMap", "()V");
+        update.name = "smo$brokenUpdateLocationMap";
+        byte[] rejected = new PrepatcherTransformer(all).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null, write(brokenLocation));
+        require(rejected == null,
+                "Economy.advance plan partially committed when location analysis failed");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(
+                        "starsector.prepatcher.patchStatus."
+                                + PrepatcherTransformer.ECONOMY.replace('/', '.')
+                                + ".economyAdvancePlan")),
+                "Economy.advance failed component was not rejected structurally");
+
+        Properties snapshotsProperties = new Properties();
+        snapshotsProperties.setProperty("patch.economyPersistentSnapshots", "true");
+        snapshotsProperties.setProperty("patch.economyLocationCache", "false");
+        snapshotsProperties.setProperty("patch.marketScheduler", "false");
+        byte[] snapshotsOnly = new PrepatcherTransformer(
+                constructor.newInstance(snapshotsProperties)).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null, original);
+        require(snapshotsOnly != null, "Economy.advance snapshot-only fixture did not apply");
+        ClassNode unownedSplit = read(snapshotsOnly);
+        require(unownedSplit.fields.removeIf(field -> field.name.equals(
+                        "smo$patched$economyAdvancePlan")),
+                "Economy.advance test fixture ownership marker missing");
+        require(unownedSplit.fields.removeIf(field -> field.name.equals(
+                        "smo$economyAdvancePlanMask")),
+                "Economy.advance test fixture mask missing");
+        rejected = new PrepatcherTransformer(all).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null, write(unownedSplit));
+        require(rejected == null,
+                "Economy.advance unified owner adopted an unowned split component");
+
+        byte[] complete = new PrepatcherTransformer(all).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null, original);
+        require(complete != null, "Economy.advance all-feature fixture did not apply");
+        ClassNode tampered = read(complete);
+        MethodInsnNode scheduled = uniqueHook(tampered, "advanceMarketScheduled");
+        scheduled.name = "smo$brokenAdvanceMarketScheduled";
+        rejected = new PrepatcherTransformer(all).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null, write(tampered));
+        require(rejected == null,
+                "Economy.advance marker accepted a damaged combined postcondition");
+
+        Properties maskThreeProperties = new Properties();
+        maskThreeProperties.setProperty("patch.economyPersistentSnapshots", "true");
+        maskThreeProperties.setProperty("patch.economyLocationCache", "true");
+        maskThreeProperties.setProperty("patch.marketScheduler", "false");
+        rejected = new PrepatcherTransformer(
+                constructor.newInstance(maskThreeProperties)).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null, complete);
+        require(rejected == null,
+                "Economy.advance accepted a transformed class under a different feature mask");
+        System.out.println("OK economy-advance-plan masks=7 atomic rollback ownership mask postcondition");
+    }
+
+    private static void runSaveMethodPlanAtomicTests(List<Path> jarPaths)
+            throws Exception {
+        byte[] original = classBytes(jarPaths, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER);
+        Constructor<PrepatcherConfig> constructor =
+                PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
+        constructor.setAccessible(true);
+
+        // Scenario bits remain config-oriented for readability in this test:
+        // 1=output dedup, 2=scheduler, 4=campaign-cache maintenance.
+        for (int scenarioMask : new int[]{1, 4, 5, 6, 7}) {
+            Properties properties = savePlanProperties(scenarioMask);
+            PrepatcherConfig featureConfig = constructor.newInstance(properties);
+            byte[] patched = new PrepatcherTransformer(featureConfig).transform(
+                    null, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER, null, null, original);
+            require(patched != null, "save method patches did not apply scenario=" + scenarioMask);
+            ClassNode node = read(patched);
+
+            boolean dedup = (scenarioMask & 1) != 0;
+            boolean scheduler = (scenarioMask & 2) != 0;
+            boolean maintenance = (scenarioMask & 4) != 0;
+            boolean barrier = scheduler || maintenance;
+            int barrierMask = (maintenance ? 1 : 0) | (scheduler ? 2 : 0);
+
+            require(hasOwnershipMarker(node, "saveOutputBufferDedup") == dedup,
+                    "save output-buffer ownership marker changed scenario=" + scenarioMask);
+            require(hasOwnershipMarker(node, "saveMethodPlan") == barrier,
+                    "save barrier ownership marker changed scenario=" + scenarioMask);
+            require(!hasOwnershipMarker(node, "marketScheduler")
+                            && !hasOwnershipMarker(node, "remoteMarketScheduler"),
+                    "save method emitted legacy scheduler markers scenario=" + scenarioMask);
+            FieldNode maskField = findFieldOrNull(node, "smo$saveMethodPlanMask");
+            if (barrier) {
+                require(maskField != null && "I".equals(maskField.desc),
+                        "save barrier plan mask field missing scenario=" + scenarioMask);
+                require(maskField.value instanceof Integer value && value == barrierMask,
+                        "save barrier plan mask field changed scenario=" + scenarioMask);
+            } else {
+                require(maskField == null,
+                        "buffer-only patch emitted save barrier mask scenario=" + scenarioMask);
+            }
+
+            MethodNode save = method(node, "o00000",
+                    "(Lcom/fs/starfarer/campaign/CampaignEngine$o;JZ)Ljava/lang/String;");
+            require(countRedundantSaveBuffers(save) == (dedup ? 0 : 1),
+                    "save output-buffer component changed scenario=" + scenarioMask);
+            require(countCalls(save, "flushMarketSchedulerBeforeSave")
+                            == (scheduler ? 1 : 0),
+                    "save scheduler barrier count changed scenario=" + scenarioMask);
+            require(countHook(patched, "registerMarketSchedulerComponent")
+                            == (scheduler ? 1 : 0),
+                    "save scheduler registration count changed scenario=" + scenarioMask);
+            require(countCalls(save, Opcodes.INVOKESTATIC, HOOKS,
+                            "runCacheMaintenance", "(Z)V") == (maintenance ? 1 : 0),
+                    "save cache-maintenance barrier count changed scenario=" + scenarioMask);
+            if (maintenance) {
+                AbstractInsnNode first = firstMeaningful(save);
+                require(first != null && first.getOpcode() == Opcodes.ICONST_1,
+                        "save forced maintenance flag is not first scenario=" + scenarioMask);
+                MethodInsnNode maintenanceCall = (MethodInsnNode) nextMeaningful(first);
+                require(maintenanceCall.owner.equals(HOOKS)
+                                && maintenanceCall.name.equals("runCacheMaintenance")
+                                && maintenanceCall.desc.equals("(Z)V"),
+                        "save maintenance barrier is malformed scenario=" + scenarioMask);
+                if (scheduler) {
+                    MethodInsnNode flush = (MethodInsnNode) nextMeaningful(maintenanceCall);
+                    require(flush.owner.equals(HOOKS)
+                                    && flush.name.equals("flushMarketSchedulerBeforeSave")
+                                    && flush.desc.equals("()V"),
+                            "save scheduler barrier does not follow maintenance scenario="
+                                    + scenarioMask);
+                }
+            } else if (scheduler) {
+                AbstractInsnNode first = firstMeaningful(save);
+                require(first instanceof MethodInsnNode call
+                                && call.owner.equals(HOOKS)
+                                && call.name.equals("flushMarketSchedulerBeforeSave")
+                                && call.desc.equals("()V"),
+                        "save scheduler barrier is not first scenario=" + scenarioMask);
+            }
+
+            byte[] repeated = new PrepatcherTransformer(featureConfig).transform(
+                    null, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER, null, null, patched);
+            require(repeated == null,
+                    "save method patches were not idempotent scenario=" + scenarioMask);
+        }
+
+        Properties allProperties = savePlanProperties(7);
+        PrepatcherConfig all = constructor.newInstance(allProperties);
+
+        // The regression addressed by this change: an incompatible optional
+        // allocation pattern must skip only deduplication. The correctness
+        // barrier and its scheduler capability registration must still commit.
+        ClassNode brokenBuffer = read(original);
+        MethodNode brokenSave = method(brokenBuffer, "o00000",
+                "(Lcom/fs/starfarer/campaign/CampaignEngine$o;JZ)Ljava/lang/String;");
+        boolean changed = false;
+        for (AbstractInsnNode insn : brokenSave.instructions.toArray()) {
+            if (insn instanceof LdcInsnNode ldc
+                    && Integer.valueOf(1_048_576).equals(ldc.cst)) {
+                ldc.cst = 1_048_575;
+                changed = true;
+                break;
+            }
+        }
+        require(changed, "save buffer fixture did not find the 1 MiB constant");
+        byte[] barrierOnly = new PrepatcherTransformer(all).transform(
+                null, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER, null, null,
+                write(brokenBuffer));
+        require(barrierOnly != null,
+                "optional buffer mismatch rolled back the correctness-critical save barrier");
+        ClassNode barrierOnlyNode = read(barrierOnly);
+        require(hasOwnershipMarker(barrierOnlyNode, "saveMethodPlan"),
+                "save barrier ownership marker missing after optional dedup mismatch");
+        require(!hasOwnershipMarker(barrierOnlyNode, "saveOutputBufferDedup"),
+                "failed optional dedup emitted an ownership marker");
+        FieldNode barrierMask = requireField(barrierOnlyNode, "smo$saveMethodPlanMask", "I");
+        require(barrierMask.value instanceof Integer value && value == 3,
+                "save barrier mask changed after optional dedup mismatch");
+        MethodNode barrierOnlySave = method(barrierOnlyNode, "o00000",
+                "(Lcom/fs/starfarer/campaign/CampaignEngine$o;JZ)Ljava/lang/String;");
+        require(countCalls(barrierOnlySave, "flushMarketSchedulerBeforeSave") == 1,
+                "scheduler flush disappeared after optional dedup mismatch");
+        require(countCalls(barrierOnlySave, Opcodes.INVOKESTATIC, HOOKS,
+                        "runCacheMaintenance", "(Z)V") == 1,
+                "cache maintenance disappeared after optional dedup mismatch");
+        require(countHook(barrierOnly, "registerMarketSchedulerComponent") == 1,
+                "save scheduler capability registration disappeared after dedup mismatch");
+        require("APPLIED".equals(System.getProperty(
+                        "starsector.prepatcher.patchStatus."
+                                + PrepatcherTransformer.CAMPAIGN_GAME_MANAGER.replace('/', '.')
+                                + ".saveMethodPlan")),
+                "save barrier was not reported APPLIED after optional dedup mismatch");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(
+                        "starsector.prepatcher.patchStatus."
+                                + PrepatcherTransformer.CAMPAIGN_GAME_MANAGER.replace('/', '.')
+                                + ".saveOutputBufferDedup")),
+                "optional buffer mismatch was not isolated to its own patch status");
+
+        // Conversely, a malformed barrier must not be adopted. The optional
+        // buffer patch may still apply, but no scheduler capability is emitted.
+        ClassNode brokenBarrier = read(original);
+        MethodNode foreignSave = method(brokenBarrier, "o00000",
+                "(Lcom/fs/starfarer/campaign/CampaignEngine$o;JZ)Ljava/lang/String;");
+        InsnList foreignPrefix = new InsnList();
+        foreignPrefix.add(new InsnNode(Opcodes.ICONST_0));
+        foreignPrefix.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "runCacheMaintenance", "(Z)V", false));
+        foreignSave.instructions.insert(foreignPrefix);
+        byte[] dedupOnly = new PrepatcherTransformer(all).transform(
+                null, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER, null, null,
+                write(brokenBarrier));
+        require(dedupOnly != null,
+                "optional dedup did not remain independently available after barrier rejection");
+        ClassNode dedupOnlyNode = read(dedupOnly);
+        require(!hasOwnershipMarker(dedupOnlyNode, "saveMethodPlan"),
+                "malformed save barrier was adopted");
+        require(hasOwnershipMarker(dedupOnlyNode, "saveOutputBufferDedup"),
+                "independent output-buffer patch did not apply after barrier rejection");
+        require(countHook(dedupOnly, "registerMarketSchedulerComponent") == 0,
+                "scheduler capability was registered despite barrier rejection");
+
+        Properties maintenanceBufferProperties = savePlanProperties(5);
+        PrepatcherConfig maintenanceBuffer = constructor.newInstance(
+                maintenanceBufferProperties);
+        byte[] maintenanceBufferBytes = new PrepatcherTransformer(maintenanceBuffer).transform(
+                null, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER, null, null, original);
+        require(maintenanceBufferBytes != null,
+                "save maintenance+buffer fixture did not apply");
+
+        // Removing either independent owner must not allow adoption of the
+        // existing hook-shaped state.
+        ClassNode unownedBuffer = read(maintenanceBufferBytes);
+        require(unownedBuffer.fields.removeIf(field -> field.name.equals(
+                        "smo$patched$saveOutputBufferDedup")),
+                "save output-buffer ownership marker missing in fixture");
+        byte[] rejected = new PrepatcherTransformer(maintenanceBuffer).transform(
+                null, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER, null, null,
+                write(unownedBuffer));
+        require(rejected == null,
+                "save output-buffer patch adopted an unowned absent-buffer state");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(
+                        "starsector.prepatcher.patchStatus."
+                                + PrepatcherTransformer.CAMPAIGN_GAME_MANAGER.replace('/', '.')
+                                + ".saveOutputBufferDedup")),
+                "unowned output-buffer state was not rejected structurally");
+
+        ClassNode unownedBarrier = read(maintenanceBufferBytes);
+        require(unownedBarrier.fields.removeIf(field -> field.name.equals(
+                        "smo$patched$saveMethodPlan")),
+                "save barrier ownership marker missing in fixture");
+        require(unownedBarrier.fields.removeIf(field -> field.name.equals(
+                        "smo$saveMethodPlanMask")),
+                "save barrier mask missing in fixture");
+        rejected = new PrepatcherTransformer(maintenanceBuffer).transform(
+                null, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER, null, null,
+                write(unownedBarrier));
+        require(rejected == null,
+                "save barrier adopted an unowned maintenance hook");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(
+                        "starsector.prepatcher.patchStatus."
+                                + PrepatcherTransformer.CAMPAIGN_GAME_MANAGER.replace('/', '.')
+                                + ".saveMethodPlan")),
+                "unowned save barrier state was not rejected structurally");
+
+        byte[] complete = new PrepatcherTransformer(all).transform(
+                null, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER, null, null, original);
+        require(complete != null, "save all-feature fixture did not apply");
+        ClassNode tampered = read(complete);
+        MethodNode tamperedSave = method(tampered, "o00000",
+                "(Lcom/fs/starfarer/campaign/CampaignEngine$o;JZ)Ljava/lang/String;");
+        MethodInsnNode flush = uniqueCall(tamperedSave, Opcodes.INVOKESTATIC,
+                HOOKS, "flushMarketSchedulerBeforeSave", "()V");
+        flush.name = "smo$brokenFlushMarketSchedulerBeforeSave";
+        rejected = new PrepatcherTransformer(all).transform(
+                null, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER, null, null,
+                write(tampered));
+        require(rejected == null,
+                "save barrier marker accepted a damaged combined postcondition");
+
+        rejected = new PrepatcherTransformer(maintenanceBuffer).transform(
+                null, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER, null, null, complete);
+        require(rejected == null,
+                "save barrier accepted a transformed class under a different barrier mask");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(
+                        "starsector.prepatcher.patchStatus."
+                                + PrepatcherTransformer.CAMPAIGN_GAME_MANAGER.replace('/', '.')
+                                + ".saveMethodPlan")),
+                "save barrier mask mismatch was not rejected structurally");
+        System.out.println("OK save-method barrier masks=2 optional-dedup isolation ownership postconditions");
+    }
+
+    private static Properties savePlanProperties(int mask) {
+        Properties properties = new Properties();
+        properties.setProperty("patch.saveOutputBufferDedup",
+                Boolean.toString((mask & 1) != 0));
+        properties.setProperty("patch.marketScheduler",
+                Boolean.toString((mask & 2) != 0));
+        boolean maintenance = (mask & 4) != 0;
+        properties.setProperty("patch.labelSpatialCandidates", Boolean.toString(maintenance));
+        properties.setProperty("patch.intelCallbackCache", "false");
+        properties.setProperty("patch.intelArrowRendering", "false");
+        properties.setProperty("patch.intelEntityIndex", "false");
+        properties.setProperty("patch.mapHitTest", "false");
+        properties.setProperty("patch.systemNebulaCache", "false");
+        properties.setProperty("patch.sampleCacheClearThrottle", "false");
+        properties.setProperty("patch.campaignListenerThrottle", "false");
+        properties.setProperty("patch.routeJumpPointIndex", "false");
+        properties.setProperty("patch.economyLocationCache", "false");
+        properties.setProperty("patch.commRelaySystemIndex", "false");
+        properties.setProperty("patch.commodityTemporalFastPath", "false");
+        properties.setProperty("scratch.trim.enabled", "false");
+        properties.setProperty("patch.starfieldCleanupBuffers", "false");
+        return properties;
+    }
+
+    private static void runMarketAdvancePlanAtomicTests(List<Path> jarPaths)
+            throws Exception {
+        byte[] original = classBytes(jarPaths, PrepatcherTransformer.MARKET);
+        Constructor<PrepatcherConfig> constructor =
+                PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
+        constructor.setAccessible(true);
+
+        for (int mask = 1; mask <= 15; mask++) {
+            Properties properties = new Properties();
+            properties.setProperty("patch.economyPersistentSnapshots",
+                    Boolean.toString((mask & 1) != 0));
+            properties.setProperty("patch.commodityTemporalFastPath",
+                    Boolean.toString((mask & 2) != 0));
+            properties.setProperty("patch.directMarketObservation",
+                    Boolean.toString((mask & 4) != 0));
+            properties.setProperty("patch.marketScheduler",
+                    Boolean.toString((mask & 8) != 0));
+            PrepatcherConfig featureConfig = constructor.newInstance(properties);
+            byte[] patched = new PrepatcherTransformer(featureConfig).transform(
+                    null, PrepatcherTransformer.MARKET, null, null, original);
+            require(patched != null, "Market.advance unified plan did not apply mask=" + mask);
+            ClassNode node = read(patched);
+            require(hasOwnershipMarker(node, "marketAdvancePlan"),
+                    "Market.advance unified ownership marker missing mask=" + mask);
+            require(!hasOwnershipMarker(node, "economyPersistentSnapshots")
+                            && !hasOwnershipMarker(node, "commodityTemporalFastPath")
+                            && !hasOwnershipMarker(node, "directMarketObservation")
+                            && !hasOwnershipMarker(node, "marketScheduler"),
+                    "Market.advance emitted legacy split markers mask=" + mask);
+            FieldNode maskField = requireField(node, "smo$marketAdvancePlanMask", "I");
+            require(maskField.value instanceof Integer value && value == mask,
+                    "Market.advance plan mask field changed for mask=" + mask);
+            require(countHook(patched, "borrowPersistentSnapshotFrames")
+                            == (((mask & 1) != 0) ? 2 : 0),
+                    "Market.advance persistent component count changed mask=" + mask);
+            require(countHook(patched, "advanceMarketCommodityTemporalState")
+                            == (((mask & 2) != 0) ? 1 : 0),
+                    "Market.advance commodity component count changed mask=" + mask);
+            require(countHook(patched, "observeMarketAdvanceEntry")
+                            == (((mask & 4) != 0) ? 1 : 0),
+                    "Market.advance observation component count changed mask=" + mask);
+            boolean scheduler = (mask & 8) != 0;
+            require(countHook(patched, "beginMarketAdvanceInvocation")
+                            == (scheduler ? 1 : 0)
+                            && countHook(patched, "endMarketAdvanceInvocation")
+                            == (scheduler ? 2 : 0)
+                            && countHook(patched, "registerConstructionQueueOwner")
+                            == (scheduler ? 1 : 0)
+                            && countHook(patched, "flushPendingMarketBeforeMutation")
+                            == (scheduler ? 3 : 0)
+                            && countHook(patched, "registerMarketSchedulerComponent")
+                            == (scheduler ? 1 : 0),
+                    "Market.advance scheduler semantic component changed mask=" + mask);
+            byte[] repeated = new PrepatcherTransformer(featureConfig).transform(
+                    null, PrepatcherTransformer.MARKET, null, null, patched);
+            require(repeated == null,
+                    "Market.advance unified plan was not idempotent mask=" + mask);
+        }
+
+        Properties allProperties = new Properties();
+        allProperties.setProperty("patch.economyPersistentSnapshots", "true");
+        allProperties.setProperty("patch.commodityTemporalFastPath", "true");
+        allProperties.setProperty("patch.directMarketObservation", "true");
+        allProperties.setProperty("patch.marketScheduler", "true");
+        PrepatcherConfig all = constructor.newInstance(allProperties);
+
+        ClassNode brokenCommodity = read(original);
+        MethodNode brokenAdvance = method(brokenCommodity, "advance", "(F)V");
+        MethodInsnNode commodityGetter = uniqueCall(brokenAdvance, Opcodes.INVOKEVIRTUAL,
+                PrepatcherTransformer.MARKET, "getCommodities", "()Ljava/util/List;");
+        commodityGetter.name = "smo$brokenGetCommodities";
+        byte[] rejected = new PrepatcherTransformer(all).transform(
+                null, PrepatcherTransformer.MARKET, null, null, write(brokenCommodity));
+        require(rejected == null,
+                "Market.advance plan partially committed when commodity analysis failed");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(
+                        "starsector.prepatcher.patchStatus."
+                                + PrepatcherTransformer.MARKET.replace('/', '.')
+                                + ".marketAdvancePlan")),
+                "Market.advance failed component was not rejected structurally");
+
+        Properties snapshotsProperties = new Properties();
+        snapshotsProperties.setProperty("patch.economyPersistentSnapshots", "true");
+        snapshotsProperties.setProperty("patch.commodityTemporalFastPath", "false");
+        snapshotsProperties.setProperty("patch.directMarketObservation", "false");
+        snapshotsProperties.setProperty("patch.marketScheduler", "false");
+        byte[] snapshotsOnly = new PrepatcherTransformer(
+                constructor.newInstance(snapshotsProperties)).transform(
+                null, PrepatcherTransformer.MARKET, null, null, original);
+        require(snapshotsOnly != null, "Market.advance snapshot-only fixture did not apply");
+        ClassNode unownedSplit = read(snapshotsOnly);
+        require(unownedSplit.fields.removeIf(field -> field.name.equals(
+                        "smo$patched$marketAdvancePlan")),
+                "Market.advance test fixture ownership marker missing");
+        require(unownedSplit.fields.removeIf(field -> field.name.equals(
+                        "smo$marketAdvancePlanMask")),
+                "Market.advance test fixture mask missing");
+        rejected = new PrepatcherTransformer(all).transform(
+                null, PrepatcherTransformer.MARKET, null, null, write(unownedSplit));
+        require(rejected == null,
+                "Market.advance unified owner adopted an unowned split component");
+
+        byte[] complete = new PrepatcherTransformer(all).transform(
+                null, PrepatcherTransformer.MARKET, null, null, original);
+        require(complete != null, "Market.advance all-feature fixture did not apply");
+        ClassNode tampered = read(complete);
+        MethodInsnNode observation = uniqueHook(tampered, "observeMarketAdvanceEntry");
+        observation.name = "smo$brokenObserveMarketAdvanceEntry";
+        rejected = new PrepatcherTransformer(all).transform(
+                null, PrepatcherTransformer.MARKET, null, null, write(tampered));
+        require(rejected == null,
+                "Market.advance marker accepted a damaged combined postcondition");
+
+        Properties maskThreeProperties = new Properties();
+        maskThreeProperties.setProperty("patch.economyPersistentSnapshots", "true");
+        maskThreeProperties.setProperty("patch.commodityTemporalFastPath", "true");
+        maskThreeProperties.setProperty("patch.directMarketObservation", "false");
+        maskThreeProperties.setProperty("patch.marketScheduler", "false");
+        rejected = new PrepatcherTransformer(
+                constructor.newInstance(maskThreeProperties)).transform(
+                null, PrepatcherTransformer.MARKET, null, null, complete);
+        require(rejected == null,
+                "Market.advance accepted a transformed class under a different feature mask");
+        System.out.println("OK market-advance-plan masks=15 atomic rollback ownership mask postcondition");
+    }
+
+    private static void runCoreMarketAdvanceCoverageTest(List<Path> jarPaths) throws Exception {
+        String market = "com/fs/starfarer/api/campaign/econ/MarketAPI";
+        Map<String, Integer> expected = new LinkedHashMap<>();
+        expected.put(PrepatcherTransformer.ECONOMY + ".advance(F)V", 1);
+        expected.put(PrepatcherTransformer.BASE_CAMPAIGN_ENTITY + ".advance(F)V", 1);
+        expected.put(PrepatcherTransformer.PLANET_SURVEY_PANEL
+                + ".new(Ljava/lang/String;Z)V", 1);
+        expected.put(PrepatcherTransformer.LUDDIC_PATH_BASE_INTEL + ".notifyEnding()V", 1);
+        expected.put(PrepatcherTransformer.PIRATE_BASE_INTEL + ".notifyEnding()V", 1);
+        expected.put(PrepatcherTransformer.DECIV_TRACKER
+                + ".decivilize(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;ZZ)V", 1);
+        expected.put(PrepatcherTransformer.DECIV_TRACKER
+                + ".removeColony(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;Z)V", 1);
+        expected.put(PrepatcherTransformer.PK_CMD
+                + ".convertSentinelToColony(Lcom/fs/starfarer/api/campaign/TextPanelAPI;"
+                + "Lcom/fs/starfarer/api/campaign/CargoAPI;)Z", 1);
+
+        Map<String, Integer> actual = new LinkedHashMap<>();
+        for (Path jarPath : jarPaths) {
+            try (JarFile jar = new JarFile(jarPath.toFile())) {
+                for (var entries = jar.entries(); entries.hasMoreElements();) {
+                    var entry = entries.nextElement();
+                    if (entry.isDirectory() || !entry.getName().endsWith(".class")) continue;
+                    ClassNode node = read(jar.getInputStream(entry).readAllBytes());
+                    for (MethodNode method : node.methods) {
+                        for (AbstractInsnNode insn : method.instructions.toArray()) {
+                            if (!(insn instanceof MethodInsnNode call)
+                                    || call.getOpcode() != Opcodes.INVOKEINTERFACE
+                                    || !call.owner.equals(market)
+                                    || !call.name.equals("advance")
+                                    || !call.desc.equals("(F)V")) continue;
+                            String key = node.name + "." + method.name + method.desc;
+                            actual.merge(key, 1, Integer::sum);
+                        }
+                    }
+                }
+            }
+        }
+        require(actual.equals(expected), "core MarketAPI.advance coverage changed; expected="
+                + expected + " actual=" + actual);
+        System.out.println("OK core-market-advance-coverage scheduled=2 synchronized=6 unknown=0");
+    }
+
+    /** Locks the construction mutation inventory to the current game JARs. */
+    private static void runConstructionMutationCoverageTest(List<Path> jarPaths)
+            throws Exception {
+        ClassNode market = read(classBytes(jarPaths, PrepatcherTransformer.MARKET));
+        Set<String> marketInventory = publicMethodInventory(market, Set.of(
+                "addIndustry", "removeIndustry", "instantiateIndustry"));
+        Set<String> expectedMarket = Set.of(
+                "addIndustry(Ljava/lang/String;)V",
+                "addIndustry(Ljava/lang/String;Ljava/util/List;)V",
+                "removeIndustry(Ljava/lang/String;"
+                        + "Lcom/fs/starfarer/api/campaign/econ/MarketAPI$MarketInteractionMode;Z)V",
+                "instantiateIndustry(Ljava/lang/String;)"
+                        + "Lcom/fs/starfarer/api/campaign/econ/Industry;");
+        require(marketInventory.equals(expectedMarket),
+                "Market construction-mutator inventory drifted: " + marketInventory);
+
+        ClassNode industry = read(classBytes(jarPaths, PrepatcherTransformer.BASE_INDUSTRY));
+        Set<String> industryInventory = publicMethodInventory(industry, Set.of(
+                "startBuilding", "finishBuildingOrUpgrading", "startUpgrading",
+                "cancelUpgrade", "downgrade", "buildNextInQueue"));
+        Set<String> expectedIndustry = Set.of(
+                "startBuilding()V",
+                "finishBuildingOrUpgrading()V",
+                "startUpgrading()V",
+                "cancelUpgrade()V",
+                "downgrade()V",
+                "buildNextInQueue(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;)V");
+        require(industryInventory.equals(expectedIndustry),
+                "BaseIndustry construction-mutator inventory drifted: "
+                        + industryInventory);
+
+        ClassNode queue = read(classBytes(jarPaths, PrepatcherTransformer.CONSTRUCTION_QUEUE));
+        Set<String> queueInventory = publicMethodInventory(queue, Set.of(
+                "getItems", "setItems", "addToEnd", "moveUp", "moveDown",
+                "moveToFront", "moveToBack", "removeItem", "getItem", "hasItem"));
+        Set<String> expectedQueue = Set.of(
+                "getItems()Ljava/util/List;",
+                "setItems(Ljava/util/List;)V",
+                "addToEnd(Ljava/lang/String;I)V",
+                "moveUp(Ljava/lang/String;)V",
+                "moveDown(Ljava/lang/String;)V",
+                "moveToFront(Ljava/lang/String;)V",
+                "moveToBack(Ljava/lang/String;)V",
+                "removeItem(Ljava/lang/String;)V",
+                "getItem(Ljava/lang/String;)"
+                        + "Lcom/fs/starfarer/api/impl/campaign/econ/impl/"
+                        + "ConstructionQueue$ConstructionQueueItem;",
+                "hasItem(Ljava/lang/String;)Z");
+        require(queueInventory.equals(expectedQueue),
+                "ConstructionQueue mutation inventory drifted: " + queueInventory);
+
+        Set<String> marketDeclarations = jarWidePublicMethodInventory(
+                jarPaths, expectedMarket);
+        Set<String> expectedMarketDeclarations = new LinkedHashSet<>();
+        for (String owner : List.of(
+                "com/fs/starfarer/api/campaign/econ/MarketAPI",
+                PrepatcherTransformer.MARKET,
+                "com/fs/starfarer/campaign/econ/PlanetConditionMarket")) {
+            for (String signature : expectedMarket) {
+                expectedMarketDeclarations.add(owner + "." + signature);
+            }
+        }
+        require(marketDeclarations.equals(expectedMarketDeclarations),
+                "JAR-wide Market construction mutation declarations drifted: "
+                        + marketDeclarations);
+
+        Set<String> industryDeclarations = jarWidePublicMethodInventory(
+                jarPaths, expectedIndustry);
+        Set<String> expectedIndustryDeclarations = new LinkedHashSet<>();
+        for (String signature : expectedIndustry) {
+            expectedIndustryDeclarations.add(PrepatcherTransformer.BASE_INDUSTRY
+                    + "." + signature);
+            if (!signature.startsWith("buildNextInQueue")) {
+                expectedIndustryDeclarations.add(
+                        "com/fs/starfarer/api/campaign/econ/Industry." + signature);
+            }
+        }
+        require(industryDeclarations.equals(expectedIndustryDeclarations),
+                "JAR-wide BaseIndustry transition declarations drifted: "
+                        + industryDeclarations);
+
+        Set<String> queueMutationSignatures = Set.of(
+                "setItems(Ljava/util/List;)V",
+                "addToEnd(Ljava/lang/String;I)V",
+                "moveUp(Ljava/lang/String;)V",
+                "moveDown(Ljava/lang/String;)V",
+                "moveToFront(Ljava/lang/String;)V",
+                "moveToBack(Ljava/lang/String;)V",
+                "removeItem(Ljava/lang/String;)V");
+        Set<String> queueDeclarations = jarWidePublicMethodInventory(
+                jarPaths, queueMutationSignatures);
+        Set<String> expectedQueueDeclarations = new LinkedHashSet<>();
+        for (String signature : queueMutationSignatures) {
+            expectedQueueDeclarations.add(PrepatcherTransformer.CONSTRUCTION_QUEUE
+                    + "." + signature);
+        }
+        require(queueDeclarations.equals(expectedQueueDeclarations),
+                "JAR-wide ConstructionQueue declarations drifted: " + queueDeclarations);
+
+        ClassNode planetConditionMarket = read(classBytes(jarPaths,
+                "com/fs/starfarer/campaign/econ/PlanetConditionMarket"));
+        require(isTrivialVoidNoOp(method(planetConditionMarket,
+                        "addIndustry", "(Ljava/lang/String;)V"))
+                        && isTrivialVoidNoOp(method(planetConditionMarket,
+                        "addIndustry", "(Ljava/lang/String;Ljava/util/List;)V"))
+                        && isTrivialVoidNoOp(method(planetConditionMarket,
+                        "removeIndustry", "(Ljava/lang/String;"
+                                + "Lcom/fs/starfarer/api/campaign/econ/"
+                                + "MarketAPI$MarketInteractionMode;Z)V"))
+                        && isTrivialNullReturn(method(planetConditionMarket,
+                        "instantiateIndustry", "(Ljava/lang/String;)"
+                                + "Lcom/fs/starfarer/api/campaign/econ/Industry;")),
+                "PlanetConditionMarket construction-method exemption is no longer a no-op");
+
+        System.out.println("OK construction-mutator-coverage market=3+factory"
+                + " industry=4+2-internal queue=7+3-read-only jar-wide-noop-exemption");
+    }
+
+    private static Set<String> publicMethodInventory(ClassNode node, Set<String> names) {
+        Set<String> result = new LinkedHashSet<>();
+        for (MethodNode method : node.methods) {
+            if (!names.contains(method.name)) continue;
+            if ((method.access & Opcodes.ACC_PUBLIC) == 0) continue;
+            result.add(method.name + method.desc);
+        }
+        return result;
+    }
+
+    private static Set<String> jarWidePublicMethodInventory(
+            List<Path> jarPaths, Set<String> signatures) throws Exception {
+        Set<String> result = new LinkedHashSet<>();
+        for (Path jarPath : jarPaths) {
+            try (JarFile jar = new JarFile(jarPath.toFile())) {
+                for (var entries = jar.entries(); entries.hasMoreElements();) {
+                    var entry = entries.nextElement();
+                    if (entry.isDirectory() || !entry.getName().endsWith(".class")) continue;
+                    ClassNode node = read(jar.getInputStream(entry).readAllBytes());
+                    for (MethodNode method : node.methods) {
+                        String signature = method.name + method.desc;
+                        if ((method.access & Opcodes.ACC_PUBLIC) != 0
+                                && signatures.contains(signature)) {
+                            result.add(node.name + "." + signature);
+                        }
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    private static boolean isTrivialVoidNoOp(MethodNode method) {
+        List<Integer> opcodes = meaningfulOpcodes(method);
+        return opcodes.equals(List.of(Opcodes.RETURN));
+    }
+
+    private static boolean isTrivialNullReturn(MethodNode method) {
+        List<Integer> opcodes = meaningfulOpcodes(method);
+        return opcodes.equals(List.of(Opcodes.ACONST_NULL, Opcodes.ARETURN));
+    }
+
+    private static List<Integer> meaningfulOpcodes(MethodNode method) {
+        List<Integer> result = new ArrayList<>();
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn.getOpcode() >= 0) result.add(insn.getOpcode());
+        }
+        return result;
+    }
+
+    private static void runMarketSchedulerStructuralTest(
             List<Path> jarPaths) throws Exception {
         Properties properties = new Properties();
-        properties.setProperty("patch.planetConditionMarketScheduler", "true");
-        properties.setProperty("patch.remoteMarketScheduler", "false");
+        properties.setProperty("patch.marketScheduler", "true");
         properties.setProperty("patch.economyLocationCache", "false");
-        properties.setProperty("patch.economySnapshotReuse", "false");
+        properties.setProperty("patch.economyPersistentSnapshots", "false");
         properties.setProperty("patch.entityScriptSnapshotReuse", "false");
+        properties.setProperty("patch.campaignSnapshotReuse", "false");
         properties.setProperty("patch.directMarketObservation", "false");
         properties.setProperty("patch.saveOutputBufferDedup", "false");
         Constructor<PrepatcherConfig> constructor =
                 PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
         constructor.setAccessible(true);
-        PrepatcherConfig planetOnly = constructor.newInstance(properties);
+        PrepatcherConfig scheduler = constructor.newInstance(properties);
+
+        byte[] stateOriginal = classBytes(jarPaths, PrepatcherTransformer.CAMPAIGN_STATE);
+        byte[] state = new PrepatcherTransformer(scheduler).transform(
+                null, PrepatcherTransformer.CAMPAIGN_STATE, null, null, stateOriginal);
+        require(state != null, "market scheduler did not validate CampaignState batch protocol");
+        require(countHook(state, "registerMarketSchedulerComponent") == 1,
+                "CampaignState batch protocol did not register its scheduler component");
+
+        ClassNode brokenState = read(stateOriginal);
+        MethodNode stateAdvance = method(
+                brokenState, "advance", "(FLcom/fs/starfarer/util/A/new;)V");
+        ArrayList<MethodInsnNode> setters = new ArrayList<>();
+        for (AbstractInsnNode insn : stateAdvance.instructions.toArray()) {
+            if (insn instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals(PrepatcherTransformer.CAMPAIGN_ENGINE)
+                    && call.name.equals("setFastForwardIteration")
+                    && call.desc.equals("(Z)V")) {
+                setters.add(call);
+            }
+        }
+        require(setters.size() == 3, "test input CampaignState batch protocol changed");
+        AbstractInsnNode trueArgument = previousMeaningful(setters.get(1));
+        stateAdvance.instructions.set(trueArgument, new InsnNode(Opcodes.ICONST_0));
+        String stateStatus = "starsector.prepatcher.patchStatus."
+                + PrepatcherTransformer.CAMPAIGN_STATE.replace('/', '.') + ".marketScheduler";
+        System.clearProperty(stateStatus);
+        byte[] brokenResult = new PrepatcherTransformer(scheduler).transform(
+                null, PrepatcherTransformer.CAMPAIGN_STATE, null, null, write(brokenState));
+        require(brokenResult == null,
+                "market scheduler accepted a broken CampaignState batch protocol");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(stateStatus)),
+                "broken CampaignState batch protocol did not fail closed structurally");
+
+        byte[] engineOriginal = classBytes(jarPaths, PrepatcherTransformer.CAMPAIGN_ENGINE);
+        byte[] engine = new PrepatcherTransformer(scheduler).transform(
+                null, PrepatcherTransformer.CAMPAIGN_ENGINE, null, null, engineOriginal);
+        require(engine != null, "market scheduler was not applied to CampaignEngine");
+        require(countHook(engine, "beginMarketSchedulerTick") == 1
+                        && countHook(engine, "endMarketSchedulerTick") >= 2,
+                "CampaignEngine did not receive a full-method scheduler tick boundary");
+        require(countHook(engine, "marketSchedulerFastForwardIterationChanged") == 1,
+                "CampaignEngine did not receive the render-batch boundary hook");
+        require(countHook(engine, "beginCampaignEngineChange") == 2
+                        && countHook(engine, "completeCampaignEngineChange") >= 2,
+                "market scheduler engine component was installed without lifecycle hooks");
 
         byte[] economyOriginal = classBytes(jarPaths, PrepatcherTransformer.ECONOMY);
-        byte[] economy = new PrepatcherTransformer(planetOnly).transform(
-                null, PrepatcherTransformer.ECONOMY, null, null,
-                economyOriginal);
-        require(economy != null, "planet-condition-only Economy frame clock was not applied");
-        require(countHook(economy, "beginRemoteMarketFrame") == 1
-                        && countHook(economy, "advanceMarketScheduled") == 0,
-                "planet-condition-only Economy transform changed central market scheduling");
-        assertScratchScope(economy, "advance", "(F)V");
-
-        ClassNode unscopedEconomy = read(economy);
-        removeScratchScope(method(unscopedEconomy, "advance", "(F)V"));
-        byte[] unscopedEconomyResult = new PrepatcherTransformer(planetOnly).transform(
-                null, PrepatcherTransformer.ECONOMY, null, null, write(unscopedEconomy));
-        require(unscopedEconomyResult == null,
-                "planet-condition frame clock without scratch scope was modified");
-        require("SKIPPED_STRUCTURAL".equals(System.getProperty(
-                        "starsector.prepatcher.patchStatus."
-                                + PrepatcherTransformer.ECONOMY.replace('/', '.')
-                                + ".planetConditionMarketFrameClock")),
-                "planet-condition frame clock without scratch scope was accepted");
+        byte[] economy = new PrepatcherTransformer(scheduler).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null, economyOriginal);
+        require(economy != null, "common market scheduler was not applied to Economy");
+        require(countHook(economy, "beginMarketSchedulerTick") == 0
+                        && countHook(economy, "advanceMarketScheduled") == 1,
+                "Economy retained a second scheduler frame boundary");
+        MethodInsnNode economyHook = uniqueHook(read(economy), "advanceMarketScheduled");
+        require(isIntegerConstant(previousMeaningful(economyHook), 0),
+                "Economy scheduler source is not ECONOMY_LOOP");
 
         byte[] entityOriginal = classBytes(
                 jarPaths, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY);
-        byte[] entity = new PrepatcherTransformer(planetOnly).transform(
+        byte[] entity = new PrepatcherTransformer(scheduler).transform(
                 null, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY, null, null,
                 entityOriginal);
-        require(entity != null
-                        && countHook(entity, "advancePlanetConditionMarketScheduled") == 1,
-                "planet-condition-only BaseCampaignEntity bridge was not applied");
+        require(entity != null && countHook(entity, "advanceMarketScheduled") == 1,
+                "BaseCampaignEntity market scheduler bridge was not applied");
+        MethodInsnNode entityHook = uniqueHook(read(entity), "advanceMarketScheduled");
+        require(isIntegerConstant(previousMeaningful(entityHook), 1),
+                "BaseCampaignEntity scheduler source is not PLANET_CONDITION");
 
-        ClassNode invertedPredicate = read(entityOriginal);
-        MethodNode invertedAdvance = method(invertedPredicate, "advance", "(F)V");
-        MethodInsnNode invertedCall = uniqueCall(invertedAdvance, Opcodes.INVOKEINTERFACE,
-                "com/fs/starfarer/api/campaign/econ/MarketAPI",
-                "isPlanetConditionMarketOnly", "()Z");
-        AbstractInsnNode invertedBranchInsn = nextMeaningful(invertedCall);
-        require(invertedBranchInsn instanceof JumpInsnNode
-                        && invertedBranchInsn.getOpcode() == Opcodes.IFEQ,
-                "planet-condition predicate branch changed in test input");
-        JumpInsnNode invertedBranch = (JumpInsnNode) invertedBranchInsn;
-        invertedAdvance.instructions.set(invertedBranch,
-                new JumpInsnNode(Opcodes.IFNE, invertedBranch.label));
-        assertInlinePatchRejected(planetOnly, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
-                "planetConditionMarketAdvanceBridge", write(invertedPredicate),
-                "planet-condition predicate branch inversion");
-
-        ClassNode foreignPredicateReceiver = read(entityOriginal);
-        MethodNode foreignReceiverAdvance = method(
-                foreignPredicateReceiver, "advance", "(F)V");
-        MethodInsnNode foreignReceiverCall = uniqueCall(foreignReceiverAdvance,
-                Opcodes.INVOKEINTERFACE, "com/fs/starfarer/api/campaign/econ/MarketAPI",
-                "isPlanetConditionMarketOnly", "()Z");
-        AbstractInsnNode predicateReceiver = previousMeaningful(foreignReceiverCall);
-        require(predicateReceiver instanceof FieldInsnNode,
-                "planet-condition predicate receiver changed in test input");
-        ((FieldInsnNode) predicateReceiver).name = "smo$foreign$market";
-        assertInlinePatchRejected(planetOnly, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
-                "planetConditionMarketAdvanceBridge", write(foreignPredicateReceiver),
-                "planet-condition predicate receiver mismatch");
-
-        ClassNode bypassedPredicate = read(entityOriginal);
-        MethodNode bypassedAdvance = method(bypassedPredicate, "advance", "(F)V");
-        MethodInsnNode bypassedMarketCall = uniqueCall(bypassedAdvance,
-                Opcodes.INVOKEINTERFACE, "com/fs/starfarer/api/campaign/econ/MarketAPI",
-                "advance", "(F)V");
-        AbstractInsnNode bypassedOwner = previousMeaningful(
-                previousMeaningful(previousMeaningful(bypassedMarketCall)));
-        require(bypassedOwner instanceof VarInsnNode
-                        && bypassedOwner.getOpcode() == Opcodes.ALOAD,
-                "planet-condition market receiver changed in bypass test input");
-        LabelNode bypass = new LabelNode();
-        bypassedAdvance.instructions.insertBefore(bypassedOwner, bypass);
-        bypassedAdvance.instructions.insert(bypass,
-                new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
-        InsnList bypassJump = new InsnList();
-        bypassJump.add(new InsnNode(Opcodes.ICONST_1));
-        bypassJump.add(new JumpInsnNode(Opcodes.IFNE, bypass));
-        bypassedAdvance.instructions.insertBefore(
-                bypassedAdvance.instructions.getFirst(), bypassJump);
-        assertInlinePatchRejected(planetOnly, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
-                "planetConditionMarketAdvanceBridge", write(bypassedPredicate),
-                "planet-condition guard bypass edge");
-
-        ClassNode enteredPredicateBranch = read(entityOriginal);
-        MethodNode enteredBranchAdvance = method(
-                enteredPredicateBranch, "advance", "(F)V");
-        MethodInsnNode enteredBranchPredicate = uniqueCall(enteredBranchAdvance,
-                Opcodes.INVOKEINTERFACE, "com/fs/starfarer/api/campaign/econ/MarketAPI",
-                "isPlanetConditionMarketOnly", "()Z");
-        AbstractInsnNode enteredBranchInsn = nextMeaningful(enteredBranchPredicate);
-        require(enteredBranchInsn instanceof JumpInsnNode
-                        && enteredBranchInsn.getOpcode() == Opcodes.IFEQ,
-                "planet-condition predicate branch changed in branch-entry test input");
-        LabelNode branchEntry = new LabelNode();
-        enteredBranchAdvance.instructions.insertBefore(enteredBranchInsn, branchEntry);
-        enteredBranchAdvance.instructions.insert(branchEntry,
-                new FrameNode(Opcodes.F_SAME1, 0, null, 1,
-                        new Object[] { Opcodes.INTEGER }));
-        InsnList branchEntryJump = new InsnList();
-        branchEntryJump.add(new InsnNode(Opcodes.ICONST_1));
-        branchEntryJump.add(new JumpInsnNode(Opcodes.GOTO, branchEntry));
-        enteredBranchAdvance.instructions.insertBefore(
-                enteredBranchAdvance.instructions.getFirst(), branchEntryJump);
-        assertInlinePatchRejected(planetOnly, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
-                "planetConditionMarketAdvanceBridge", write(enteredPredicateBranch),
-                "planet-condition predicate branch external entry");
-
-        ClassNode damagedPatchedPredicate = read(entity);
-        MethodNode damagedPatchedAdvance = method(
-                damagedPatchedPredicate, "advance", "(F)V");
-        MethodInsnNode damagedPatchedCall = uniqueCall(damagedPatchedAdvance,
-                Opcodes.INVOKEINTERFACE, "com/fs/starfarer/api/campaign/econ/MarketAPI",
-                "isPlanetConditionMarketOnly", "()Z");
-        AbstractInsnNode damagedPatchedBranchInsn = nextMeaningful(damagedPatchedCall);
-        require(damagedPatchedBranchInsn instanceof JumpInsnNode
-                        && damagedPatchedBranchInsn.getOpcode() == Opcodes.IFEQ,
-                "patched planet-condition predicate branch changed in test input");
-        JumpInsnNode damagedPatchedBranch = (JumpInsnNode) damagedPatchedBranchInsn;
-        damagedPatchedAdvance.instructions.set(damagedPatchedBranch,
-                new JumpInsnNode(Opcodes.IFNE, damagedPatchedBranch.label));
-        assertInlinePatchRejected(planetOnly, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
-                "planetConditionMarketAdvanceBridge", write(damagedPatchedPredicate),
-                "marker-preserved planet-condition predicate branch inversion");
-
-        byte[] save = new PrepatcherTransformer(planetOnly).transform(
+        byte[] managerOriginal = classBytes(
+                jarPaths, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER);
+        byte[] manager = new PrepatcherTransformer(scheduler).transform(
                 null, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER, null, null,
-                classBytes(jarPaths, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER));
-        require(save != null && countHook(save, "flushRemoteMarketsBeforeSave") == 1,
-                "planet-condition-only pre-save flush was not applied");
+                managerOriginal);
+        require(manager != null && countHook(manager, "flushMarketSchedulerBeforeSave") == 1,
+                "market scheduler pre-save flush was not applied");
+        require(countHook(manager, "runCacheMaintenance") == 1,
+                "forced cache maintenance was not applied before market scheduler save flush");
+
+        byte[] militaryOriginal = classBytes(
+                jarPaths, PrepatcherTransformer.MILITARY_BASE);
+        byte[] military = new PrepatcherTransformer(scheduler).transform(
+                null, PrepatcherTransformer.MILITARY_BASE, null, null, militaryOriginal);
+        require(military != null && countHook(military,
+                        "registerMarketSchedulerComponent") == 1,
+                "MilitaryBase replay wrapper did not register its semantic capability");
+        byte[] militaryWithoutRegistration = removeSchedulerRegistration(military, 64);
+        String militaryStatus = "starsector.prepatcher.patchStatus."
+                + PrepatcherTransformer.MILITARY_BASE.replace('/', '.')
+                + ".marketStepReplayMilitaryBase";
+        System.clearProperty(militaryStatus);
+        require(new PrepatcherTransformer(scheduler).transform(
+                        null, PrepatcherTransformer.MILITARY_BASE, null, null,
+                        militaryWithoutRegistration) == null,
+                "MilitaryBase wrapper without capability registration was accepted");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(militaryStatus)),
+                "MilitaryBase missing capability registration did not fail closed");
+
+        byte[] queueOriginal = classBytes(
+                jarPaths, PrepatcherTransformer.CONSTRUCTION_QUEUE);
+        byte[] queue = new PrepatcherTransformer(scheduler).transform(
+                null, PrepatcherTransformer.CONSTRUCTION_QUEUE, null, null, queueOriginal);
+        require(queue != null && countHook(queue,
+                        "registerMarketSchedulerComponent") == 1,
+                "ConstructionQueue barriers did not register their semantic capability");
+        byte[] queueWithoutRegistration = removeSchedulerRegistration(queue, 1024);
+        String queueStatus = "starsector.prepatcher.patchStatus."
+                + PrepatcherTransformer.CONSTRUCTION_QUEUE.replace('/', '.')
+                + ".marketConstructionMutationBarriers";
+        System.clearProperty(queueStatus);
+        require(new PrepatcherTransformer(scheduler).transform(
+                        null, PrepatcherTransformer.CONSTRUCTION_QUEUE, null, null,
+                        queueWithoutRegistration) == null,
+                "ConstructionQueue barriers without capability registration were accepted");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(queueStatus)),
+                "ConstructionQueue missing capability registration did not fail closed");
     }
 
-    /**
-     * Exercises the compatibility fallback hidden by the all-enabled release
-     * profile: reusable scratch snapshots are selected only when persistent
-     * owner-local snapshots are disabled.
-     */
-    private static void runFallbackEconomySnapshotStructuralTest(
+
+    private static void runRemovedEconomyScratchSnapshotStructuralTest(
             List<Path> jarPaths) throws Exception {
         Properties properties = new Properties();
-        properties.setProperty("patch.economyPersistentSnapshots", "false");
         properties.setProperty("patch.economySnapshotReuse", "true");
+        properties.setProperty("patch.economyPersistentSnapshots", "false");
         properties.setProperty("patch.economyLocationCache", "false");
-        properties.setProperty("patch.remoteMarketScheduler", "false");
-        properties.setProperty("patch.planetConditionMarketScheduler", "false");
+        properties.setProperty("patch.marketScheduler", "false");
         properties.setProperty("patch.directMarketObservation", "false");
         properties.setProperty("patch.commodityTemporalFastPath", "false");
         Constructor<PrepatcherConfig> constructor =
                 PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
         constructor.setAccessible(true);
-        PrepatcherConfig fallbackOnly = constructor.newInstance(properties);
+        PrepatcherConfig removedOnly = constructor.newInstance(properties);
+        require(!removedOnly.economyPersistentSnapshots,
+                "removed economy scratch setting enabled persistent snapshots");
 
-        byte[] economy = new PrepatcherTransformer(fallbackOnly).transform(
+        byte[] economy = new PrepatcherTransformer(removedOnly).transform(
                 null, PrepatcherTransformer.ECONOMY, null, null,
                 classBytes(jarPaths, PrepatcherTransformer.ECONOMY));
-        require(economy != null, "fallback Economy snapshots were not applied");
-        require(countHook(economy, "borrowEconomyMarketsSnapshot") == 2
-                        && countHook(economy, "borrowEconomyCollectionSnapshot") == 1
-                        && countHook(economy, "borrowPersistentSnapshotTimed") == 0,
-                "fallback Economy snapshot selection changed");
-        assertScratchScope(economy, "advance", "(F)V");
-        assertScratchScope(economy, "advanceMarketConditionsWhenPaused", "(F)V");
-        byte[] economyAgain = new PrepatcherTransformer(fallbackOnly).transform(
-                null, PrepatcherTransformer.ECONOMY, null, null, economy);
-        require(economyAgain == null, "fallback Economy snapshots are not idempotent");
-
-        ClassNode unscopedEconomy = read(economy);
-        removeScratchScope(method(unscopedEconomy, "advance", "(F)V"));
-        String economyStatus = "starsector.prepatcher.patchStatus."
-                + PrepatcherTransformer.ECONOMY.replace('/', '.')
-                + ".economySnapshotReuse";
-        System.clearProperty(economyStatus);
-        byte[] unscopedEconomyResult = new PrepatcherTransformer(fallbackOnly).transform(
-                null, PrepatcherTransformer.ECONOMY, null, null,
-                write(unscopedEconomy));
-        require(unscopedEconomyResult == null,
-                "fallback Economy snapshots without a scratch scope were modified");
-        require("SKIPPED_STRUCTURAL".equals(System.getProperty(economyStatus)),
-                "fallback Economy snapshots without a scratch scope were accepted");
-
-        byte[] market = new PrepatcherTransformer(fallbackOnly).transform(
+        byte[] market = new PrepatcherTransformer(removedOnly).transform(
                 null, PrepatcherTransformer.MARKET, null, null,
                 classBytes(jarPaths, PrepatcherTransformer.MARKET));
-        require(market != null, "fallback Market snapshots were not applied");
-        require(countHook(market, "borrowEconomyCollectionSnapshot") == 2
-                        && countHook(market, "borrowPersistentSnapshotFrames") == 0,
-                "fallback Market snapshot selection changed");
-        assertScratchScope(market, "advance", "(F)V");
-        byte[] marketAgain = new PrepatcherTransformer(fallbackOnly).transform(
-                null, PrepatcherTransformer.MARKET, null, null, market);
-        require(marketAgain == null, "fallback Market snapshots are not idempotent");
+        require(economy == null && market == null,
+                "removed economy scratch setting still selected a transformer path");
 
-        ClassNode unscopedMarket = read(market);
-        removeScratchScope(method(unscopedMarket, "advance", "(F)V"));
-        String marketStatus = "starsector.prepatcher.patchStatus."
-                + PrepatcherTransformer.MARKET.replace('/', '.')
-                + ".economySnapshotReuse";
-        System.clearProperty(marketStatus);
-        byte[] unscopedMarketResult = new PrepatcherTransformer(fallbackOnly).transform(
-                null, PrepatcherTransformer.MARKET, null, null, write(unscopedMarket));
-        require(unscopedMarketResult == null,
-                "fallback Market snapshots without a scratch scope were modified");
-        require("SKIPPED_STRUCTURAL".equals(System.getProperty(marketStatus)),
-                "fallback Market snapshots without a scratch scope were accepted");
+        try (java.io.InputStream in = StructuralCompatibilityTest.class.getClassLoader()
+                .getResourceAsStream(HOOKS + ".class")) {
+            require(in != null, "target-loader hooks class bytes are unavailable");
+            ClassNode hooks = read(in.readAllBytes());
+            require(hooks.methods.stream().noneMatch(method ->
+                            method.name.equals("borrowEconomyMarketsSnapshot")
+                                    || method.name.equals("borrowEconomyCollectionSnapshot")),
+                    "removed economy scratch runtime hooks remain in the payload");
+        }
+    }
+
+    private static void runHyperspaceViewportBoundsAtomicTest(
+            List<Path> jarPaths) throws Exception {
+        Properties properties = new Properties();
+        properties.setProperty("patch.hyperspaceViewportBounds", "true");
+        properties.setProperty("patch.terrainRandomReuse", "false");
+        Constructor<PrepatcherConfig> constructor =
+                PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
+        constructor.setAccessible(true);
+        PrepatcherConfig boundsOnly = constructor.newInstance(properties);
+
+        byte[] original = classBytes(jarPaths, HyperspacePatches.BASE_TILED);
+        String statusKey = "starsector.prepatcher.patchStatus."
+                + HyperspacePatches.BASE_TILED.replace('/', '.')
+                + ".hyperspaceViewportBounds";
+
+        byte[] patched = new PrepatcherTransformer(boundsOnly).transform(
+                null, HyperspacePatches.BASE_TILED, null, null, original);
+        require(patched != null, "atomic hyperspace viewport-bounds patch was not applied");
+        ClassNode patchedNode = read(patched);
+        require(HyperspacePatches.countPatchedViewportBounds(patchedNode) == 2,
+                "atomic hyperspace viewport-bounds postcondition is incomplete");
+        require(hasOwnershipMarker(patchedNode, "hyperspaceViewportBounds"),
+                "atomic hyperspace viewport-bounds ownership marker is missing");
+        require(!hasOwnershipMarker(patchedNode, "hyperspaceCulling")
+                        && !hasOwnershipMarker(patchedNode, "hyperspaceYClamp"),
+                "legacy split hyperspace ownership markers were emitted");
+        verifyBytecode(patched);
+
+        ClassNode partialRange = read(original);
+        prepatchOneViewportRange(partialRange);
+        System.clearProperty(statusKey);
+        byte[] partialRangeResult = new PrepatcherTransformer(boundsOnly).transform(
+                null, HyperspacePatches.BASE_TILED, null, null, write(partialRange));
+        require(partialRangeResult == null,
+                "atomic viewport-bounds patch modified a partially corrected range");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "partial vertical-range state was not rejected structurally");
+        require(!hasOwnershipMarker(partialRange, "hyperspaceViewportBounds"),
+                "partial vertical-range input gained an ownership marker");
+
+        ClassNode partialClamp = read(original);
+        prepatchOneViewportClamp(partialClamp);
+        System.clearProperty(statusKey);
+        byte[] partialClampResult = new PrepatcherTransformer(boundsOnly).transform(
+                null, HyperspacePatches.BASE_TILED, null, null, write(partialClamp));
+        require(partialClampResult == null,
+                "atomic viewport-bounds patch modified a partially corrected clamp");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "partial vertical-clamp state was not rejected structurally");
+        require(!hasOwnershipMarker(partialClamp, "hyperspaceViewportBounds"),
+                "partial vertical-clamp input gained an ownership marker");
+
+        Properties conflictingLegacy = new Properties();
+        conflictingLegacy.setProperty("patch.hyperspaceCulling", "true");
+        conflictingLegacy.setProperty("patch.hyperspaceYClamp", "false");
+        PrepatcherConfig legacyConflict = constructor.newInstance(conflictingLegacy);
+        require(!legacyConflict.hyperspaceViewportBounds,
+                "disagreeing legacy hyperspace settings enabled a partial fix");
     }
 
     private static void runLoaderGuardTests(PrepatcherConfig config,
@@ -405,12 +1154,18 @@ public final class StructuralCompatibilityTest {
                 PrepatcherTransformer transformer = new PrepatcherTransformer(config);
                 byte[] transformed = transformer.transform(null, className, null, null, original);
                 require(transformed != null, "no patch applied to " + className + " from " + jarPath);
+                String compositionStatus = "starsector.prepatcher.patchStatus."
+                        + className.replace('/', '.') + ".composition";
+                require("PASSED".equals(System.getProperty(compositionStatus)),
+                        "final composition validation did not pass for " + className);
                 assertExpectedHooks(className, transformed);
                 assertHookTargetsExist(transformed);
                 methods += verifyBytecode(transformed);
                 int skippedBefore = integerProperty("starsector.prepatcher.skippedPatches");
                 byte[] second = transformer.transform(null, className, null, null, transformed);
                 require(second == null, "transform is not idempotent for " + className);
+                require("PASSED".equals(System.getProperty(compositionStatus)),
+                        "idempotent composition validation did not pass for " + className);
                 require(integerProperty("starsector.prepatcher.skippedPatches") == skippedBefore,
                         "already-patched class was reported as structurally incompatible: " + className);
                 classes++;
@@ -419,11 +1174,14 @@ public final class StructuralCompatibilityTest {
         return new Result(classes, methods);
     }
 
-    private static void runNegativeRetainAllTests(PrepatcherConfig config, Path jarPath) throws Exception {
+    private static void runNegativeMapRenderStuffTests(PrepatcherConfig config, Path jarPath) throws Exception {
         byte[] h;
+        byte[] a;
         try (JarFile jar = new JarFile(jarPath.toFile())) {
             h = jar.getInputStream(jar.getJarEntry(PrepatcherTransformer.H + ".class")).readAllBytes();
+            a = jar.getInputStream(jar.getJarEntry(PrepatcherTransformer.A + ".class")).readAllBytes();
         }
+        assertMapRenderStuffConfigIsolation(h, a);
 
         byte[] unrelated = mutateH(h, Mutation.UNRELATED_NOP);
         byte[] unrelatedResult = new PrepatcherTransformer(config)
@@ -447,7 +1205,10 @@ public final class StructuralCompatibilityTest {
         require(missingResult != null, "other H patches were lost when retainAll was missing");
         require(countHook(missingResult, "retainAllFast") == 0,
                 "missing retainAll site was patched unexpectedly");
-        assertHNonRetainHooks(missingResult, "missing retainAll site");
+        require(countHook(missingResult, "borrowEntityList") == 0
+                        && countHook(missingResult, "borrowClassSet") == 0,
+                "missing retainAll site left a partial renderStuff patch");
+        assertHIndependentHooks(missingResult, "missing retainAll site");
         verifyBytecode(missingResult);
 
         byte[] ambiguous = mutateH(h, Mutation.DUPLICATE_RETAIN);
@@ -456,10 +1217,552 @@ public final class StructuralCompatibilityTest {
         require(ambiguousResult != null, "other H patches were lost for ambiguous retainAll");
         require(countHook(ambiguousResult, "retainAllFast") == 0,
                 "ambiguous retainAll sites were patched unexpectedly");
-        assertHNonRetainHooks(ambiguousResult, "ambiguous retainAll sites");
+        require(countHook(ambiguousResult, "borrowEntityList") == 0
+                        && countHook(ambiguousResult, "borrowClassSet") == 0,
+                "ambiguous retainAll sites left a partial renderStuff patch");
+        assertHIndependentHooks(ambiguousResult, "ambiguous retainAll sites");
         verifyBytecode(ambiguousResult);
 
+        byte[] missingAllocation = mutateH(h, Mutation.MISSING_CLASS_SET);
+        byte[] missingAllocationResult = new PrepatcherTransformer(config)
+                .transform(null, PrepatcherTransformer.H, null, null, missingAllocation);
+        require(missingAllocationResult != null,
+                "independent H patches were lost when a render scratch allocation was missing");
+        require(countHook(missingAllocationResult, "retainAllFast") == 0
+                        && countHook(missingAllocationResult, "borrowEntityList") == 0
+                        && countHook(missingAllocationResult, "borrowClassSet") == 0,
+                "missing class-set allocation produced a partial renderStuff patch");
+        assertHIndependentHooks(missingAllocationResult, "missing class-set allocation");
+        verifyBytecode(missingAllocationResult);
+
         runOwnershipAndWrapperTests(config, h);
+    }
+
+    private static void assertMapRenderStuffConfigIsolation(byte[] h, byte[] a) throws Exception {
+        Constructor<PrepatcherConfig> constructor =
+                PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
+        constructor.setAccessible(true);
+
+        Properties hitOnlyProperties = new Properties();
+        hitOnlyProperties.setProperty("patch.mapRenderStuff", "false");
+        hitOnlyProperties.setProperty("patch.mapHitTest", "true");
+        hitOnlyProperties.setProperty("patch.labelSpatialCandidates", "false");
+        hitOnlyProperties.setProperty("patch.intelEntityIndex", "false");
+        hitOnlyProperties.setProperty("patch.systemNebulaCache", "false");
+        hitOnlyProperties.setProperty("patch.sampleCacheClearThrottle", "false");
+        hitOnlyProperties.setProperty("patch.gridLineCap", "false");
+        hitOnlyProperties.setProperty("patch.intelCallbackCache", "false");
+        PrepatcherConfig hitOnly = constructor.newInstance(hitOnlyProperties);
+        require(new PrepatcherTransformer(hitOnly).transform(
+                        null, PrepatcherTransformer.H, null, null, h) == null,
+                "patch.mapHitTest unexpectedly selected H.renderStuff");
+        byte[] patchedA = new PrepatcherTransformer(hitOnly).transform(
+                null, PrepatcherTransformer.A, null, null, a);
+        require(patchedA != null && countHook(patchedA, "borrowHitList") == 1
+                        && countHook(patchedA, "borrowHitPoint") == 1
+                        && countHook(patchedA, "hitTestCached") == 1,
+                "patch.mapHitTest did not own the complete A hit-test group");
+
+        Properties renderOnlyProperties = new Properties();
+        renderOnlyProperties.setProperty("patch.mapRenderStuff", "true");
+        renderOnlyProperties.setProperty("patch.mapHitTest", "false");
+        renderOnlyProperties.setProperty("patch.labelSpatialCandidates", "false");
+        renderOnlyProperties.setProperty("patch.intelEntityIndex", "false");
+        renderOnlyProperties.setProperty("patch.systemNebulaCache", "false");
+        renderOnlyProperties.setProperty("patch.sampleCacheClearThrottle", "false");
+        renderOnlyProperties.setProperty("patch.gridLineCap", "false");
+        renderOnlyProperties.setProperty("patch.intelCallbackCache", "false");
+        PrepatcherConfig renderOnly = constructor.newInstance(renderOnlyProperties);
+        byte[] patchedH = new PrepatcherTransformer(renderOnly).transform(
+                null, PrepatcherTransformer.H, null, null, h);
+        require(patchedH != null && countHook(patchedH, "retainAllFast") == 1
+                        && countHook(patchedH, "borrowEntityList") == 1
+                        && countHook(patchedH, "borrowClassSet") == 1,
+                "patch.mapRenderStuff did not own its complete H.renderStuff group");
+        require(new PrepatcherTransformer(renderOnly).transform(
+                        null, PrepatcherTransformer.A, null, null, a) == null,
+                "patch.mapRenderStuff unexpectedly selected A hit-test group");
+    }
+
+    private static void runNegativeHitTestGroupTests(
+            PrepatcherConfig config, Path jarPath) throws Exception {
+        byte[] original;
+        try (JarFile jar = new JarFile(jarPath.toFile())) {
+            original = jar.getInputStream(jar.getJarEntry(
+                    PrepatcherTransformer.A + ".class")).readAllBytes();
+        }
+        Constructor<PrepatcherConfig> constructor =
+                PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
+        constructor.setAccessible(true);
+
+        Properties hitOnlyProperties = new Properties();
+        hitOnlyProperties.setProperty("patch.mapHitTest", "true");
+        hitOnlyProperties.setProperty("patch.intelCallbackCache", "false");
+        PrepatcherConfig hitOnly = constructor.newInstance(hitOnlyProperties);
+        String statusKey = "starsector.prepatcher.patchStatus."
+                + PrepatcherTransformer.A.replace('/', '.') + ".mapHitTest";
+
+        byte[] patched = new PrepatcherTransformer(hitOnly).transform(
+                null, PrepatcherTransformer.A, null, null, original);
+        require(patched != null, "atomic map hit-test group did not apply");
+        ClassNode patchedNode = read(patched);
+        require(hasOwnershipMarker(patchedNode, "mapHitTest"),
+                "map hit-test ownership marker is missing");
+        require(countHook(patched, "borrowHitList") == 1
+                        && countHook(patched, "borrowHitPoint") == 1
+                        && countHook(patched, "hitTestCached") == 1,
+                "map hit-test postcondition is incomplete");
+        verifyBytecode(patched);
+
+        int skippedBefore = integerProperty("starsector.prepatcher.skippedPatches");
+        require(new PrepatcherTransformer(hitOnly).transform(
+                        null, PrepatcherTransformer.A, null, null, patched) == null,
+                "map hit-test group is not idempotent");
+        require(integerProperty("starsector.prepatcher.skippedPatches") == skippedBefore,
+                "idempotent map hit-test group was reported as incompatible");
+
+        ClassNode unowned = read(patched);
+        require(unowned.fields.removeIf(field -> field.name.equals("smo$patched$mapHitTest")),
+                "map hit-test marker was not emitted");
+        System.clearProperty(statusKey);
+        require(new PrepatcherTransformer(hitOnly).transform(
+                        null, PrepatcherTransformer.A, null, null, write(unowned)) == null,
+                "foreign complete hit-test group was modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "foreign complete hit-test group was not rejected structurally");
+
+        ClassNode unscoped = read(patched);
+        removeScratchScope(method(unscoped, "smo$originalHitTest",
+                "(FFF)Lcom/fs/starfarer/api/campaign/SectorEntityToken;"));
+        System.clearProperty(statusKey);
+        require(new PrepatcherTransformer(hitOnly).transform(
+                        null, PrepatcherTransformer.A, null, null, write(unscoped)) == null,
+                "owned hit-test hooks without scope were modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "owned hit-test hooks without scope were accepted");
+
+        ClassNode partial = read(patched);
+        MethodInsnNode pointHook = uniqueHook(partial, "borrowHitPoint");
+        pointHook.name = "borrowArrowVector";
+        System.clearProperty(statusKey);
+        require(new PrepatcherTransformer(hitOnly).transform(
+                        null, PrepatcherTransformer.A, null, null, write(partial)) == null,
+                "partial hit-test allocation group was modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "partial hit-test allocation group was accepted");
+
+        ClassNode tamperedWrapper = read(patched);
+        method(tamperedWrapper, "OO0000",
+                "(FFF)Lcom/fs/starfarer/api/campaign/SectorEntityToken;")
+                .instructions.insert(new InsnNode(Opcodes.NOP));
+        System.clearProperty(statusKey);
+        require(new PrepatcherTransformer(hitOnly).transform(
+                        null, PrepatcherTransformer.A, null, null, write(tamperedWrapper)) == null,
+                "tampered hit-test wrapper was modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "tampered hit-test wrapper was accepted");
+
+        Properties withIndependentProperties = new Properties();
+        withIndependentProperties.setProperty("patch.mapHitTest", "true");
+        withIndependentProperties.setProperty("patch.intelCallbackCache", "true");
+        PrepatcherConfig withIndependent = constructor.newInstance(withIndependentProperties);
+        byte[] missingAllocation = mutateAHitTest(original, HitMutation.MISSING_HIT_LIST);
+        byte[] missingAllocationResult = new PrepatcherTransformer(withIndependent).transform(
+                null, PrepatcherTransformer.A, null, null, missingAllocation);
+        require(missingAllocationResult != null,
+                "missing hit-list allocation blocked independent A patch");
+        require(countHook(missingAllocationResult, "getMapLocationCached") == 1,
+                "missing hit-list allocation cancelled independent Intel callback patch");
+        require(countHook(missingAllocationResult, "borrowHitList") == 0
+                        && countHook(missingAllocationResult, "borrowHitPoint") == 0
+                        && countHook(missingAllocationResult, "hitTestCached") == 0,
+                "missing hit-list allocation produced a partial hit-test group");
+        verifyBytecode(missingAllocationResult);
+
+        byte[] missingSemantic = mutateAHitTest(original, HitMutation.MISSING_FACTOR_CALL);
+        byte[] missingSemanticResult = new PrepatcherTransformer(withIndependent).transform(
+                null, PrepatcherTransformer.A, null, null, missingSemantic);
+        require(missingSemanticResult != null,
+                "missing hit-test semantic anchor blocked independent A patch");
+        require(countHook(missingSemanticResult, "getMapLocationCached") == 1,
+                "missing hit-test semantic anchor cancelled independent Intel callback patch");
+        require(countHook(missingSemanticResult, "borrowHitList") == 0
+                        && countHook(missingSemanticResult, "borrowHitPoint") == 0
+                        && countHook(missingSemanticResult, "hitTestCached") == 0,
+                "missing semantic anchor produced a partial hit-test group");
+        verifyBytecode(missingSemanticResult);
+
+        Properties legacyProperties = new Properties();
+        legacyProperties.setProperty("patch.mapHitTest", "false");
+        legacyProperties.setProperty("patch.scratchCollections", "true");
+        legacyProperties.setProperty("patch.hoverHitTestCache", "true");
+        legacyProperties.setProperty("patch.intelCallbackCache", "false");
+        PrepatcherConfig legacyOnly = constructor.newInstance(legacyProperties);
+        require(new PrepatcherTransformer(legacyOnly).transform(
+                        null, PrepatcherTransformer.A, null, null, original) == null,
+                "removed split hit-test keys still select a transformer path");
+    }
+
+    private static void runNegativeIntelArrowRenderingTests(Path jarPath)
+            throws Exception {
+        byte[] original;
+        try (JarFile jar = new JarFile(jarPath.toFile())) {
+            original = jar.getInputStream(jar.getJarEntry(
+                    PrepatcherTransformer.Z + ".class")).readAllBytes();
+        }
+        Constructor<PrepatcherConfig> constructor =
+                PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
+        constructor.setAccessible(true);
+
+        Properties groupProperties = new Properties();
+        groupProperties.setProperty("patch.intelArrowRendering", "true");
+        groupProperties.setProperty("patch.intelCallbackCache", "false");
+        PrepatcherConfig groupOnly = constructor.newInstance(groupProperties);
+        String statusKey = "starsector.prepatcher.patchStatus."
+                + PrepatcherTransformer.Z.replace('/', '.') + ".intelArrowRendering";
+
+        byte[] patched = new PrepatcherTransformer(groupOnly).transform(
+                null, PrepatcherTransformer.Z, null, null, original);
+        require(patched != null, "Intel-arrow rendering group did not apply");
+        require(countHook(patched, "getArrowDataCached") == 1
+                        && countHook(patched, "borrowArrowVector") == 2,
+                "Intel-arrow rendering postcondition is incomplete");
+        require(hasOwnershipMarker(read(patched), "intelArrowRendering"),
+                "Intel-arrow rendering marker is missing");
+        assertScratchScope(patched, "o00000", "(FF)V");
+        verifyBytecode(patched);
+
+        int skippedBefore = integerProperty("starsector.prepatcher.skippedPatches");
+        require(new PrepatcherTransformer(groupOnly).transform(
+                        null, PrepatcherTransformer.Z, null, null, patched) == null,
+                "Intel-arrow rendering group is not idempotent");
+        require(integerProperty("starsector.prepatcher.skippedPatches") == skippedBefore,
+                "idempotent Intel-arrow rendering was reported as incompatible");
+
+        ClassNode unowned = read(patched);
+        require(unowned.fields.removeIf(field -> field.name.equals(
+                        "smo$patched$intelArrowRendering")),
+                "Intel-arrow rendering marker was not emitted");
+        System.clearProperty(statusKey);
+        require(new PrepatcherTransformer(groupOnly).transform(
+                        null, PrepatcherTransformer.Z, null, null, write(unowned)) == null,
+                "foreign complete Intel-arrow rendering group was modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "foreign complete Intel-arrow rendering group was not rejected");
+
+        ClassNode unscoped = read(patched);
+        removeScratchScope(method(unscoped, "o00000", "(FF)V"));
+        System.clearProperty(statusKey);
+        require(new PrepatcherTransformer(groupOnly).transform(
+                        null, PrepatcherTransformer.Z, null, null, write(unscoped)) == null,
+                "Intel-arrow hooks without scope were modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "Intel-arrow hooks without scope were accepted");
+
+        ClassNode partialCallback = read(patched);
+        uniqueHook(partialCallback, "getArrowDataCached").name = "getMapLocationCached";
+        System.clearProperty(statusKey);
+        require(new PrepatcherTransformer(groupOnly).transform(
+                        null, PrepatcherTransformer.Z, null, null,
+                        write(partialCallback)) == null,
+                "partial Intel-arrow callback state was modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "partial Intel-arrow callback state was accepted");
+
+        ClassNode partialVector = read(patched);
+        MethodInsnNode firstVectorHook = null;
+        for (MethodNode candidate : partialVector.methods) {
+            for (AbstractInsnNode insn : candidate.instructions.toArray()) {
+                if (insn instanceof MethodInsnNode call
+                        && call.getOpcode() == Opcodes.INVOKESTATIC
+                        && call.owner.equals(HOOKS)
+                        && call.name.equals("borrowArrowVector")) {
+                    firstVectorHook = call;
+                    break;
+                }
+            }
+            if (firstVectorHook != null) break;
+        }
+        require(firstVectorHook != null, "Intel-arrow vector hook missing in test input");
+        firstVectorHook.name = "borrowHitPoint";
+        System.clearProperty(statusKey);
+        require(new PrepatcherTransformer(groupOnly).transform(
+                        null, PrepatcherTransformer.Z, null, null,
+                        write(partialVector)) == null,
+                "partial Intel-arrow vector state was modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "partial Intel-arrow vector state was accepted");
+
+        for (ArrowMutation mutation : ArrowMutation.values()) {
+            byte[] mutated = mutateIntelArrowRendering(original, mutation);
+            System.clearProperty(statusKey);
+            require(new PrepatcherTransformer(groupOnly).transform(
+                            null, PrepatcherTransformer.Z, null, null, mutated) == null,
+                    mutation + " unexpectedly produced a partial Intel-arrow group");
+            require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                    mutation + " was not rejected structurally");
+            require(countHook(mutated, "getArrowDataCached") == 0
+                            && countHook(mutated, "borrowArrowVector") == 0,
+                    mutation + " test input already contains optimizer hooks");
+            verifyBytecode(mutated);
+        }
+
+        Properties callbackOnlyProperties = new Properties();
+        callbackOnlyProperties.setProperty("patch.intelArrowRendering", "false");
+        callbackOnlyProperties.setProperty("patch.intelCallbackCache", "true");
+        PrepatcherConfig callbackOnly = constructor.newInstance(callbackOnlyProperties);
+        require(new PrepatcherTransformer(callbackOnly).transform(
+                        null, PrepatcherTransformer.Z, null, null, original) == null,
+                "patch.intelCallbackCache still selects the Z.o00000 surface");
+
+        Properties legacyProperties = new Properties();
+        legacyProperties.setProperty("patch.intelArrowRendering", "false");
+        legacyProperties.setProperty("patch.intelCallbackCache", "false");
+        legacyProperties.setProperty("patch.arrowVectorPool", "true");
+        PrepatcherConfig legacyOnly = constructor.newInstance(legacyProperties);
+        require(new PrepatcherTransformer(legacyOnly).transform(
+                        null, PrepatcherTransformer.Z, null, null, original) == null,
+                "removed split Intel-arrow key still selects a transformer path");
+    }
+
+    private static byte[] mutateIntelArrowRendering(byte[] source, ArrowMutation mutation) {
+        ClassNode node = read(source);
+        MethodNode method = method(node, "o00000", "(FF)V");
+        if (mutation == ArrowMutation.MISSING_CALLBACK) {
+            for (AbstractInsnNode insn : method.instructions.toArray()) {
+                if (insn instanceof MethodInsnNode call
+                        && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                        && call.owner.equals(
+                        "com/fs/starfarer/api/campaign/comm/IntelInfoPlugin")
+                        && call.name.equals("getArrowData")
+                        && call.desc.equals("(Lcom/fs/starfarer/api/ui/SectorMapAPI;)Ljava/util/List;")) {
+                    call.name = "getArrowDataChanged";
+                    return write(node);
+                }
+            }
+            throw new AssertionError("Intel-arrow callback site not found in test input");
+        }
+
+        TypeInsnNode allocation = null;
+        MethodInsnNode constructorCall = null;
+        VarInsnNode store = null;
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (!(insn instanceof TypeInsnNode candidate)
+                    || candidate.getOpcode() != Opcodes.NEW
+                    || !candidate.desc.equals("org/lwjgl/util/vector/Vector2f")) continue;
+            for (AbstractInsnNode cursor = candidate.getNext(); cursor != null;
+                 cursor = cursor.getNext()) {
+                if (cursor instanceof MethodInsnNode call
+                        && call.getOpcode() == Opcodes.INVOKESPECIAL
+                        && call.owner.equals("org/lwjgl/util/vector/Vector2f")
+                        && call.name.equals("<init>") && call.desc.equals("(FF)V")) {
+                    AbstractInsnNode next = nextMeaningful(call);
+                    if (next instanceof VarInsnNode var && var.getOpcode() == Opcodes.ASTORE) {
+                        allocation = candidate;
+                        constructorCall = call;
+                        store = var;
+                    }
+                    break;
+                }
+                if (cursor.getOpcode() == Opcodes.NEW && cursor != candidate) break;
+            }
+            if (allocation != null) break;
+        }
+        require(allocation != null && constructorCall != null && store != null,
+                "Intel-arrow vector allocation missing in test input");
+        method.instructions.insertBefore(store, new InsnNode(Opcodes.ACONST_NULL));
+        AbstractInsnNode cursor = allocation;
+        while (cursor != null) {
+            AbstractInsnNode next = cursor.getNext();
+            method.instructions.remove(cursor);
+            if (cursor == constructorCall) break;
+            cursor = next;
+        }
+        return write(node);
+    }
+
+    private enum ArrowMutation {
+        MISSING_CALLBACK,
+        MISSING_VECTOR
+    }
+
+    private static void runNegativeEventsPanelReconciliationTests(Path jarPath)
+            throws Exception {
+        byte[] original;
+        try (JarFile jar = new JarFile(jarPath.toFile())) {
+            original = jar.getInputStream(jar.getJarEntry(
+                    PrepatcherTransformer.EVENTS + ".class")).readAllBytes();
+        }
+        Constructor<PrepatcherConfig> constructor =
+                PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
+        constructor.setAccessible(true);
+
+        Properties groupProperties = new Properties();
+        groupProperties.setProperty("patch.intelReconciliation", "true");
+        groupProperties.setProperty("patch.intelCallbackCache", "false");
+        PrepatcherConfig groupOnly = constructor.newInstance(groupProperties);
+        String statusKey = "starsector.prepatcher.patchStatus."
+                + PrepatcherTransformer.EVENTS.replace('/', '.') + ".intelReconciliation";
+
+        byte[] patched = new PrepatcherTransformer(groupOnly).transform(
+                null, PrepatcherTransformer.EVENTS, null, null, original);
+        require(patched != null, "EventsPanel reconciliation group did not apply");
+        require(countHook(patched, "fastContains") == 1
+                        && countHook(patched, "existingIntelIconCandidates") == 1,
+                "EventsPanel reconciliation postcondition is incomplete");
+        require(hasOwnershipMarker(read(patched), "intelReconciliation"),
+                "EventsPanel reconciliation marker is missing");
+        assertScratchScope(patched, "addMissingIconsAndRows", "()V");
+        verifyBytecode(patched);
+
+        int skippedBefore = integerProperty("starsector.prepatcher.skippedPatches");
+        require(new PrepatcherTransformer(groupOnly).transform(
+                        null, PrepatcherTransformer.EVENTS, null, null, patched) == null,
+                "EventsPanel reconciliation group is not idempotent");
+        require(integerProperty("starsector.prepatcher.skippedPatches") == skippedBefore,
+                "idempotent EventsPanel reconciliation was reported as incompatible");
+
+        ClassNode unowned = read(patched);
+        require(unowned.fields.removeIf(field -> field.name.equals(
+                        "smo$patched$intelReconciliation")),
+                "EventsPanel reconciliation marker was not emitted");
+        System.clearProperty(statusKey);
+        require(new PrepatcherTransformer(groupOnly).transform(
+                        null, PrepatcherTransformer.EVENTS, null, null, write(unowned)) == null,
+                "foreign complete EventsPanel reconciliation group was modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "foreign complete EventsPanel reconciliation group was not rejected");
+
+        ClassNode unscoped = read(patched);
+        removeScratchScope(method(unscoped, "addMissingIconsAndRows", "()V"));
+        System.clearProperty(statusKey);
+        require(new PrepatcherTransformer(groupOnly).transform(
+                        null, PrepatcherTransformer.EVENTS, null, null, write(unscoped)) == null,
+                "EventsPanel reconciliation hooks without scope were modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "EventsPanel reconciliation hooks without scope were accepted");
+
+        ClassNode partialContains = read(patched);
+        uniqueHook(partialContains, "fastContains").name = "existingIntelIconCandidates";
+        System.clearProperty(statusKey);
+        require(new PrepatcherTransformer(groupOnly).transform(
+                        null, PrepatcherTransformer.EVENTS, null, null,
+                        write(partialContains)) == null,
+                "partial EventsPanel membership hook state was modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "partial EventsPanel membership hook state was accepted");
+
+        ClassNode partialCandidates = read(patched);
+        uniqueHook(partialCandidates, "existingIntelIconCandidates").name = "fastContains";
+        System.clearProperty(statusKey);
+        require(new PrepatcherTransformer(groupOnly).transform(
+                        null, PrepatcherTransformer.EVENTS, null, null,
+                        write(partialCandidates)) == null,
+                "partial EventsPanel candidate hook state was modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(statusKey)),
+                "partial EventsPanel candidate hook state was accepted");
+
+        Properties withIndependentProperties = new Properties();
+        withIndependentProperties.setProperty("patch.intelReconciliation", "true");
+        withIndependentProperties.setProperty("patch.intelCallbackCache", "true");
+        PrepatcherConfig withIndependent = constructor.newInstance(withIndependentProperties);
+        for (EventsMutation mutation : EventsMutation.values()) {
+            byte[] mutated = mutateEventsPanel(original, mutation);
+            byte[] result = new PrepatcherTransformer(withIndependent).transform(
+                    null, PrepatcherTransformer.EVENTS, null, null, mutated);
+            require(result != null,
+                    mutation + " blocked independent EventsPanel callback patch");
+            require(countHook(result, "getMapLocationCached") == 7,
+                    mutation + " cancelled independent Intel callback patch");
+            require(countHook(result, "fastContains") == 0
+                            && countHook(result, "existingIntelIconCandidates") == 0,
+                    mutation + " produced a partial EventsPanel reconciliation group");
+            verifyBytecode(result);
+        }
+
+        Properties legacyProperties = new Properties();
+        legacyProperties.setProperty("patch.intelReconciliation", "false");
+        legacyProperties.setProperty("patch.intelCallbackCache", "false");
+        legacyProperties.setProperty("patch.intelFastContains", "true");
+        legacyProperties.setProperty("patch.intelExistingIconLookup", "true");
+        PrepatcherConfig legacyOnly = constructor.newInstance(legacyProperties);
+        require(new PrepatcherTransformer(legacyOnly).transform(
+                        null, PrepatcherTransformer.EVENTS, null, null, original) == null,
+                "removed split EventsPanel keys still select a transformer path");
+    }
+
+    private static byte[] mutateEventsPanel(byte[] source, EventsMutation mutation) {
+        ClassNode node = read(source);
+        MethodNode method = method(node, "addMissingIconsAndRows", "()V");
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (!(insn instanceof MethodInsnNode call)) continue;
+            if (mutation == EventsMutation.MISSING_CONTAINS
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("contains")
+                    && call.desc.equals("(Ljava/lang/Object;)Z")) {
+                call.owner = "java/util/Collection";
+                return write(node);
+            }
+            if (mutation == EventsMutation.MISSING_VALUES
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals("java/util/LinkedHashMap")
+                    && call.name.equals("values")
+                    && call.desc.equals("()Ljava/util/Collection;")) {
+                call.setOpcode(Opcodes.INVOKEINTERFACE);
+                call.owner = "java/util/Map";
+                call.itf = true;
+                return write(node);
+            }
+        }
+        throw new AssertionError("EventsPanel mutation site not found: " + mutation);
+    }
+
+    private static byte[] mutateAHitTest(byte[] source, HitMutation mutation) {
+        ClassNode node = read(source);
+        MethodNode hit = method(node, "OO0000",
+                "(FFF)Lcom/fs/starfarer/api/campaign/SectorEntityToken;");
+        if (mutation == HitMutation.MISSING_FACTOR_CALL) {
+            int changed = 0;
+            for (AbstractInsnNode insn : hit.instructions.toArray()) {
+                if (insn instanceof MethodInsnNode call
+                        && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                        && call.owner.equals(PrepatcherTransformer.H)
+                        && call.name.equals("getFactor") && call.desc.equals("()F")) {
+                    call.name = "getFactorChanged";
+                    changed++;
+                }
+            }
+            require(changed >= 1, "hit-test factor call missing in test input");
+            return write(node);
+        }
+
+        TypeInsnNode allocation = null;
+        MethodInsnNode constructorCall = null;
+        for (AbstractInsnNode insn : hit.instructions.toArray()) {
+            if (!(insn instanceof TypeInsnNode candidate)
+                    || candidate.getOpcode() != Opcodes.NEW
+                    || !candidate.desc.equals("java/util/ArrayList")) continue;
+            for (AbstractInsnNode cursor = candidate.getNext(); cursor != null;
+                 cursor = cursor.getNext()) {
+                if (cursor instanceof MethodInsnNode call
+                        && call.getOpcode() == Opcodes.INVOKESPECIAL
+                        && call.owner.equals("java/util/ArrayList")
+                        && call.name.equals("<init>")
+                        && call.desc.equals("(Ljava/util/Collection;)V")) {
+                    allocation = candidate;
+                    constructorCall = call;
+                    break;
+                }
+                if (cursor.getOpcode() == Opcodes.NEW && cursor != candidate) break;
+            }
+            if (allocation != null) break;
+        }
+        require(allocation != null && constructorCall != null,
+                "hit-list allocation missing in test input");
+        allocation.desc = "java/util/LinkedList";
+        constructorCall.owner = "java/util/LinkedList";
+        return write(node);
     }
 
     private static void runNegativeLifecycleTests(PrepatcherConfig config, Path jarPath) throws Exception {
@@ -697,13 +2000,13 @@ public final class StructuralCompatibilityTest {
             throws Exception {
         Map<String, List<String>> patches = new LinkedHashMap<>();
         patches.put(PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
-                List.of("planetConditionMarketAdvanceBridge"));
+                List.of("marketScheduler"));
         patches.put(PrepatcherTransformer.ECONOMY,
-                List.of("economyPersistentSnapshots", "economyLocationCache",
-                        "remoteMarketScheduler"));
+                List.of("economyAdvancePlan"));
         patches.put(PrepatcherTransformer.MARKET,
-                List.of("economyPersistentSnapshots", "commodityTemporalFastPath",
-                        "directMarketObservation"));
+                List.of("marketAdvancePlan"));
+        patches.put(PrepatcherTransformer.CAMPAIGN_GAME_MANAGER,
+                List.of("saveMethodPlan", "saveOutputBufferDedup"));
         patches.put(PrepatcherTransformer.BASE_INDUSTRY,
                 List.of("marketNoOpCallbacks"));
         patches.put(PrepatcherTransformer.MUTABLE_STAT,
@@ -738,8 +2041,6 @@ public final class StructuralCompatibilityTest {
         }
 
         Map<String, MethodKey> scoped = new LinkedHashMap<>();
-        scoped.put(PrepatcherTransformer.ECONOMY, new MethodKey("advance", "(F)V",
-                "remoteMarketScheduler"));
         scoped.put(PrepatcherTransformer.INTEL_MANAGER, new MethodKey(
                 "findNearestCommRelayToReceive",
                 "(Lcom/fs/starfarer/api/campaign/SectorEntityToken;)"
@@ -765,22 +2066,31 @@ public final class StructuralCompatibilityTest {
                             "starsector.prepatcher.patchStatus."
                                     + className.replace('/', '.') + "." + key.patchId)),
                     className + " exp8 hooks without scope were accepted");
-            if (className.equals(PrepatcherTransformer.ECONOMY)) {
-                require("SKIPPED_STRUCTURAL".equals(System.getProperty(
-                                "starsector.prepatcher.patchStatus."
-                                        + className.replace('/', '.')
-                                        + ".remoteMarketScheduler")),
-                        "Economy remote-market scheduler hooks without scope were accepted");
-            }
         }
+
+        byte[] enginePatched = new PrepatcherTransformer(config).transform(
+                null, PrepatcherTransformer.CAMPAIGN_ENGINE, null, null,
+                classBytes(jarPaths, PrepatcherTransformer.CAMPAIGN_ENGINE));
+        require(enginePatched != null, "CampaignEngine market-scheduler tick transform failed");
+        ClassNode unticked = read(enginePatched);
+        removeHookScope(method(unticked, "advance", "(FLcom/fs/starfarer/util/A/new;)V"),
+                "beginMarketSchedulerTick", "endMarketSchedulerTick", "market scheduler tick");
+        byte[] untickedResult = new PrepatcherTransformer(config).transform(
+                null, PrepatcherTransformer.CAMPAIGN_ENGINE, null, null, write(unticked));
+        require(untickedResult == null,
+                "CampaignEngine scheduler component without its tick boundary was modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(
+                        "starsector.prepatcher.patchStatus."
+                                + PrepatcherTransformer.CAMPAIGN_ENGINE.replace('/', '.')
+                                + ".marketScheduler")),
+                "CampaignEngine scheduler component without tick boundary was accepted");
 
         Map<String, HookTamper> latePostconditions = new LinkedHashMap<>();
         latePostconditions.put(PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
-                new HookTamper("advancePlanetConditionMarketScheduled",
-                        "planetConditionMarketAdvanceBridge"));
+                new HookTamper("advanceMarketScheduled", "marketScheduler"));
         latePostconditions.put(PrepatcherTransformer.ECONOMY,
                 new HookTamper("borrowPersistentSnapshotTimed",
-                        "economyPersistentSnapshots"));
+                        "economyAdvancePlan"));
         latePostconditions.put(PrepatcherTransformer.SHIP,
                 new HookTamper("borrowShipListSnapshot", "shipAdvanceScratch"));
         latePostconditions.put(PrepatcherTransformer.DYNAMIC_PARTICLE_GROUP,
@@ -813,7 +2123,10 @@ public final class StructuralCompatibilityTest {
                 damagedScheduledAmount, "advance", "(F)V");
         MethodInsnNode scheduled = uniqueHook(
                 damagedScheduledAmount, "advanceMarketScheduled");
-        AbstractInsnNode scheduledAmount = previousMeaningful(scheduled);
+        AbstractInsnNode scheduledSource = previousMeaningful(scheduled);
+        require(isIntegerConstant(scheduledSource, 0),
+                "Economy scheduled source changed in test input");
+        AbstractInsnNode scheduledAmount = previousMeaningful(scheduledSource);
         require(scheduledAmount instanceof VarInsnNode amountLoad
                         && amountLoad.getOpcode() == Opcodes.FLOAD && amountLoad.var == 1,
                 "Economy scheduled amount changed in test input");
@@ -827,7 +2140,7 @@ public final class StructuralCompatibilityTest {
         require("SKIPPED_STRUCTURAL".equals(System.getProperty(
                         "starsector.prepatcher.patchStatus."
                                 + PrepatcherTransformer.ECONOMY.replace('/', '.')
-                                + ".remoteMarketScheduler")),
+                                + ".economyAdvancePlan")),
                 "Economy scheduler with damaged amount source was accepted as idempotent");
     }
 
@@ -888,14 +2201,14 @@ public final class StructuralCompatibilityTest {
         require(patched != null, "H baseline transform failed in ownership test");
 
         ClassNode unowned = read(patched);
-        require(unowned.fields.removeIf(field -> field.name.equals("smo$patched$retainAll")),
-                "retainAll ownership marker was not emitted");
+        require(unowned.fields.removeIf(field -> field.name.equals("smo$patched$mapRenderStuff")),
+                "mapRenderStuff ownership marker was not emitted");
         byte[] unownedResult = new PrepatcherTransformer(config)
                 .transform(null, PrepatcherTransformer.H, null, null, write(unowned));
         require(unownedResult == null, "foreign hook-shaped retainAll state was modified");
         require("SKIPPED_STRUCTURAL".equals(System.getProperty(
-                        "starsector.prepatcher.patchStatus.com.fs.starfarer.coreui.A.H.retainAll")),
-                "foreign hook-shaped retainAll state was not rejected structurally");
+                        "starsector.prepatcher.patchStatus.com.fs.starfarer.coreui.A.H.mapRenderStuff")),
+                "foreign hook-shaped mapRenderStuff state was not rejected structurally");
 
         ClassNode unscoped = read(patched);
         removeScratchScope(method(unscoped, "renderStuff", "(FZ)V"));
@@ -903,11 +2216,35 @@ public final class StructuralCompatibilityTest {
                 .transform(null, PrepatcherTransformer.H, null, null, write(unscoped));
         require(unscopedResult == null, "owned scratch hooks without a scope were modified");
         require("SKIPPED_STRUCTURAL".equals(System.getProperty(
-                        "starsector.prepatcher.patchStatus.com.fs.starfarer.coreui.A.H.retainAll")),
-                "owned retainAll hook without a scratch scope was accepted");
+                        "starsector.prepatcher.patchStatus.com.fs.starfarer.coreui.A.H.mapRenderStuff")),
+                "owned mapRenderStuff hooks without a scratch scope were accepted");
+
+        ClassNode partial = read(patched);
+        MethodNode partialRender = method(partial, "renderStuff", "(FZ)V");
+        MethodInsnNode classSetHook = null;
+        for (AbstractInsnNode insn : partialRender.instructions.toArray()) {
+            if (insn instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals(HOOKS) && call.name.equals("borrowClassSet")
+                    && call.desc.equals("()Ljava/util/HashSet;")) {
+                classSetHook = call;
+                break;
+            }
+        }
+        require(classSetHook != null, "borrowClassSet hook missing in patched H");
+        InsnList restoredAllocation = new InsnList();
+        restoredAllocation.add(new TypeInsnNode(Opcodes.NEW, "java/util/HashSet"));
+        restoredAllocation.add(new InsnNode(Opcodes.DUP));
+        restoredAllocation.add(new MethodInsnNode(Opcodes.INVOKESPECIAL,
+                "java/util/HashSet", "<init>", "()V", false));
+        partialRender.instructions.insertBefore(classSetHook, restoredAllocation);
+        partialRender.instructions.remove(classSetHook);
+        byte[] partialResult = new PrepatcherTransformer(config)
+                .transform(null, PrepatcherTransformer.H, null, null, write(partial));
+        require(partialResult == null, "owned partial renderStuff group was modified");
         require("SKIPPED_STRUCTURAL".equals(System.getProperty(
-                        "starsector.prepatcher.patchStatus.com.fs.starfarer.coreui.A.H.scratchCollections")),
-                "owned scratch allocation hooks without a scope were accepted");
+                        "starsector.prepatcher.patchStatus.com.fs.starfarer.coreui.A.H.mapRenderStuff")),
+                "owned partial renderStuff group was not rejected structurally");
 
         ClassNode tampered = read(patched);
         method(tampered, "getIntelIconEntity",
@@ -943,20 +2280,25 @@ public final class StructuralCompatibilityTest {
     }
 
     private static void removeScratchScope(MethodNode method) {
-        TryCatchBlockNode scratchHandler = null;
+        removeHookScope(method, "beginScratchScope", "endScratchScope", "scratch");
+    }
+
+    private static void removeHookScope(MethodNode method, String beginName,
+                                        String endName, String label) {
+        TryCatchBlockNode handler = null;
         for (TryCatchBlockNode block : method.tryCatchBlocks) {
             AbstractInsnNode first = nextMeaningful(block.handler);
             if (block.type == null && first instanceof MethodInsnNode call
-                    && call.owner.equals(HOOKS) && call.name.equals("endScratchScope")
+                    && call.owner.equals(HOOKS) && call.name.equals(endName)
                     && call.desc.equals("()V")) {
-                require(scratchHandler == null, "multiple scratch catch-all handlers in test input");
-                scratchHandler = block;
+                require(handler == null, "multiple " + label + " catch-all handlers in test input");
+                handler = block;
             }
         }
-        require(scratchHandler != null, "scratch catch-all handler is missing in test input");
-        method.tryCatchBlocks.remove(scratchHandler);
+        require(handler != null, label + " catch-all handler is missing in test input");
+        method.tryCatchBlocks.remove(handler);
 
-        AbstractInsnNode cursor = scratchHandler.handler;
+        AbstractInsnNode cursor = handler.handler;
         while (cursor != null) {
             AbstractInsnNode next = cursor.getNext();
             boolean done = cursor.getOpcode() == Opcodes.ATHROW;
@@ -968,19 +2310,17 @@ public final class StructuralCompatibilityTest {
         int removedCalls = 0;
         for (AbstractInsnNode insn : method.instructions.toArray()) {
             if (insn instanceof MethodInsnNode call && call.owner.equals(HOOKS)
-                    && (call.name.equals("beginScratchScope") || call.name.equals("endScratchScope"))
+                    && (call.name.equals(beginName) || call.name.equals(endName))
                     && call.desc.equals("()V")) {
                 method.instructions.remove(call);
                 removedCalls++;
             }
         }
-        require(removedCalls >= 2, "scratch scope calls are missing in test input");
+        require(removedCalls >= 2, label + " scope calls are missing in test input");
     }
 
-    private static void assertHNonRetainHooks(byte[] bytes, String scenario) {
+    private static void assertHIndependentHooks(byte[] bytes, String scenario) {
         Map<String, Integer> expected = new LinkedHashMap<>();
-        expected.put("borrowEntityList", 1);
-        expected.put("borrowClassSet", 1);
         expected.put("nearbyLabelIcons", 1);
         expected.put("getIntelIconEntityIndexed", 1);
         expected.put("updateSystemNebulasCached", 1);
@@ -1014,6 +2354,27 @@ public final class StructuralCompatibilityTest {
             unrelated.add(new InsnNode(Opcodes.POP));
             render.instructions.insert(unrelated);
             return write(node);
+        }
+
+        if (mutation == Mutation.MISSING_CLASS_SET) {
+            for (AbstractInsnNode insn : render.instructions.toArray()) {
+                if (!(insn instanceof TypeInsnNode allocation)
+                        || allocation.getOpcode() != Opcodes.NEW
+                        || !allocation.desc.equals("java/util/HashSet")) continue;
+                allocation.desc = "java/util/LinkedHashSet";
+                for (AbstractInsnNode cursor = allocation.getNext(); cursor != null;
+                     cursor = cursor.getNext()) {
+                    if (cursor instanceof MethodInsnNode call
+                            && call.getOpcode() == Opcodes.INVOKESPECIAL
+                            && call.owner.equals("java/util/HashSet")
+                            && call.name.equals("<init>") && call.desc.equals("()V")) {
+                        call.owner = "java/util/LinkedHashSet";
+                        return write(node);
+                    }
+                    if (cursor.getOpcode() == Opcodes.NEW) break;
+                }
+            }
+            throw new AssertionError("target HashSet allocation not found in H.renderStuff");
         }
 
         MethodInsnNode retain = null;
@@ -1075,9 +2436,14 @@ public final class StructuralCompatibilityTest {
                 expected.put("fastContains", 1);
                 expected.put("existingIntelIconCandidates", 1);
             }
+            case PrepatcherTransformer.CAMPAIGN_STATE ->
+                    expected.put("registerMarketSchedulerComponent", 1);
             case PrepatcherTransformer.CAMPAIGN_ENGINE -> {
                 expected.put("beginCampaignEngineChange", 2);
                 expected.put("completeCampaignEngineChange", 2);
+                expected.put("beginMarketSchedulerTick", 1);
+                expected.put("endMarketSchedulerTick", 2);
+                expected.put("marketSchedulerFastForwardIterationChanged", 1);
                 expected.put("readdChangeListenersIfNeeded", 1);
             }
             case PrepatcherTransformer.COURSE_WIDGET -> {
@@ -1091,17 +2457,17 @@ public final class StructuralCompatibilityTest {
             case PrepatcherTransformer.BASE_CAMPAIGN_ENTITY -> {
                 // Entity-script empty fast path remains inline. The condition-only
                 // market call site is routed through a marked scheduler/observer hook.
-                expected.put("advancePlanetConditionMarketScheduled", 1);
+                expected.put("advanceMarketScheduled", 1);
             }
             case PrepatcherTransformer.MEMORY -> {
                 // Fully inline; the previous helper-based version was measurable
                 // in real campaign telemetry.
             }
+            case PrepatcherTransformer.CORE_SCRIPT ->
+                    assertHookCount(bytes, CORE_WORLDS_RUNTIME, "update", 1);
             case PrepatcherTransformer.ECONOMY -> {
                 expected.put("updateEconomyLocationMapIfNeededPersistent", 1);
                 expected.put("borrowPersistentSnapshotTimed", 1);
-                expected.put("borrowEconomyCollectionSnapshot", 1);
-                expected.put("beginRemoteMarketFrame", 1);
                 expected.put("advanceMarketScheduled", 1);
                 expected.put("newPersistentSnapshotState", 2);
                 expected.put("markPersistentSnapshotStructure", 3);
@@ -1112,9 +2478,39 @@ public final class StructuralCompatibilityTest {
                 expected.put("markPersistentSnapshotStructure", 6);
                 expected.put("advanceMarketCommodityTemporalState", 1);
                 expected.put("observeMarketAdvanceEntry", 1);
+                expected.put("beginMarketAdvanceInvocation", 1);
+                expected.put("endMarketAdvanceInvocation", 2);
+                expected.put("registerConstructionQueueOwner", 1);
+                expected.put("flushPendingMarketBeforeMutation", 3);
+                expected.put("registerMarketSchedulerComponent", 1);
             }
-            case PrepatcherTransformer.BASE_INDUSTRY ->
-                    expected.put("isBaseIndustryDormantFastPathEligible", 1);
+            case PrepatcherTransformer.BASE_INDUSTRY -> {
+                expected.put("isBaseIndustryDormantFastPathEligible", 1);
+                expected.put("flushPendingMarketBeforeMutation", 4);
+                expected.put("registerMarketSchedulerComponent", 1);
+            }
+            case PrepatcherTransformer.MILITARY_BASE,
+                    PrepatcherTransformer.LIONS_GUARD_HQ -> {
+                expected.put("hasCurrentMarketAdvanceBatch", 1);
+                expected.put("currentMarketAdvanceBatchRunCount", 1);
+                expected.put("currentMarketAdvanceBatchRunAmount", 1);
+                expected.put("currentMarketAdvanceBatchRunRepeats", 1);
+                expected.put("recordMarketComponentReplayedStep", 1);
+                expected.put("registerMarketSchedulerComponent", 1);
+            }
+            case PrepatcherTransformer.RECENT_UNREST -> {
+                expected.put("hasCurrentMarketAdvanceBatch", 1);
+                expected.put("currentMarketAdvanceBatchRunCount", 1);
+                expected.put("currentMarketAdvanceBatchRunAmount", 1);
+                expected.put("currentMarketAdvanceBatchRunRepeats", 1);
+                expected.put("recordMarketComponentReplayedStep", 1);
+                expected.put("shouldContinueRecentUnrestReplay", 1);
+                expected.put("registerMarketSchedulerComponent", 1);
+            }
+            case PrepatcherTransformer.CONSTRUCTION_QUEUE -> {
+                expected.put("flushPendingConstructionQueueBeforeMutation", 7);
+                expected.put("registerMarketSchedulerComponent", 1);
+            }
             case PrepatcherTransformer.MUTABLE_STAT ->
                     expected.put("markCommodityTemporalOwnerDirty", 14);
             case PrepatcherTransformer.COMMODITY_ON_MARKET -> {
@@ -1172,10 +2568,24 @@ public final class StructuralCompatibilityTest {
             case PrepatcherTransformer.PROGRESS_INPUT, PrepatcherTransformer.PROGRESS_OUTPUT ->
                     expected.put("saveLoadProgressMinIntervalSeconds", 1);
             case PrepatcherTransformer.CAMPAIGN_GAME_MANAGER -> {
-                expected.put("flushRemoteMarketsBeforeSave", 1);
+                expected.put("runCacheMaintenance", 1);
+                expected.put("flushMarketSchedulerBeforeSave", 1);
             }
-            case HyperspacePatches.BASE_TILED ->
-                    assertHookCount(bytes, HYPERSPACE_HOOKS, "seededRandom", 3);
+            case PrepatcherTransformer.PLANET_SURVEY_PANEL,
+                    PrepatcherTransformer.LUDDIC_PATH_BASE_INTEL,
+                    PrepatcherTransformer.PIRATE_BASE_INTEL,
+                    PrepatcherTransformer.PK_CMD ->
+                    expected.put("advanceMarketSynchronized", 1);
+            case PrepatcherTransformer.DECIV_TRACKER ->
+                    expected.put("advanceMarketSynchronized", 2);
+            case HyperspacePatches.BASE_TILED -> {
+                assertHookCount(bytes, HYPERSPACE_HOOKS, "seededRandom", 3);
+                ClassNode tiled = read(bytes);
+                require(HyperspacePatches.countPatchedViewportBounds(tiled) == 2,
+                        className + " atomic viewport-bounds postcondition is incomplete");
+                require(hasOwnershipMarker(tiled, "hyperspaceViewportBounds"),
+                        className + " atomic viewport-bounds marker is missing");
+            }
             case HyperspacePatches.HYPER_TERRAIN -> {
                 int layerFilters = countHook(bytes, HYPERSPACE_HOOKS, "filterLayers")
                         + countHook(bytes, HYPERSPACE_HOOKS, "filterLayerSet");
@@ -1213,6 +2623,8 @@ public final class StructuralCompatibilityTest {
             assertScratchScope(bytes, "o00000", "(FF)V");
         } else if (className.equals(PrepatcherTransformer.EVENTS)) {
             assertScratchScope(bytes, "addMissingIconsAndRows", "()V");
+        } else if (className.equals(PrepatcherTransformer.CAMPAIGN_ENGINE)) {
+            assertMarketSchedulerTickScope(bytes);
         } else if (className.equals(PrepatcherTransformer.BASE_LOCATION)) {
             assertScratchScope(bytes, "advance", "(FLcom/fs/starfarer/util/A/new;)V");
             assertScratchScope(bytes, "advanceEvenIfPaused",
@@ -1223,13 +2635,16 @@ public final class StructuralCompatibilityTest {
             assertMemoryEmptyGuard(bytes);
         } else if (className.equals(PrepatcherTransformer.ECONOMY)) {
             assertEconomyPersistentSnapshots(bytes);
-            assertScratchScope(bytes, "advance", "(F)V");
-            assertScratchScope(bytes, "advanceMarketConditionsWhenPaused", "(F)V");
         } else if (className.equals(PrepatcherTransformer.MARKET)) {
             assertMarketPersistentSnapshots(bytes);
             assertMarketCommodityTemporalActiveSet(bytes);
         } else if (className.equals(PrepatcherTransformer.BASE_INDUSTRY)) {
             assertBaseIndustryDormantFastPath(bytes);
+        } else if (className.equals(PrepatcherTransformer.MILITARY_BASE)
+                || className.equals(PrepatcherTransformer.LIONS_GUARD_HQ)
+                || className.equals(PrepatcherTransformer.RECENT_UNREST)) {
+            assertMarketStepReplayWrapper(bytes,
+                    className.equals(PrepatcherTransformer.RECENT_UNREST));
         } else if (className.equals(PrepatcherTransformer.MUTABLE_STAT)) {
             assertCommodityTemporalBinding(bytes);
         } else if (className.equals(PrepatcherTransformer.COMMODITY_ON_MARKET)) {
@@ -1245,6 +2660,25 @@ public final class StructuralCompatibilityTest {
         } else if (className.equals(PrepatcherTransformer.DYNAMIC_PARTICLE_GROUP)) {
             assertScratchScope(bytes, "advance", "(F)V");
         }
+    }
+
+    private static void assertMarketStepReplayWrapper(byte[] bytes, boolean recent) {
+        ClassNode node = read(bytes);
+        MethodNode wrapper = method(node, "advance", "(F)V");
+        MethodNode raw = method(node, "smo$advanceSingleStep", "(F)V");
+        require((raw.access & Opcodes.ACC_PRIVATE) != 0
+                        && (raw.access & Opcodes.ACC_SYNTHETIC) != 0,
+                node.name + " replay body metadata changed");
+        require(countCalls(wrapper, Opcodes.INVOKESPECIAL, node.name,
+                        "smo$advanceSingleStep", "(F)V") == 2,
+                node.name + " replay wrapper raw-call count changed");
+        require(countCalls(wrapper, -1, node.name, "advance", "(F)V") == 0,
+                node.name + " replay wrapper recurses into itself");
+        require(countCalls(wrapper, Opcodes.INVOKESTATIC, HOOKS,
+                        "shouldContinueRecentUnrestReplay",
+                        "(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;)Z")
+                        == (recent ? 1 : 0),
+                node.name + " RecentUnrest break hook changed");
     }
 
     private static void assertBaseIndustryDormantFastPath(byte[] bytes) {
@@ -1292,7 +2726,8 @@ public final class StructuralCompatibilityTest {
         FieldNode state = requireField(node, "smo$commodityTemporalState", "Ljava/lang/Object;");
         require(state.access == fieldAccess && state.signature == null && state.value == null,
                 "Market commodity temporal state field metadata changed");
-        MethodNode advance = method(node, "advance", "(F)V");
+        MethodNode advance = optionalMethod(node, "smo$marketAdvancePlanBody", "(F)V");
+        if (advance == null) advance = method(node, "advance", "(F)V");
         require(countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
                 "advanceMarketCommodityTemporalState",
                 "(Ljava/lang/Object;Ljava/lang/Object;F)Ljava/lang/Object;") == 1,
@@ -1347,8 +2782,15 @@ public final class StructuralCompatibilityTest {
                 "Economy persistent snapshots left getMarketsCopy in a hot path");
         require(countHook(bytes, "updateEconomyLocationMapIfNeeded") == 0,
                 "Economy retained the per-frame full-fingerprint location hook");
-        require(countHook(bytes, "borrowEconomyMarketsSnapshot") == 0,
-                "Economy retained old clear/addAll market snapshots");
+        require(countHook(bytes, "borrowEconomyMarketsSnapshot") == 0
+                        && countHook(bytes, "borrowEconomyCollectionSnapshot") == 0,
+                "Economy retained removed scratch snapshot hooks");
+        require(countCalls(paused, Opcodes.INVOKESPECIAL, "java/util/ArrayList",
+                        "<init>", "(Ljava/util/Collection;)V") == 1,
+                "Economy paused condition snapshot no longer uses vanilla fresh-copy semantics");
+        require(countCalls(paused, Opcodes.INVOKESTATIC, HOOKS,
+                        "beginScratchScope", "()V") == 0,
+                "Economy persistent snapshots retained a hidden paused scratch scope");
     }
 
     private static void assertMarketPersistentSnapshots(byte[] bytes) {
@@ -1372,15 +2814,17 @@ public final class StructuralCompatibilityTest {
                     "(Ljava/lang/Object;Ljava/util/Collection;II)Ljava/util/ArrayList;") == 1,
                     "Market persistent accessor hook changed: " + accessor.name);
         }
-        MethodNode advance = method(node, "advance", "(F)V");
+        MethodNode advance = optionalMethod(node, "smo$marketAdvancePlanBody", "(F)V");
+        if (advance == null) advance = method(node, "advance", "(F)V");
         require(countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
                 conditions.name, conditions.desc) == 1,
                 "Market conditions snapshot call changed");
         require(countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
                 industries.name, industries.desc) == 1,
                 "Market industries snapshot call changed");
-        require(countHook(bytes, "borrowEconomyCollectionSnapshot") == 0,
-                "Market retained old clear/addAll snapshots");
+        require(countHook(bytes, "borrowEconomyMarketsSnapshot") == 0
+                        && countHook(bytes, "borrowEconomyCollectionSnapshot") == 0,
+                "Market retained removed scratch snapshot hooks");
     }
 
     private static void assertTempModExpiryScheduler(byte[] bytes) {
@@ -1573,10 +3017,7 @@ public final class StructuralCompatibilityTest {
                 "Memory.advance guard is not the exact post-pause prefix");
     }
 
-    private static void assertRedundantSaveBufferRemoved(byte[] bytes) {
-        ClassNode node = read(bytes);
-        MethodNode save = method(node, "o00000",
-                "(Lcom/fs/starfarer/campaign/CampaignEngine$o;JZ)Ljava/lang/String;");
+    private static int countRedundantSaveBuffers(MethodNode save) {
         int redundant = 0;
         for (AbstractInsnNode insn : save.instructions.toArray()) {
             if (!(insn instanceof MethodInsnNode call)
@@ -1585,9 +3026,54 @@ public final class StructuralCompatibilityTest {
                     || !call.name.equals("<init>")
                     || !call.desc.equals("(Ljava/io/OutputStream;I)V")) continue;
             AbstractInsnNode size = previousMeaningful(call);
-            if (size instanceof LdcInsnNode ldc && Integer.valueOf(1_048_576).equals(ldc.cst)) redundant++;
+            if (size instanceof LdcInsnNode ldc
+                    && Integer.valueOf(1_048_576).equals(ldc.cst)) redundant++;
         }
-        require(redundant == 0, "redundant outer 1 MiB save buffer is still present");
+        return redundant;
+    }
+
+    private static void assertRedundantSaveBufferRemoved(byte[] bytes) {
+        ClassNode node = read(bytes);
+        MethodNode save = method(node, "o00000",
+                "(Lcom/fs/starfarer/campaign/CampaignEngine$o;JZ)Ljava/lang/String;");
+        require(countRedundantSaveBuffers(save) == 0,
+                "redundant outer 1 MiB save buffer is still present");
+    }
+
+    private static void assertMarketSchedulerTickScope(byte[] bytes) {
+        ClassNode node = read(bytes);
+        MethodNode scoped = method(node, "advance", "(FLcom/fs/starfarer/util/A/new;)V");
+        require(countCalls(scoped, "beginMarketSchedulerTick") == 1,
+                node.name + ".advance has no unique market-scheduler tick entry");
+        int returns = 0;
+        for (AbstractInsnNode insn : scoped.instructions.toArray()) {
+            if (insn.getOpcode() < Opcodes.IRETURN || insn.getOpcode() > Opcodes.RETURN) continue;
+            returns++;
+            AbstractInsnNode previous = previousMeaningful(insn);
+            require(previous instanceof MethodInsnNode call && call.owner.equals(HOOKS)
+                            && call.name.equals("endMarketSchedulerTick") && call.desc.equals("()V"),
+                    node.name + ".advance has an unclosed market-scheduler tick return");
+        }
+        require(countCalls(scoped, "endMarketSchedulerTick") == returns + 1,
+                node.name + ".advance market-scheduler tick exit count changed");
+
+        MethodNode setter = method(node, "setFastForwardIteration", "(Z)V");
+        require(setter != null, node.name + ".setFastForwardIteration(Z)V is missing");
+        require(countCalls(setter, Opcodes.INVOKESTATIC, HOOKS,
+                        "marketSchedulerFastForwardIterationChanged", "(Z)V") == 1,
+                node.name + ".setFastForwardIteration has no unique render-batch hook");
+        for (AbstractInsnNode insn : setter.instructions.toArray()) {
+            if (insn.getOpcode() != Opcodes.RETURN) continue;
+            AbstractInsnNode hookInsn = previousMeaningful(insn);
+            require(hookInsn instanceof MethodInsnNode hook && hook.owner.equals(HOOKS)
+                            && hook.name.equals("marketSchedulerFastForwardIterationChanged")
+                            && hook.desc.equals("(Z)V"),
+                    node.name + ".setFastForwardIteration return does not close the batch boundary");
+            AbstractInsnNode source = previousMeaningful(hookInsn);
+            require(source instanceof VarInsnNode load && load.getOpcode() == Opcodes.ILOAD
+                            && load.var == 1,
+                    node.name + ".setFastForwardIteration hook source is not argument 1");
+        }
     }
 
     private static void assertScratchScope(byte[] bytes, String name, String desc) {
@@ -1643,6 +3129,77 @@ public final class StructuralCompatibilityTest {
             }
         }
         return locals;
+    }
+
+    private static void prepatchOneViewportRange(ClassNode node) {
+        for (MethodNode method : node.methods) {
+            int width = -1;
+            int height = -1;
+            AbstractInsnNode afterHeight = null;
+            for (AbstractInsnNode insn : method.instructions.toArray()) {
+                if (!(insn instanceof MethodInsnNode call) || !call.desc.equals("()F")) continue;
+                AbstractInsnNode store = nextMeaningful(call);
+                if (!(store instanceof VarInsnNode local)
+                        || local.getOpcode() != Opcodes.FSTORE) continue;
+                if (call.name.equals("getVisibleWidth")) width = local.var;
+                else if (call.name.equals("getVisibleHeight")) {
+                    height = local.var;
+                    afterHeight = store;
+                }
+            }
+            if (width < 0 || height < 0 || afterHeight == null) continue;
+            List<VarInsnNode> widthLoads = new ArrayList<>();
+            for (AbstractInsnNode insn = afterHeight.getNext(); insn != null;
+                 insn = insn.getNext()) {
+                if (insn instanceof VarInsnNode load
+                        && load.getOpcode() == Opcodes.FLOAD && load.var == width) {
+                    widthLoads.add(load);
+                }
+            }
+            if (widthLoads.size() != 3) continue;
+            widthLoads.get(2).var = height;
+            return;
+        }
+        throw new AssertionError("viewport vertical-range fixture site not found");
+    }
+
+    private static void prepatchOneViewportClamp(ClassNode node) {
+        for (MethodNode method : node.methods) {
+            boolean viewportMethod = false;
+            for (AbstractInsnNode insn : method.instructions.toArray()) {
+                if (insn instanceof MethodInsnNode call
+                        && call.name.equals("getVisibleHeight") && call.desc.equals("()F")) {
+                    viewportMethod = true;
+                    break;
+                }
+            }
+            if (!viewportMethod) continue;
+            List<InsnNode> comparisons = new ArrayList<>();
+            for (AbstractInsnNode insn : method.instructions.toArray()) {
+                if (!(insn instanceof InsnNode length)
+                        || length.getOpcode() != Opcodes.ARRAYLENGTH) continue;
+                AbstractInsnNode previous = previousMeaningful(length);
+                AbstractInsnNode next1 = nextMeaningful(length);
+                AbstractInsnNode next2 = next1 == null ? null : nextMeaningful(next1);
+                AbstractInsnNode next3 = next2 == null ? null : nextMeaningful(next2);
+                if (!(previous instanceof FieldInsnNode field)
+                        || field.getOpcode() != Opcodes.GETFIELD || !field.desc.startsWith("[[")
+                        || next1 == null || next1.getOpcode() != Opcodes.I2F
+                        || next2 == null || next2.getOpcode() != Opcodes.FCMPL
+                        || !(next3 instanceof JumpInsnNode)) continue;
+                comparisons.add(length);
+            }
+            if (comparisons.size() != 2) continue;
+            InsnNode victim = comparisons.get(1);
+            InsnList replacement = new InsnList();
+            replacement.add(new InsnNode(Opcodes.ICONST_0));
+            replacement.add(new InsnNode(Opcodes.AALOAD));
+            replacement.add(new InsnNode(Opcodes.ARRAYLENGTH));
+            method.instructions.insertBefore(victim, replacement);
+            method.instructions.remove(victim);
+            return;
+        }
+        throw new AssertionError("viewport vertical-clamp fixture site not found");
     }
 
     private static List<AbstractInsnNode> meaningfulInstructions(MethodNode method) {
@@ -1758,6 +3315,37 @@ public final class StructuralCompatibilityTest {
         return writer.toByteArray();
     }
 
+    private static byte[] removeSchedulerRegistration(byte[] bytes, int component) {
+        ClassNode node = read(bytes);
+        MethodNode initializer = method(node, "<clinit>", "()V");
+        int removed = 0;
+        for (AbstractInsnNode insn : initializer.instructions.toArray()) {
+            if (!(insn instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESTATIC
+                    || !call.owner.equals(HOOKS)
+                    || !call.name.equals("registerMarketSchedulerComponent")
+                    || !call.desc.equals("(I)V")) continue;
+            AbstractInsnNode source = previousMeaningful(call);
+            if (!isIntegerConstant(source, component)) continue;
+            initializer.instructions.remove(source);
+            initializer.instructions.remove(call);
+            removed++;
+        }
+        require(removed > 0,
+                "scheduler registration fixture missing component " + component);
+        return write(node);
+    }
+
+    private static FieldNode findFieldOrNull(ClassNode node, String name) {
+        FieldNode result = null;
+        for (FieldNode field : node.fields) {
+            if (!field.name.equals(name)) continue;
+            require(result == null, "field " + name + " is duplicated in test input");
+            result = field;
+        }
+        return result;
+    }
+
     private static FieldNode requireField(ClassNode node, String name, String desc) {
         FieldNode found = null;
         for (FieldNode field : node.fields) {
@@ -1766,6 +3354,16 @@ public final class StructuralCompatibilityTest {
             found = field;
         }
         require(found != null, "field " + name + desc + " is missing");
+        return found;
+    }
+
+    private static MethodNode optionalMethod(ClassNode node, String name, String desc) {
+        MethodNode found = null;
+        for (MethodNode method : node.methods) {
+            if (!method.name.equals(name) || !method.desc.equals(desc)) continue;
+            require(found == null, "duplicate method " + name + desc);
+            found = method;
+        }
         return found;
     }
 
@@ -1778,10 +3376,26 @@ public final class StructuralCompatibilityTest {
         return found.get(0);
     }
 
+    private static AbstractInsnNode firstMeaningful(MethodNode method) {
+        AbstractInsnNode current = method.instructions.getFirst();
+        while (current != null && current.getOpcode() < 0) current = current.getNext();
+        return current;
+    }
+
     private static AbstractInsnNode previousMeaningful(AbstractInsnNode node) {
         AbstractInsnNode current = node.getPrevious();
         while (current != null && current.getOpcode() < 0) current = current.getPrevious();
         return current;
+    }
+
+
+    private static boolean isIntegerConstant(AbstractInsnNode insn, int value) {
+        if (insn == null) return false;
+        int opcode = insn.getOpcode();
+        if (value >= 0 && value <= 5 && opcode == Opcodes.ICONST_0 + value) return true;
+        if (value == -1 && opcode == Opcodes.ICONST_M1) return true;
+        if (insn instanceof IntInsnNode integer) return integer.operand == value;
+        return insn instanceof LdcInsnNode ldc && Integer.valueOf(value).equals(ldc.cst);
     }
 
     private static AbstractInsnNode nextMeaningful(AbstractInsnNode node) {
@@ -1798,7 +3412,9 @@ public final class StructuralCompatibilityTest {
         return Integer.parseInt(System.getProperty(key, "0"));
     }
 
-    private enum Mutation { UNRELATED_NOP, UNRELATED_RETAIN, MISSING_RETAIN, DUPLICATE_RETAIN }
+    private enum Mutation { UNRELATED_NOP, UNRELATED_RETAIN, MISSING_RETAIN, DUPLICATE_RETAIN, MISSING_CLASS_SET }
+    private enum HitMutation { MISSING_HIT_LIST, MISSING_FACTOR_CALL }
+    private enum EventsMutation { MISSING_CONTAINS, MISSING_VALUES }
     private record MethodKey(String name, String desc, String patchId) {}
     private record HookTamper(String hookName, String patchId) {}
 

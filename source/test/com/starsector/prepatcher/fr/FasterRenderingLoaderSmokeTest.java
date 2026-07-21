@@ -25,6 +25,10 @@ public final class FasterRenderingLoaderSmokeTest {
     private static final String GLOBAL = "com.fs.starfarer.api.Global";
     private static final String CAMPAIGN_ENGINE =
             "com.fs.starfarer.campaign.CampaignEngine";
+    private static final String HYPERSPACE_TERRAIN =
+            "com.fs.starfarer.api.impl.campaign.terrain.HyperspaceTerrainPlugin";
+    private static final String BASE_TERRAIN =
+            "com.fs.starfarer.api.impl.campaign.terrain.BaseTerrain";
     private static final String INTEL_MANAGER =
             "com.fs.starfarer.campaign.comms.v2.IntelManager";
     private static final String COMMODITY_ON_MARKET =
@@ -36,11 +40,13 @@ public final class FasterRenderingLoaderSmokeTest {
             "com.fs.starfarer.api.StarsectorPrepatcherHyperspaceHooks";
     private static final String RUNTIME_BRIDGE =
             "com.fs.starfarer.api.StarsectorPrepatcherRuntimeBridge";
+    private static final String PRESENTATION_HOOKS =
+            "com.fs.starfarer.api.StarsectorPrepatcherPresentationHooks";
     private static final String AGENT =
             "com.starsector.prepatcher.agent.PrepatcherAgent";
     private static final String RUNTIME_ENTRY_PREFIX =
             "com/fs/starfarer/api/StarsectorPrepatcher";
-    private static final int EXPECTED_RUNTIME_CLASS_COUNT = 64;
+    private static final int EXPECTED_RUNTIME_CLASS_COUNT = 84;
 
     private FasterRenderingLoaderSmokeTest() {}
 
@@ -59,20 +65,26 @@ public final class FasterRenderingLoaderSmokeTest {
 
         Class<?> global = load(system, GLOBAL);
         Class<?> campaignEngine = load(system, CAMPAIGN_ENGINE);
+        Class<?> hyperspaceTerrain = load(system, HYPERSPACE_TERRAIN);
+        Class<?> baseTerrain = load(system, BASE_TERRAIN);
         Class<?> intelManager = load(system, INTEL_MANAGER);
         Class<?> commodityOnMarket = load(system, COMMODITY_ON_MARKET);
         Class<?> hooks = load(system, RUNTIME_HOOKS);
         Class<?> hyperspaceHooks = load(system, HYPERSPACE_HOOKS);
         Class<?> bridge = load(system, RUNTIME_BRIDGE);
+        Class<?> presentationHooks = load(system, PRESENTATION_HOOKS);
         Class<?> vector2f = load(system, VECTOR_2F);
 
         assertDefinedBy(system, global);
         assertDefinedBy(system, campaignEngine);
+        assertDefinedBy(system, hyperspaceTerrain);
+        assertDefinedBy(system, baseTerrain);
         assertDefinedBy(system, intelManager);
         assertDefinedBy(system, commodityOnMarket);
         assertDefinedBy(system, hooks);
         assertDefinedBy(system, hyperspaceHooks);
         assertDefinedBy(system, bridge);
+        assertDefinedBy(system, presentationHooks);
         int runtimeClassCount = assertRuntimeInventory(agentJar, system);
 
         // This is the exact descriptor that previously failed while resolving
@@ -97,6 +109,24 @@ public final class FasterRenderingLoaderSmokeTest {
         require("APPLIED".equals(commodityPatchStatus),
                 "FR did not transform CommodityOnMarket: status="
                         + commodityPatchStatus);
+        String presentationPatchStatus = System.getProperty(
+                "starsector.prepatcher.patchStatus." + CAMPAIGN_ENGINE
+                        + ".fastForwardPresentation");
+        require("APPLIED".equals(presentationPatchStatus),
+                "FR did not apply presentation coalescing before the structural transformer: status="
+                        + presentationPatchStatus);
+        String apiPresentationPatchStatus = System.getProperty(
+                "starsector.prepatcher.patchStatus." + BASE_TERRAIN
+                        + ".fastForwardPresentation");
+        require("APPLIED".equals(apiPresentationPatchStatus),
+                "FR did not apply presentation coalescing from starfarer.api.jar: status="
+                        + apiPresentationPatchStatus);
+        String frMutatedPresentationStatus = System.getProperty(
+                "starsector.prepatcher.patchStatus." + HYPERSPACE_TERRAIN
+                        + ".fastForwardPresentation");
+        require("APPLIED".equals(frMutatedPresentationStatus),
+                "FR-mutated presentation target did not match its unchanged local sound surface: status="
+                        + frMutatedPresentationStatus);
 
         Class<?> agent = load(system, AGENT);
         ClassLoader agentLoader = agent.getClassLoader();
@@ -122,6 +152,12 @@ public final class FasterRenderingLoaderSmokeTest {
                 + " commRelaySystemIndex=" + intelPatchStatus);
         System.out.println("OK transformed economy target " + COMMODITY_ON_MARKET
                 + " commodityEventModDirtyCache=" + commodityPatchStatus);
+        System.out.println("OK ordered overlapping target " + CAMPAIGN_ENGINE
+                + " fastForwardPresentation=" + presentationPatchStatus);
+        System.out.println("OK FR API-container target " + BASE_TERRAIN
+                + " fastForwardPresentation=" + apiPresentationPatchStatus);
+        System.out.println("OK FR upstream-mutated target " + HYPERSPACE_TERRAIN
+                + " fastForwardPresentation=" + frMutatedPresentationStatus);
         System.out.println("OK runtime payload inventory classes=" + runtimeClassCount);
     }
 

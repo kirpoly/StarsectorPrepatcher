@@ -50,13 +50,31 @@ VERIFICATION_CONFIG="$BUILD/structural-all-enabled.properties"
     -e 's/^patch\.loadingTextReader[[:space:]]*=.*/patch.loadingTextReader=true/' \
     -e 's/^patch\.startupLogAggregation[[:space:]]*=.*/patch.startupLogAggregation=true/' \
     "$MOD_ROOT/profiles/aggressive.properties"
+  printf '%s\n' 'patch.directMarketObservation=true'
+  printf '%s\n' 'logging.statsIntervalSeconds=1'
 } > "$VERIFICATION_CONFIG"
 grep -qx 'patch.loadingTextReader=true' "$VERIFICATION_CONFIG"
 grep -qx 'patch.startupLogAggregation=true' "$VERIFICATION_CONFIG"
+grep -qx 'patch.directMarketObservation=true' "$VERIFICATION_CONFIG"
+grep -qx 'logging.statsIntervalSeconds=1' "$VERIFICATION_CONFIG"
 java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
   com.starsector.prepatcher.agent.StructuralCompatibilityTest \
   "$VERIFICATION_CONFIG" "${CORE_JARS[@]}" \
   2>&1 | tee "$REPORT_DIR/structural-verification.txt"
+
+java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
+  com.starsector.prepatcher.agent.CoreWorldsStructuralMatcherTest \
+  "$VERIFICATION_CONFIG" "$CORE/starfarer.api.jar" \
+  2>&1 | tee "$REPORT_DIR/core-worlds-structural-matcher.txt"
+
+java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
+  com.starsector.prepatcher.agent.FastForwardPresentationStructuralPlanTest \
+  2>&1 | tee "$REPORT_DIR/fast-forward-presentation-structural-plan.txt"
+
+java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
+  com.starsector.prepatcher.agent.FastForwardPresentationCompatibilityTest \
+  "$CORE/starfarer_obf.jar" "$CORE/starfarer.api.jar" \
+  2>&1 | tee "$REPORT_DIR/fast-forward-presentation-compatibility.txt"
 
 java "${EXPORTS[@]}" -cp "$TEST_CLASSES:$TEST_CP" \
   com.starsector.prepatcher.agent.DirectMarketObserveTransformerTest \
@@ -66,12 +84,16 @@ RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/st
 {
   echo '== LifecycleGcRegressionTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.LifecycleGcRegressionTest
+  echo '== CacheMaintenanceRuntimeTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.CacheMaintenanceRuntimeTest
+  echo '== CoreWorldsRuntimeRegressionTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.CoreWorldsRuntimeRegressionTest
   echo '== Exp6RuntimeRegressionTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.Exp6RuntimeRegressionTest
   echo '== Exp8RuntimeRegressionTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.Exp8RuntimeRegressionTest
-  echo '== RemoteMarketSchedulerRuntimeTest =='
-  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.RemoteMarketSchedulerRuntimeTest
+  echo '== MarketSchedulerRuntimeTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.MarketSchedulerRuntimeTest
   echo '== DirectMarketObservationRuntimeTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.DirectMarketObservationRuntimeTest
   echo '== PersistentEconomyRuntimeRegressionTest =='
@@ -84,12 +106,40 @@ RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/st
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.LoadingSaveRuntimeRegressionTest
 } 2>&1 | tee "$REPORT_DIR/runtime-regression.txt"
 
+{
+  echo '== FastForwardPresentationRuntimeTest =='
+  java -noverify -cp "$RUNTIME_CP" \
+    com.fs.starfarer.api.FastForwardPresentationRuntimeTest
+  echo '== FastForwardPresentationLoadedTargetPolicyTest =='
+  java -noverify -cp "$RUNTIME_CP" \
+    com.starsector.prepatcher.agent.FastForwardPresentationLoadedTargetPolicyTest
+} 2>&1 | tee "$REPORT_DIR/fast-forward-presentation-runtime.txt"
+
+java \
+  "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar=config=$MOD_ROOT/profiles/aggressive.properties" \
+  -cp "$RUNTIME_CP" \
+  com.starsector.prepatcher.runtime.CoreWorldsActualAgentSmokeTest \
+  2>&1 | tee "$REPORT_DIR/core-worlds-actual-agent.txt"
+
+java -noverify \
+  "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar=config=$MOD_ROOT/profiles/aggressive.properties" \
+  -cp "$RUNTIME_CP" \
+  com.starsector.prepatcher.runtime.FastForwardPresentationActualAgentSmokeTest \
+  2>&1 | tee "$REPORT_DIR/fast-forward-presentation-actual-agent.txt"
+
 java \
   -Dstarsector.prepatcher.sessionOrigin=temp-mod-smoke \
   "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar" \
   -cp "$RUNTIME_CP" \
   com.starsector.prepatcher.runtime.TempModActualAgentSmokeTest \
   2>&1 | tee "$REPORT_DIR/temp-mod-actual-agent-smoke.txt"
+
+java \
+  -Dstarsector.prepatcher.sessionOrigin=market-step-replay-smoke \
+  "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar" \
+  -cp "$RUNTIME_CP" \
+  com.starsector.prepatcher.runtime.MarketStepReplayActualAgentSmokeTest \
+  2>&1 | tee "$REPORT_DIR/market-step-replay-actual-agent-smoke.txt"
 
 # Exercise the active-set dependency contract with every other patch, including
 # the standalone temp-mod switch, disabled. The transformer must still install

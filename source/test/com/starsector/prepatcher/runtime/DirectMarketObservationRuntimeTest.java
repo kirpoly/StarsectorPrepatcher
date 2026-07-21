@@ -55,6 +55,8 @@ public final class DirectMarketObservationRuntimeTest {
             Path session = waitForSession(root.resolve("logs/direct-market-observe"));
             String sessionMetadata = Files.readString(session.resolve("session.json"),
                     StandardCharsets.UTF_8);
+            require(sessionMetadata.contains("\"schema\": 3"),
+                    "observer session schema was not updated");
             require(sessionMetadata.contains("\"sessionOrigin\": \"runtime-test\""),
                     "observer session origin was not persisted");
             require(session.getFileName().toString().startsWith("session-runtime-test-"),
@@ -68,7 +70,7 @@ public final class DirectMarketObservationRuntimeTest {
 
             StarsectorPrepatcherHooks.observeDirectMarketAdvance(market, 0.25f, siteId, metadata);
             StarsectorPrepatcherHooks.observeDirectMarketAdvance(market, 0.75f, siteId, metadata);
-            StarsectorPrepatcherHooks.advancePlanetConditionMarketScheduled(market, 0.125f);
+            StarsectorPrepatcherHooks.advanceMarketScheduled(market, 0.125f, 1);
             // Simulates reflection/uninstrumented caller with no origin marker.
             market.advance(0.5f);
             require(counter.calls == 4, "observation paths changed call count");
@@ -225,7 +227,7 @@ public final class DirectMarketObservationRuntimeTest {
     }
 
     private static void waitForSummaryCounts(
-            Path file, long planetImmediate, long direct, long unknown, long timeoutMs)
+            Path file, long planetFallback, long direct, long unknown, long timeoutMs)
             throws Exception {
         long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
         while (System.nanoTime() < deadline) {
@@ -233,7 +235,7 @@ public final class DirectMarketObservationRuntimeTest {
                 String[] lines = Files.readString(file, StandardCharsets.UTF_8).split("\\R");
                 if (lines.length > 1) {
                     String[] header = lines[0].split(",", -1);
-                    int p = column(header, "planet_condition_immediate_entries");
+                    int p = column(header, "planet_condition_fallback_entries");
                     int d = column(header, "direct_callsite_entries");
                     int u = column(header, "unknown_entries");
                     long ps = 0L, ds = 0L, us = 0L;
@@ -244,7 +246,7 @@ public final class DirectMarketObservationRuntimeTest {
                         ds += Long.parseLong(values[d]);
                         us += Long.parseLong(values[u]);
                     }
-                    if (ps >= planetImmediate && ds >= direct && us >= unknown) return;
+                    if (ps >= planetFallback && ds >= direct && us >= unknown) return;
                 }
             }
             Thread.sleep(50L);
