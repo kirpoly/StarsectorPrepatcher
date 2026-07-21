@@ -6,6 +6,20 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $modRoot = (Resolve-Path $PSScriptRoot).Path
+$verifyMutex = [Threading.Mutex]::new(
+    $false,
+    'Local\StarsectorPrepatcher.verify-structural')
+$verifyMutexTaken = $false
+try {
+try {
+    $verifyMutexTaken = $verifyMutex.WaitOne([TimeSpan]::FromMinutes(5))
+} catch [Threading.AbandonedMutexException] {
+    $verifyMutexTaken = $true
+}
+if (-not $verifyMutexTaken) {
+    throw 'Timed out waiting for another StarsectorPrepatcher verification process.'
+}
+
 $gameRoot = (Resolve-Path (Join-Path $modRoot '..\..')).Path
 $core = Join-Path $gameRoot 'starsector-core'
 $build = Join-Path $modRoot '.build'
@@ -503,3 +517,9 @@ if (-not (Test-Path -LiteralPath $frJar -PathType Leaf)) {
 }
 
 Write-Host 'Documentation/structural/runtime/hyperspace/startup/FR verification completed.' -ForegroundColor Green
+} finally {
+    if ($verifyMutexTaken) {
+        $verifyMutex.ReleaseMutex()
+    }
+    $verifyMutex.Dispose()
+}
